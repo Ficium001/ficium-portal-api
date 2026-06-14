@@ -18,10 +18,10 @@ log = structlog.get_logger()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("portal_api_starting", env=settings.env, model=settings.deployment_model)
-    await init_pool()
+    init_pool()   # sync — psycopg2/SQLAlchemy
     log.info("portal_api_ready")
     yield
-    await close_pool()
+    close_pool()  # sync
     log.info("portal_api_stopped")
 
 
