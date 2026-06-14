@@ -1,10 +1,8 @@
 # =============================================================================
 # ficium-portal-api — Configuration
-# Environment-driven (pydantic-settings). The SAME image runs in every
-# deployment model; only env values differ.
 # =============================================================================
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,30 +13,39 @@ class Settings(BaseSettings):
     version: str = "0.1.0"
 
     # ── Database ──────────────────────────────────────────────
-    # SaaS:        Supabase Postgres direct connection (NOT PostgREST)
-    # client-cloud/MRU: managed Postgres in-region
-    # on-premises: Postgres inside the institution's environment
+    # SaaS: Supabase transaction pooler (port 6543, not 5432)
+    # Use: postgresql://postgres.[ref]:[password]@aws-0-*.pooler.supabase.com:6543/postgres
     database_url:        str = Field(..., description="Postgres DSN")
     db_pool_min:         int = 2
     db_pool_max:         int = 10
     db_command_timeout:  float = 30.0
 
-    # ── Auth (verify ficium-auth tokens) ──────────────────────
-    # JWKS discovery URL of ficium-auth. Verified, cached, refreshed on
-    # unknown-kid (key rotation). No shared secret.
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_db_url(cls, v: str) -> str:
+        """
+        Ensure the DSN uses the plain postgresql:// scheme (psycopg2).
+        Strip asyncpg/psycopg2 driver prefixes if present.
+        """
+        if not isinstance(v, str):
+            return v
+        v = v.replace("postgresql+asyncpg://", "postgresql://")
+        v = v.replace("postgresql+psycopg2://", "postgresql://")
+        return v
+
+    # ── Auth ──────────────────────────────────────────────────
     auth_jwks_url:   str = "https://ficium-auth-production.up.railway.app/.well-known/jwks.json"
-    auth_issuer:     str = "https://ficium-auth-production.up.railway.app"
+    auth_issuer:     str = "ficium-auth"
     auth_audience:   str = "authenticated"
     jwks_cache_ttl:  int = 3600
 
-    # ── CORS (Portal origins) ─────────────────────────────────
-    allowed_origins:       str = ""
-    allowed_origin_regex:  str = r"^https://ficium-portal[a-z0-9.\-]*\.vercel\.app$"
+    # ── CORS ──────────────────────────────────────────────────
+    allowed_origins:      str = ""
+    allowed_origin_regex: str = r"^https://ficium-portal[a-z0-9.\-]*\.vercel\.app$"
 
-    # ── Deployment model (audit/labelling) ────────────────────
-    deployment_model: str = "saas"   # saas | client_cloud | on_prem
-
-    log_level: str = "INFO"
+    # ── Deployment ────────────────────────────────────────────
+    deployment_model: str = "saas"
+    log_level:        str = "INFO"
 
 
 settings = Settings()  # type: ignore[call-arg]
