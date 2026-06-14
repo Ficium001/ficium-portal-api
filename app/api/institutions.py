@@ -25,7 +25,7 @@ async def get_my_institution(
     institution_id = claims.get("institution_id")
 
     if not institution_id:
-        if claims.get("user_role") == "admin":
+        if claims.get("user_role") in ("admin", "super_admin"):
             return {"user_type": "admin", "approved": True,
                     "suspended_at": None, "suspension_reason": None}
         raise HTTPException(status_code=403, detail="No institution context.")
