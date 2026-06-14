@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # ── Auth ──────────────────────────────────────────────────
     auth_jwks_url:   str = "https://ficium-auth-production.up.railway.app/.well-known/jwks.json"
     auth_issuer:     str = "ficium-auth"
-    auth_audience:   str = "authenticated"
+    auth_audience:   str = "ficium-portal"   # must match ficium-auth JWT_AUDIENCE
     jwks_cache_ttl:  int = 3600
 
     # ── CORS ──────────────────────────────────────────────────
