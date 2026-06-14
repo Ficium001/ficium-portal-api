@@ -1,7 +1,7 @@
 # =============================================================================
 # ficium-portal-api — Members router
-# Replaces: useMyRole, useInstitutionUsers (institution_members queries)
-# RLS scopes every read to the caller's institution.
+# Replaces: useMyRole, useInstitutionUsers, useMyGroup
+# RLS / SECURITY DEFINER scope every read to the caller's identity.
 # =============================================================================
 
 from __future__ import annotations
@@ -40,9 +40,25 @@ async def get_my_role(
     return _row_to_dict(row)
 
 
+@router.get("/my-group")
+async def get_my_group(
+    conn: Session = Depends(tenant_conn),
+) -> dict | None:
+    """
+    The caller's group (module_permissions, label, user_type).
+    Calls portal_admin.get_my_group() — the SAME SECURITY DEFINER RPC the
+    frontend used. Resolves admin_users first, then institution_members,
+    via auth.uid(). Returns null when the caller has no group.
+    """
+    result = conn.execute(text("SELECT portal_admin.get_my_group() AS grp")).fetchone()
+    if result is None or result.grp is None:
+        return None
+    # result.grp is already JSONB → comes back as a dict via psycopg2/SQLAlchemy
+    return result.grp
+
+
 @router.get("")
 async def list_members(
-    claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> list[dict]:
     """All active members of the caller's institution (RLS-scoped)."""
