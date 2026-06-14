@@ -1,17 +1,13 @@
 # =============================================================================
-# ficium-portal-api — Request dependencies
-# Ties verification (security.py) to the RLS-scoped DB session (db.py).
-# Endpoints depend on `tenant_conn` and receive a connection already bound to
-# the caller's identity, with Postgres RLS enforcing tenant isolation.
+# ficium-portal-api — Request dependencies (psycopg2 / SQLAlchemy version)
 # =============================================================================
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Generator
 
-import asyncpg
 from fastapi import Depends, Header, HTTPException
+from sqlalchemy.orm import Session
 
 from .core.db import tenant_session
 from .core.security import TokenError, verify_token
@@ -28,12 +24,12 @@ async def current_claims(authorization: str = Header(default="")) -> dict[str, A
         raise HTTPException(status_code=401, detail=str(e)) from e
 
 
-async def tenant_conn(
+def tenant_conn(
     claims: dict[str, Any] = Depends(current_claims),
-) -> AsyncIterator[asyncpg.Connection]:
+) -> Generator[Session, None, None]:
     """
-    Yield a DB connection scoped to the caller via RLS. The same identity
-    PostgREST would have injected — only now we control it, on any Postgres.
+    Yield a DB session scoped to the caller via RLS.
+    Synchronous generator — FastAPI handles sync dependencies correctly.
     """
-    async with tenant_session(claims) as conn:
-        yield conn
+    with tenant_session(claims) as session:
+        yield session
