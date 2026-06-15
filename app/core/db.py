@@ -2,13 +2,17 @@
 # ficium-portal-api — Database core (psycopg2 + SQLAlchemy)
 #
 # Uses psycopg2 (sync) via SQLAlchemy connection pool.
-# asyncpg requires a direct TCP connection to Postgres (port 5432) which
-# Supabase blocks from external IPs on the free plan. psycopg2 works fine
-# with the Supabase transaction pooler (port 6543, pgbouncer).
+# Connects via Supabase transaction pooler (port 6543, pgbouncer).
 #
-# The RLS contract is identical: every request sets request.jwt.claims and
-# SET LOCAL ROLE authenticated inside a transaction, so auth.uid() resolves
-# correctly and RLS enforces tenant isolation unchanged.
+# RLS contract: every request sets request.jwt.claims via set_config()
+# so auth.uid() resolves correctly and RLS enforces tenant isolation.
+# We do NOT issue SET LOCAL ROLE because:
+#   1. pgbouncer in transaction mode resets session state between transactions
+#   2. The pooler connection user lacks permission to SET ROLE authenticated
+#   3. Supabase PostgREST itself only uses set_config — not SET ROLE
+#
+# RLS policies must be written to check auth.uid() (which reads the GUC),
+# not to check current_role. This is standard Supabase RLS practice.
 # =============================================================================
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from contextlib import contextmanager
 from typing import Any, Generator
 
 import structlog
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import settings
@@ -62,16 +66,19 @@ def _session_or_raise() -> sessionmaker:
 def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
     """
     Yield a DB session scoped to ONE request's identity.
-    Sets request.jwt.claims and ROLE authenticated so RLS works
-    identically to PostgREST / the asyncpg version.
+    Sets request.jwt.claims so auth.uid() resolves and RLS enforces
+    tenant isolation — identical to what PostgREST does.
+    No SET ROLE: pgbouncer transaction mode resets session state and
+    the pooler user cannot switch roles anyway.
     """
     SessionLocal = _session_or_raise()
     claims_json = json.dumps(claims, separators=(",", ":"))
     session = SessionLocal()
     try:
-        session.execute(text("SELECT set_config('request.jwt.claims', :c, true)"),
-                        {"c": claims_json})
-        session.execute(text("SET LOCAL ROLE authenticated"))
+        session.execute(
+            text("SELECT set_config('request.jwt.claims', :c, true)"),
+            {"c": claims_json},
+        )
         yield session
         session.commit()
     except Exception:
