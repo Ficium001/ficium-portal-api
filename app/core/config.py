@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     auth_audience:   str = "ficium-portal"   # must match ficium-auth JWT_AUDIENCE
     jwks_cache_ttl:  int = 3600
 
+    # ── Server-to-server ──────────────────────────────────────
+    # Shared secret for calls from the ficium client-app Vercel backend.
+    # Set APP_SERVICE_SECRET to the same value in both services.
+    app_service_secret: str = Field(default="", description="X-Service-Secret for s2s calls")
+
     # ── CORS ──────────────────────────────────────────────────
     allowed_origins:      str = ""
     allowed_origin_regex: str = r"^https://ficium-portal[a-z0-9.\-]*\.vercel\.app$"
