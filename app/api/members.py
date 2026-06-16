@@ -1,7 +1,5 @@
 # =============================================================================
 # ficium-portal-api — Members router
-# Replaces: useMyRole, useInstitutionUsers, useMyGroup
-# RLS / SECURITY DEFINER scope every read to the caller's identity.
 # =============================================================================
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from ..deps import current_claims, tenant_conn
 router = APIRouter(prefix="/members", tags=["members"])
 
 
-def _row_to_dict(row) -> dict:
+def _row(row) -> dict:
     return dict(row._mapping)
 
 
@@ -24,7 +22,7 @@ async def get_my_role(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
-    """The caller's own institution_members row (role, group, flags)."""
+    """The caller's own institution_members row."""
     sub = claims.get("sub")
     row = conn.execute(
         text("""
@@ -37,24 +35,90 @@ async def get_my_role(
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Member not found.")
-    return _row_to_dict(row)
+    return _row(row)
 
 
 @router.get("/my-group")
 async def get_my_group(
+    claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict | None:
     """
-    The caller's group (module_permissions, label, user_type).
-    Calls portal_admin.get_my_group() — the SAME SECURITY DEFINER RPC the
-    frontend used. Resolves admin_users first, then institution_members,
-    via auth.uid(). Returns null when the caller has no group.
+    Resolve the caller's group and module_permissions.
+    Uses sub from the verified JWT directly (avoids auth.uid() inside
+    SECURITY DEFINER which may return null in pgbouncer transaction mode).
+    Priority: custom institution group > platform system group.
     """
-    result = conn.execute(text("SELECT portal_admin.get_my_group() AS grp")).fetchone()
-    if result is None or result.grp is None:
+    sub = claims.get("sub")
+    if not sub:
         return None
-    # result.grp is already JSONB → comes back as a dict via psycopg2/SQLAlchemy
-    return result.grp
+
+    # 1. Custom institution group
+    row = conn.execute(
+        text("""
+            SELECT jsonb_build_object(
+                'id',                 g.id::TEXT,
+                'slug',               g.slug,
+                'label',              g.label,
+                'description',        COALESCE(g.description, ''),
+                'module_permissions', to_jsonb(g.module_permissions),
+                'user_type',          'institution',
+                'is_system',          g.is_system
+            ) AS grp
+            FROM  institution.institution_members im
+            JOIN  institution.groups g ON g.id = im.custom_group_id
+            WHERE im.auth_user_id = :uid
+              AND im.active       = true
+            LIMIT 1
+        """),
+        {"uid": sub},
+    ).fetchone()
+    if row and row.grp:
+        return row.grp
+
+    # 2. Platform system group fallback (group_id -> portal_admin.user_groups)
+    row = conn.execute(
+        text("""
+            SELECT jsonb_build_object(
+                'id',                 ug.id::TEXT,
+                'slug',               ug.slug,
+                'label',              ug.label,
+                'description',        COALESCE(ug.description, ''),
+                'module_permissions', to_jsonb(ug.module_permissions),
+                'user_type',          'institution',
+                'is_system',          ug.is_system
+            ) AS grp
+            FROM  institution.institution_members im
+            JOIN  portal_admin.user_groups ug ON ug.id = im.group_id
+            WHERE im.auth_user_id = :uid
+              AND im.active       = true
+            LIMIT 1
+        """),
+        {"uid": sub},
+    ).fetchone()
+    if row and row.grp:
+        return row.grp
+
+    return None
+
+
+@router.get("/my-group-debug")
+async def get_my_group_debug(
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """Temporary: returns raw member row to confirm sub + active state."""
+    sub = claims.get("sub")
+    row = conn.execute(
+        text("""
+            SELECT id, auth_user_id, active, group_id, custom_group_id, is_primary_admin
+            FROM institution.institution_members
+            WHERE auth_user_id = :uid
+            LIMIT 1
+        """),
+        {"uid": sub},
+    ).fetchone()
+    return {"sub": sub, "member": dict(row._mapping) if row else None}
 
 
 @router.get("")
@@ -70,4 +134,4 @@ async def list_members(
             ORDER BY created_at
         """)
     ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [_row(r) for r in rows]
