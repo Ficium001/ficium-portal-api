@@ -12,11 +12,11 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from ..deps import tenant_conn
 from ..core.db import service_session
+from ..deps import tenant_conn
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
