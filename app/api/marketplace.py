@@ -12,11 +12,11 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
+from ..core.db import AppDatabaseUnavailable, app_service_session
 from ..deps import tenant_conn
-from ..core.db import app_service_session, AppDatabaseUnavailable
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
@@ -41,7 +41,7 @@ _REQUESTS_SQL = """
         'individual'                                                    AS client_type,
         s.monthly_income                                               AS client_monthly_income,
         s.net_worth                                                     AS client_net_worth,
-        s.debt_to_income_ratio                                          AS client_debt_to_income_ratio
+        s.debt_to_income_ratio                                  AS client_debt_to_income_ratio
     FROM  public.requests               r
     LEFT JOIN public.client_financial_snapshot s ON s.client_id = r.client_id
     WHERE r.status = 'open'
