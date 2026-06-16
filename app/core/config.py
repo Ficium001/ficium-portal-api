@@ -36,7 +36,12 @@ class Settings(BaseSettings):
     # ── Auth ──────────────────────────────────────────────────
     auth_jwks_url:   str = "https://ficium-auth-production.up.railway.app/.well-known/jwks.json"
     auth_issuer:     str = "ficium-auth"
-    auth_audience:   str = "ficium-portal"   # must match ficium-auth JWT_AUDIENCE
+    # ficium-auth issues aud="authenticated" deliberately (kept so the Postgres
+    # auth.role()/RLS contract — see db/000_auth_shim.sql — resolves exactly as
+    # it did under Supabase, where "authenticated" is the expected role claim).
+    # This MUST match ficium-auth's jwt_audience config, not an arbitrary
+    # service name — they are two sides of one verified contract.
+    auth_audience:   str = "authenticated"
     jwks_cache_ttl:  int = 3600
 
     # ── Server-to-server ──────────────────────────────────────

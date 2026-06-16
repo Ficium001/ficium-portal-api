@@ -14,10 +14,10 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from ..deps import current_claims, tenant_conn
+from ..deps import tenant_conn
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
@@ -64,6 +64,8 @@ async def submit_for_approval(
             "payload": json.dumps(body.get("payload", {})),
         },
     ).fetchone()
+    if result is None or result.action_id is None:
+        raise HTTPException(status_code=500, detail="submit_for_approval returned no id.")
     return {"action_id": str(result.action_id)}
 
 
