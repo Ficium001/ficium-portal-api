@@ -64,6 +64,11 @@ async def submit_for_approval(
             "payload": json.dumps(body.get("payload", {})),
         },
     ).fetchone()
+    if result is None:
+        raise HTTPException(
+            status_code=500,
+            detail="submit_for_approval returned no action id.",
+        )
     return {"action_id": str(result.action_id)}
 
 
