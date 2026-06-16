@@ -5,10 +5,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from ..deps import current_claims, tenant_conn
+from ..deps import current_claims
 
 router = APIRouter(prefix="/institutions", tags=["institutions"])
 

@@ -14,10 +14,10 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from ..deps import current_claims, tenant_conn
+from ..deps import tenant_conn
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
