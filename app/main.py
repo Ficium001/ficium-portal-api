@@ -13,6 +13,7 @@ from .api.members import router as members_router
 from .api.approvals import router as approvals_router
 from .api.marketplace import router as marketplace_router
 from .api.catalog import router as catalog_router
+from .api.public import router as public_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
 
@@ -56,3 +57,4 @@ app.include_router(members_router)
 app.include_router(approvals_router)
 app.include_router(marketplace_router)
 app.include_router(catalog_router)
+app.include_router(public_router)   # server-to-server, no JWT
