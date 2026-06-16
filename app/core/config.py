@@ -15,12 +15,19 @@ class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────
     # SaaS: Supabase transaction pooler (port 6543, not 5432)
     # Use: postgresql://postgres.[ref]:[password]@aws-0-*.pooler.supabase.com:6543/postgres
-    database_url:        str = Field(..., description="Postgres DSN")
+    database_url:        str = Field(..., description="Portal Postgres DSN")
     db_pool_min:         int = 2
     db_pool_max:         int = 10
     db_command_timeout:  float = 30.0
 
-    @field_validator("database_url", mode="before")
+    # ── Cross-project: Ficium App database (marketplace pool) ──
+    # The marketplace reads public.requests / public.client_financial_snapshot
+    # which live in the Ficium App Supabase project, NOT the Portal project.
+    # Set to the App project's transaction-pooler DSN (port 6543).
+    # Optional: if empty, marketplace endpoints return 503 rather than 500.
+    app_database_url:    str = Field(default="", description="Ficium App Postgres DSN")
+
+    @field_validator("database_url", "app_database_url", mode="before")
     @classmethod
     def normalize_db_url(cls, v: str) -> str:
         """
