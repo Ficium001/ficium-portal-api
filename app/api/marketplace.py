@@ -2,21 +2,21 @@
 # ficium-portal-api — Marketplace router
 # =============================================================================
 #
-# GET /marketplace/requests  — all open client requests (service_session,
-#                              bypasses cross-schema RLS; reads public.requests
-#                              directly and LEFT JOINs client_financial_snapshot)
+# GET /marketplace/requests  — all open client requests (app_service_session;
+#                              reads public.requests + client_financial_snapshot
+#                              from the Ficium App DB, anonymised signals only)
 #
 # GET /marketplace/my-bids   — this institution's bids (tenant_conn + RLS)
 # =============================================================================
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from ..deps import tenant_conn
-from ..core.db import service_session
+from ..core.db import app_service_session, AppDatabaseUnavailable
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
@@ -40,9 +40,8 @@ _REQUESTS_SQL = """
         LEFT(r.client_id::TEXT, 8)                                     AS client_ref,
         'individual'                                                    AS client_type,
         s.monthly_income                                               AS client_monthly_income,
-        s.total_net_worth                                              AS client_net_worth,
-        s.health_score                                                 AS client_health_score,
-        s.employment_status                                            AS client_employment_status
+        s.net_worth                                                     AS client_net_worth,
+        s.debt_to_income_ratio                                          AS client_debt_to_income_ratio
     FROM  public.requests               r
     LEFT JOIN public.client_financial_snapshot s ON s.client_id = r.client_id
     WHERE r.status = 'open'
@@ -55,21 +54,25 @@ async def list_requests(
 ) -> list[dict]:
     """
     Open marketplace requests visible to all approved institutions.
-    Uses service_session() — no JWT needed — because the marketplace is
-    cross-schema (public.requests) and all institutions see the same pool.
+    Uses app_service_session() — no JWT needed — reads the shared
+    marketplace pool from the Ficium App database. All approved
+    institutions see the same requests.
     Client PII is never exposed: only anonymised financial signals.
     """
-    with service_session() as conn:
-        if product_type:
-            result = conn.execute(
-                text(_REQUESTS_SQL + " AND r.product_type = :pt ORDER BY r.created_at DESC"),
-                {"pt": product_type},
-            )
-        else:
-            result = conn.execute(
-                text(_REQUESTS_SQL + " ORDER BY r.created_at DESC")
-            )
-        return _rows(result)
+    try:
+        with app_service_session() as conn:
+            if product_type:
+                result = conn.execute(
+                    text(_REQUESTS_SQL + " AND r.product_type = :pt ORDER BY r.created_at DESC"),
+                    {"pt": product_type},
+                )
+            else:
+                result = conn.execute(
+                    text(_REQUESTS_SQL + " ORDER BY r.created_at DESC")
+                )
+            return _rows(result)
+    except AppDatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/my-bids")
