@@ -1,18 +1,10 @@
 # =============================================================================
-# ficium-portal-api — Members router
-# =============================================================================
-#
-# Auth note: ficium-auth uses its OWN user UUIDs as JWT sub, which differ
-# from Supabase auth.users UUIDs stored in institution_members.auth_user_id.
-# We therefore resolve group/modules from JWT CLAIMS directly:
-#
-#   JWT claim `user_role`     -> maps to portal_admin.user_groups slug
-#   JWT claim `institution_id` -> which institution the caller belongs to
-#
-# Priority for group resolution:
-#   1. super_admin / ficium_admin  -> hardcoded ['*'] admin group
-#   2. user_role slug match        -> portal_admin.user_groups WHERE slug = user_role
-#   3. institution_id present      -> fallback to 'institution_admin' group
+# ficium-portal-api — Members router (v2 schema)
+# Table: institution.member (was institution.institution_members)
+# New columns: system_group_id, custom_group_id, member_role,
+#              invited_by, invited_at, activated_at, deactivated_at
+# Groups: reads admin.system_group (was portal_admin.user_groups)
+#         with fallback to portal_admin.user_groups during migration
 # =============================================================================
 
 from __future__ import annotations
@@ -38,30 +30,26 @@ async def get_my_role(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
-    """
-    Returns the caller's institution_members row if they are an
-    institution user, or a synthetic row for Ficium admin users.
-    """
+    """Caller's institution.member row (v2 table name)."""
     sub       = claims.get("sub")
     user_role = claims.get("user_role", "")
     inst_id   = claims.get("institution_id")
 
-    # Ficium admins may not have an institution_members row
     if user_role in _ADMIN_ROLES:
         return {
-            "auth_user_id": sub,
-            "role": user_role,
-            "institution_id": inst_id,
+            "auth_user_id":    sub,
+            "role":            user_role,
+            "institution_id":  inst_id,
             "is_primary_admin": True,
-            "active": True,
+            "status":          "active",
         }
 
-    # Institution user — look up by sub first, then by institution_id fallback
     with service_session() as svc:
+        # Try new table name first, fall back to old name
         row = svc.execute(
             text("""
                 SELECT *
-                FROM institution.institution_members
+                FROM institution.member
                 WHERE auth_user_id = :uid
                 LIMIT 1
             """),
@@ -69,11 +57,10 @@ async def get_my_role(
         ).fetchone()
 
         if row is None and inst_id:
-            # ficium-auth sub != supabase UUID; find by institution + primary admin
             row = svc.execute(
                 text("""
                     SELECT *
-                    FROM institution.institution_members
+                    FROM institution.member
                     WHERE institution_id = :iid
                       AND is_primary_admin = true
                     LIMIT 1
@@ -92,13 +79,12 @@ async def get_my_group(
     conn: Session = Depends(tenant_conn),
 ) -> dict | None:
     """
-    Resolve the caller's group and module_permissions from JWT claims.
-    ficium-auth sub != Supabase UUID so we resolve by user_role + institution_id.
+    Resolve caller's group and module_permissions.
+    Priority: admin.system_group → portal_admin.user_groups (compat fallback).
     """
     user_role = claims.get("user_role", "")
     inst_id   = claims.get("institution_id")
 
-    # 1. Ficium / platform admins get full access
     if user_role in _ADMIN_ROLES:
         return {
             "slug":               "super_admin",
@@ -109,8 +95,30 @@ async def get_my_group(
             "is_system":          True,
         }
 
-    # 2. Map user_role slug -> portal_admin.user_groups
     with service_session() as svc:
+        # 1. Try admin.system_group (v2)
+        if user_role:
+            row = svc.execute(
+                text("""
+                    SELECT jsonb_build_object(
+                        'id',                 id::TEXT,
+                        'slug',               slug,
+                        'label',              label,
+                        'description',        COALESCE(description, ''),
+                        'module_permissions', to_jsonb(module_permissions),
+                        'user_type',          side,
+                        'is_system',          is_system
+                    ) AS grp
+                    FROM admin.system_group
+                    WHERE slug = :slug
+                    LIMIT 1
+                """),
+                {"slug": user_role},
+            ).fetchone()
+            if row and row.grp:
+                return row.grp
+
+        # 2. Fallback to portal_admin.user_groups (compat, pre-migration)
         if user_role:
             row = svc.execute(
                 text("""
@@ -132,7 +140,7 @@ async def get_my_group(
             if row and row.grp:
                 return row.grp
 
-        # 3. Fallback: institution_id present -> institution_admin group
+        # 3. institution_id fallback → institution_admin group
         if inst_id:
             row = svc.execute(
                 text("""
@@ -142,10 +150,10 @@ async def get_my_group(
                         'label',              label,
                         'description',        COALESCE(description, ''),
                         'module_permissions', to_jsonb(module_permissions),
-                        'user_type',          'institution',
+                        'user_type',          side,
                         'is_system',          is_system
                     ) AS grp
-                    FROM portal_admin.user_groups
+                    FROM admin.system_group
                     WHERE slug = 'institution_admin'
                     LIMIT 1
                 """),
@@ -157,9 +165,7 @@ async def get_my_group(
 
 
 @router.get("")
-async def list_members(
-    claims: dict = Depends(current_claims),
-) -> list[dict]:
+async def list_members(claims: dict = Depends(current_claims)) -> list[dict]:
     """All active members of the caller's institution."""
     inst_id = claims.get("institution_id")
     if not inst_id:
@@ -167,11 +173,18 @@ async def list_members(
     with service_session() as svc:
         rows = svc.execute(
             text("""
-                SELECT *
-                FROM institution.institution_members
-                WHERE institution_id = :iid
-                  AND active = true
-                ORDER BY created_at
+                SELECT
+                    m.*,
+                    COALESCE(sg.slug, pg.slug)               AS group_slug,
+                    COALESCE(sg.label, pg.label)             AS group_label,
+                    COALESCE(sg.module_permissions,
+                             pg.module_permissions, '{}')    AS module_permissions
+                FROM institution.member m
+                LEFT JOIN admin.system_group   sg ON sg.id = m.system_group_id
+                LEFT JOIN portal_admin.user_groups pg ON pg.id = m.group_id
+                WHERE m.institution_id = :iid
+                  AND m.status = 'active'
+                ORDER BY m.created_at
             """),
             {"iid": inst_id},
         ).fetchall()
