@@ -1,15 +1,10 @@
 # =============================================================================
-# ficium-portal-api — Public router (server-to-server, no JWT)
+# ficium-portal-api — Public router (server-to-server, no JWT) v2 schema
+#
 # GET /public/requests/{request_id}/bids
-#
-# Called exclusively from the ficium Vercel backend (api/request-bids.ts).
-# Authenticated by X-Service-Secret header — NOT a user JWT.
-# Uses service_session() to bypass RLS so we can read cross-tenant bids
-# for a specific request.
-#
-# Security layers:
-#   1. X-Service-Secret constant-time check (shared secret, set via env var)
-#   2. IDOR guard: consumer_id must match public.requests.client_id
+#   Reads marketplace.bid + institution.institution (v2 names).
+#   Falls back to institution.institution_bids + institution.institutions
+#   if marketplace.bid is empty (pre-migration state).
 # =============================================================================
 
 from __future__ import annotations
@@ -43,26 +38,65 @@ async def get_bids_for_request(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
 ) -> list[dict]:
     """
-    Return all submitted bids for a request.
-    Secured by X-Service-Secret; no user JWT involved.
-    Only called server-to-server from the ficium Vercel backend.
+    Return all submitted bids for a request (server-to-server only).
+    Secured by X-Service-Secret. IDOR guard: consumer_id must own the request.
+
+    v2: reads marketplace.request + marketplace.bid + institution.institution.
+    Pre-migration fallback: reads public.requests + institution.institution_bids.
     """
     _verify_secret(x_service_secret)
 
     with service_session() as conn:
-        # IDOR guard — confirm the consumer owns this request
+        # ── v2 path: marketplace.request ─────────────────────────────────────
         owner = conn.execute(
+            text("SELECT consumer_id FROM marketplace.request WHERE id = :rid"),
+            {"rid": request_id},
+        ).fetchone()
+
+        if owner is not None:
+            # v2 — verify ownership
+            if str(owner.consumer_id) != consumer_id:
+                raise HTTPException(status_code=403, detail="Not the request owner.")
+
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        b.id,
+                        b.request_id,
+                        b.institution_id,
+                        i.name          AS institution_name,
+                        i.logo_url      AS institution_logo,
+                        b.rate,
+                        b.rate_type,
+                        b.rate_valid_days,
+                        b.amount_offered,
+                        b.term_months,
+                        b.conditions,
+                        b.fee_structure,
+                        b.status,
+                        b.submitted_at,
+                        b.expires_at
+                    FROM  marketplace.bid          b
+                    JOIN  institution.institution  i ON i.id = b.institution_id
+                    WHERE b.request_id = :rid
+                      AND b.status IN ('submitted', 'under_review')
+                    ORDER BY b.rate ASC
+                """),
+                {"rid": request_id},
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+        # ── Pre-migration fallback: public.requests (app DB reads via service conn)
+        owner_legacy = conn.execute(
             text("SELECT client_id FROM public.requests WHERE id = :rid"),
             {"rid": request_id},
         ).fetchone()
 
-        if owner is None:
+        if owner_legacy is None:
             raise HTTPException(status_code=404, detail="Request not found.")
-
-        if str(owner.client_id) != consumer_id:
+        if str(owner_legacy.client_id) != consumer_id:
             raise HTTPException(status_code=403, detail="Not the request owner.")
 
-        # Fetch submitted bids, cheapest rate first
         rows = conn.execute(
             text("""
                 SELECT
