@@ -183,7 +183,7 @@ async def list_members(claims: dict = Depends(current_claims)) -> list[dict]:
                 LEFT JOIN admin.system_group   sg ON sg.id = m.system_group_id
                 LEFT JOIN portal_admin.user_groups pg ON pg.id = m.group_id
                 WHERE m.institution_id = :iid
-                  AND m.status = 'active'
+                  AND m.deactivated_at IS NULL
                 ORDER BY m.created_at
             """),
             {"iid": inst_id},
