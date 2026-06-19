@@ -89,20 +89,40 @@ def _session_or_raise() -> sessionmaker:
 @contextmanager
 def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
     """
-    Yield a DB session scoped to ONE request's identity.
-    Sets request.jwt.claims so auth.uid() resolves and RLS enforces
-    tenant isolation — identical to what PostgREST does.
-    No SET ROLE: pgbouncer transaction mode resets session state and
-    the pooler user cannot switch roles anyway.
+    Yield a DB session scoped to ONE request's identity, with RLS ENFORCED.
+
+    Two steps inside the transaction, in this order:
+      1. set_config('request.jwt.claims', ...) so auth.uid() / auth.jwt()
+         resolve for the RLS policies.
+      2. SET LOCAL ROLE authenticated so Postgres actually APPLIES those
+         policies. The pooler logs in as the `postgres` role, which carries
+         BYPASSRLS — without this role switch, RLS never fires and tenant
+         isolation depends entirely on each query remembering its WHERE
+         clause. Switching to `authenticated` (no BYPASSRLS) makes RLS the
+         real backstop: a forgotten filter can no longer leak across tenants.
+
+    Both are SET LOCAL / transaction-scoped, so they auto-reset on COMMIT or
+    ROLLBACK — safe under pgbouncer transaction-mode pooling, which resets
+    session state between transactions anyway.
+
+    NOTE: `authenticated` must hold USAGE + the necessary table grants on
+    every schema the routers touch (admin, catalog, identity, institution,
+    marketplace, governance, portal_admin). Migrations 09 and 10 establish
+    these grants and the catalog read policies. Privileged work that must
+    bypass RLS uses service_session() instead.
     """
     SessionLocal = _session_or_raise()
     claims_json = json.dumps(claims, separators=(",", ":"))
     session = SessionLocal()
     try:
+        # 1. Publish JWT claims for the RLS policies to read.
         session.execute(
             text("SELECT set_config('request.jwt.claims', :c, true)"),
             {"c": claims_json},
         )
+        # 2. Drop into the non-BYPASSRLS role so policies are enforced.
+        #    Role name is a constant, never user input — safe to inline.
+        session.execute(text("SET LOCAL ROLE authenticated"))
         yield session
         session.commit()
     except Exception:
