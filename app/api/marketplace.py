@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+import hmac
+
+from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
 from ..deps import current_claims, tenant_conn
 
@@ -221,3 +224,82 @@ async def get_bid(
     if row is None:
         raise HTTPException(status_code=404, detail="Bid not found.")
     return _row(row)
+
+
+# ── POST /marketplace/sync-requests ──────────────────────────────────────────
+# Server-to-server: pull open consumer requests from the app DB and upsert them
+# into marketplace.request (portal DB) via marketplace.ingest_app_request.
+# Idempotent on the app request id. Intended to be called by a scheduled job
+# (cron / Supabase scheduled function) or a DB webhook on request creation.
+
+def _verify_service_secret(received: str) -> None:
+    expected = settings.app_service_secret
+    if not expected:
+        raise HTTPException(status_code=503, detail="Service-to-service auth not configured.")
+    if not hmac.compare_digest(received.encode(), expected.encode()):
+        raise HTTPException(status_code=403, detail="Invalid service secret.")
+
+
+@router.post("/sync-requests")
+async def sync_requests(
+    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
+    limit: int = Query(default=200, le=1000),
+) -> dict:
+    """
+    Mirror open app-DB requests into marketplace.request. Returns counts.
+    Reads app DB (service), writes portal DB (service). No consumer PII copied —
+    only consumer_id (uuid) and a truncated consumer_ref.
+    """
+    _verify_service_secret(x_service_secret)
+
+    # 1. Pull open requests from the app DB
+    try:
+        with app_service_session() as app_conn:
+            app_rows = app_conn.execute(
+                text("""
+                    SELECT id, client_id, product_type::text AS product_type,
+                           amount, preferred_term_months, purpose, max_rate,
+                           decision_deadline, status::text AS status, created_at
+                    FROM public.requests
+                    WHERE status = 'open'
+                    ORDER BY created_at DESC
+                    LIMIT :lim
+                """),
+                {"lim": limit},
+            ).fetchall()
+    except AppDatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    # 2. Upsert each into the portal marketplace via the ingest function
+    synced, failed = 0, 0
+    errors: list[str] = []
+    with service_session() as conn:
+        for r in app_rows:
+            try:
+                conn.execute(
+                    text("""
+                        SELECT marketplace.ingest_app_request(
+                            :id, :consumer_id, :product_type, :amount, :term,
+                            :purpose, :max_rate, :deadline, :status, :created_at
+                        )
+                    """),
+                    {
+                        "id":          r.id,
+                        "consumer_id": r.client_id,
+                        "product_type": r.product_type,
+                        "amount":      r.amount,
+                        "term":        r.preferred_term_months,
+                        "purpose":     r.purpose,
+                        "max_rate":    r.max_rate,
+                        "deadline":    r.decision_deadline,
+                        "status":      r.status,
+                        "created_at":  r.created_at,
+                    },
+                )
+                synced += 1
+            except Exception as e:  # noqa: BLE001 — collect per-row failures
+                failed += 1
+                if len(errors) < 10:
+                    errors.append(f"{r.id}: {e}")
+
+    return {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
