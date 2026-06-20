@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import hmac
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Body, Header, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from ..core.config import settings
@@ -33,7 +35,7 @@ async def get_bids_for_request(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
 ) -> list[dict]:
     """
-    Return all submitted bids for a request (server-to-server only).
+    Return all submitted bids for a single request (server-to-server only).
     v2 path: marketplace.request + marketplace.bid (portal DB).
     Fallback: public.requests + institution_bids (app DB).
     """
@@ -103,3 +105,105 @@ async def get_bids_for_request(
 
     except AppDatabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+class BulkBidsRequest(BaseModel):
+    request_ids: list[str]
+    consumer_id: str
+
+
+@router.post("/requests/bids/bulk")
+async def get_bids_bulk(
+    body: Annotated[BulkBidsRequest, Body()],
+    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
+) -> dict[str, list[dict]]:
+    """
+    Bulk bid fetch — returns bids for multiple request IDs in ONE query.
+    Replaces N parallel calls to /requests/{id}/bids from the consumer app.
+    Ownership is enforced: only request IDs owned by consumer_id are returned.
+    """
+    _verify_secret(x_service_secret)
+
+    if not body.request_ids:
+        return {}
+
+    result: dict[str, list[dict]] = {rid: [] for rid in body.request_ids}
+
+    # ── v2 path: portal DB ────────────────────────────────────────────────────
+    with service_session() as conn:
+        owned = conn.execute(
+            text("""
+                SELECT id FROM marketplace.request
+                WHERE id = ANY(:ids) AND consumer_id = :cid
+            """),
+            {"ids": body.request_ids, "cid": body.consumer_id},
+        ).fetchall()
+        owned_ids = [str(r.id) for r in owned]
+
+        if owned_ids:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        b.id, b.request_id, b.institution_id,
+                        i.name          AS institution_name,
+                        i.logo_url      AS institution_logo,
+                        b.rate, b.rate_type, b.rate_valid_days,
+                        b.amount_offered, b.term_months,
+                        b.conditions, b.fee_structure,
+                        b.status, b.submitted_at, b.expires_at
+                    FROM  marketplace.bid         b
+                    JOIN  institution.institution i ON i.id = b.institution_id
+                    WHERE b.request_id = ANY(:ids)
+                      AND b.status IN ('submitted', 'under_review')
+                    ORDER BY b.rate ASC
+                """),
+                {"ids": owned_ids},
+            ).fetchall()
+            for r in rows:
+                rid = str(r._mapping["request_id"])
+                if rid in result:
+                    result[rid].append(dict(r._mapping))
+
+        # IDs not found in portal DB — check app DB fallback
+        remaining = [rid for rid in body.request_ids if rid not in owned_ids]
+        if not remaining:
+            return result
+
+    # ── Fallback: app DB ──────────────────────────────────────────────────────
+    try:
+        with app_service_session() as app_conn:
+            owned_legacy = app_conn.execute(
+                text("""
+                    SELECT id FROM public.requests
+                    WHERE id = ANY(:ids) AND client_id = :cid
+                """),
+                {"ids": remaining, "cid": body.consumer_id},
+            ).fetchall()
+            owned_legacy_ids = [str(r.id) for r in owned_legacy]
+
+            if owned_legacy_ids:
+                rows = app_conn.execute(
+                    text("""
+                        SELECT
+                            b.id, b.request_id, b.institution_id,
+                            i.name      AS institution_name,
+                            b.rate, b.rate_type, b.amount_offered,
+                            b.term_months, b.conditions,
+                            b.submitted_at, b.status
+                        FROM  institution.institution_bids b
+                        JOIN  institution.institutions     i ON i.id = b.institution_id
+                        WHERE b.request_id = ANY(:ids)
+                          AND b.status     = 'submitted'
+                        ORDER BY b.rate ASC
+                    """),
+                    {"ids": owned_legacy_ids},
+                ).fetchall()
+                for r in rows:
+                    rid = str(r._mapping["request_id"])
+                    if rid in result:
+                        result[rid].append(dict(r._mapping))
+
+    except AppDatabaseUnavailable:
+        pass  # fallback unavailable — return what we have from portal DB
+
+    return result
