@@ -1,0 +1,38 @@
+name: integration-tests
+
+# Runs the Ficium security/flow regression suite against both Supabase
+# databases. DSNs are provided as repo secrets (session-pooler / direct
+# connection strings, port 5432 — NOT the transaction pooler, since the tests
+# use SET ROLE inside a transaction).
+#
+# Required repository secrets:
+#   PORTAL_DB_DSN   postgresql://postgres.<ref>:<pw>@<host>:5432/postgres
+#   APP_DB_DSN      postgresql://postgres.<ref>:<pw>@<host>:5432/postgres
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # allow manual runs
+  schedule:
+    - cron: "0 6 * * *"     # daily 06:00 UTC regression sweep
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install pytest psycopg2-binary
+
+      - name: Run integration suite
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
+        run: pytest tests/test_integration.py -v --tb=short
