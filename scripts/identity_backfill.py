@@ -89,7 +89,7 @@ def build_email_map(cur: Any) -> dict[str, str]:
     cur.execute("""
         SELECT id::text, lower(email) FROM auth_portal.auth_users
     """)
-    return {row[1]: row[0] for row in cur.fetchall()}
+    return {row["lower"]: row["id"] for row in cur.fetchall()}
 
 
 def build_supabase_email_map(cur: Any) -> dict[str, str]:
@@ -101,7 +101,7 @@ def build_supabase_email_map(cur: Any) -> dict[str, str]:
         cur.execute("""
             SELECT id::text, lower(email) FROM auth.users
         """)
-        return {row[0]: row[1] for row in cur.fetchall()}
+        return {row["id"]: row["lower"] for row in cur.fetchall()}
     except psycopg2.errors.UndefinedTable:
         cur.connection.rollback()
         return {}
