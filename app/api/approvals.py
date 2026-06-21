@@ -1,18 +1,21 @@
 # =============================================================================
-# ficium-portal-api — Approvals router (v2 schema)
-# Table: governance.action (was institution.pending_actions)
-# New fields: scope, label, risk, maker_ip, maker_user_agent,
-#             resource_label, payload_before, checker_ip, execution_status
-# RPC: governance.submit() (was institution.submit_for_approval — shim kept)
+# ficium-portal-api — Approvals router (maker-checker core)
+# Replaces: usePendingActions, useSubmitBid, useApproveAction, useRejectAction
+#
+# These call the SAME SECURITY DEFINER RPCs the frontend used on Supabase:
+#   submit_for_approval(p_action_category, p_resource_type, p_resource_id, p_payload)
+#   approve_action(p_action_id, p_note)
+#   reject_action(p_action_id, p_note)
+# Dual-control enforcement lives in those functions — unchanged.
 # =============================================================================
 
 from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from ..deps import tenant_conn
 
@@ -25,19 +28,16 @@ def _row_to_dict(row) -> dict:
 
 @router.get("/pending")
 async def list_pending_actions(
-    scope: str = Query(default="institution"),
     conn: Session = Depends(tenant_conn),
 ) -> list[dict]:
-    """Pending governance actions for the caller's institution."""
+    """Pending maker-checker actions for the caller's institution."""
     rows = conn.execute(
         text("""
             SELECT *
-            FROM governance.action
-            WHERE status = 'pending'
-              AND scope  = :scope
+            FROM institution.pending_actions
+            WHERE action_status = 'pending'
             ORDER BY expires_at ASC
-        """),
-        {"scope": scope},
+        """)
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
@@ -48,27 +48,27 @@ async def submit_for_approval(
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """
-    Submit a maker-checker action via governance.submit() RPC.
-    body: { action_category, resource_type, resource_id, payload, label?, risk? }
+    Submit an action for dual-control approval.
+    body: { action_category, resource_type, resource_id, payload }
     """
     result = conn.execute(
         text("""
-            SELECT governance.submit(
-                :cat, :rtype, :rid,
-                CAST(:payload AS jsonb),
-                :label,
-                :risk
+            SELECT institution.submit_for_approval(
+                :cat, :rtype, :rid, CAST(:payload AS jsonb)
             ) AS action_id
         """),
         {
-            "cat":     body["action_category"],
-            "rtype":   body["resource_type"],
-            "rid":     body.get("resource_id"),
+            "cat":   body["action_category"],
+            "rtype": body["resource_type"],
+            "rid":   body.get("resource_id"),
             "payload": json.dumps(body.get("payload", {})),
-            "label":   body.get("label", ""),
-            "risk":    body.get("risk", "medium"),
         },
     ).fetchone()
+    if result is None:
+        raise HTTPException(
+            status_code=500,
+            detail="submit_for_approval returned no action id.",
+        )
     return {"action_id": str(result.action_id)}
 
 
@@ -78,7 +78,7 @@ async def approve_action(
     body: dict = Body(default={}),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
-    """Approve a pending governance action (checker only — enforced in RPC)."""
+    """Approve a pending action (institution admins only — enforced in RPC)."""
     try:
         result = conn.execute(
             text("SELECT institution.approve_action(:aid, :note) AS res"),
@@ -95,7 +95,7 @@ async def reject_action(
     body: dict = Body(...),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
-    """Reject a pending governance action with a required note."""
+    """Reject a pending action with a required note."""
     note = body.get("note")
     if not note:
         raise HTTPException(status_code=422, detail="A rejection note is required.")
