@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     # ── Auth ──────────────────────────────────────────────────
     auth_jwks_url:   str = "https://ficium-auth-production.up.railway.app/.well-known/jwks.json"
     auth_issuer:     str = "ficium-auth"
-    auth_audience:   str = "authenticated"    # matches ficium-auth aud claim (kept for Postgres RLS shim)
+    auth_audience:   str = "authenticated"  # matches ficium-auth aud claim
     jwks_cache_ttl:  int = 3600
 
     # ── Server-to-server ──────────────────────────────────────
