@@ -10,13 +10,12 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-
-import hmac
 
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
@@ -96,7 +95,7 @@ async def list_requests(
                         LEFT(r.client_id::TEXT, 8)                        AS consumer_ref,
                         s.monthly_income                                   AS client_monthly_income,
                         s.net_worth                                        AS client_net_worth,
-                        s.debt_to_income_ratio                             AS client_debt_to_income_ratio
+                        s.debt_to_income_ratio AS client_debt_to_income_ratio
                     FROM  public.requests               r
                     LEFT JOIN public.client_financial_snapshot s ON s.client_id = r.client_id
                     WHERE r.status = 'open'
