@@ -76,7 +76,7 @@ def discover_tenant_columns(cur: Any) -> list[dict]:
         ORDER BY table_schema, table_name
     """)
     return [
-        {"schema": r[0], "table": r[1], "column": r[2]}
+        {"schema": r["table_schema"], "table": r["table_name"], "column": r["column_name"]}
         for r in cur.fetchall()
     ]
 
