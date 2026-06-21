@@ -164,14 +164,25 @@ def run(apply: bool) -> int:
             total_rows += 1
 
     # Report unmatched
-    if unmatched:
-        log(f"\n⚠️  {len(unmatched)} unmatched UUID(s):")
-        for u in unmatched:
+    skip_emails = {e.strip().lower() for e in os.environ.get("SKIP_EMAILS", "").split(",") if e.strip()}
+    blocking = [u for u in unmatched if u.get("email", "").lower() not in skip_emails]
+    skipped  = [u for u in unmatched if u.get("email", "").lower() in skip_emails]
+
+    if skipped:
+        log(f"\n⏭️  Skipping {len(skipped)} user(s) via SKIP_EMAILS:")
+        for u in skipped:
+            log(f"  {u}")
+
+    if blocking:
+        log(f"\n⚠️  {len(blocking)} unmatched UUID(s):")
+        for u in blocking:
             log(f"  {u}")
         if apply:
             log("\n❌ --apply refused: resolve unmatched users first, then re-run --dry-run.")
             conn.rollback()
             return 1
+    elif unmatched and not blocking:
+        log("\n✅ All unmatched users are in SKIP_EMAILS — proceeding.")
 
     log(f"\n{'[DRY-RUN] ' if dry_run else ''}Plan: {total_rows} row(s) to update across "
         f"{len({p['schema']+'.'+p['table'] for p in plan})} table(s)")
