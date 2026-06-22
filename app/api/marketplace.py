@@ -114,12 +114,17 @@ async def list_requests(
 @router.get("/my-bids")
 async def list_my_bids(
     status: str | None = Query(default=None),
+    claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> list[dict]:
     """
     This institution's bids via marketplace.my_bids view (security_invoker).
     Includes request + product context — no separate call needed.
+    Admins have no institution context, so they have no bids — return empty.
     """
+    if claims.get("user_role") in ("admin", "super_admin"):
+        return []
+
     sql = "SELECT * FROM marketplace.my_bids"
     params: dict = {}
     if status:
