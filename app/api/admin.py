@@ -83,7 +83,7 @@ async def admin_users(
         rows = conn.execute(
             text("""
                 SELECT to_jsonb(u) AS u FROM portal_admin.admin_users u
-                WHERE :st IS NULL OR u.status = :st::portal_admin.admin_user_status
+                WHERE :st IS NULL OR u.status = CAST(:st AS portal_admin.admin_user_status)
                 ORDER BY u.created_at DESC
             """),
             {"st": status},
@@ -143,7 +143,7 @@ async def admin_dual_control(
         rows = conn.execute(
             text("""
                 SELECT to_jsonb(a) AS a FROM portal_admin.admin_dual_control_actions a
-                WHERE :st = 'all' OR a.status = :st::portal_admin.dual_control_status
+                WHERE :st = 'all' OR a.status = CAST(:st AS portal_admin.dual_control_status)
                 ORDER BY a.initiated_at DESC
             """),
             {"st": status},
@@ -164,7 +164,7 @@ async def admin_audit(
             text("""
                 SELECT to_jsonb(e) AS e FROM (
                     SELECT * FROM portal_admin.admin_audit_log
-                    WHERE (:outcome IS NULL OR outcome = :outcome::portal_admin.audit_outcome)
+                    WHERE (:outcome IS NULL OR outcome = CAST(:outcome AS portal_admin.audit_outcome))
                       AND (:category IS NULL OR action_category ILIKE :category || '%')
                     ORDER BY created_at DESC LIMIT :lim
                 ) e
