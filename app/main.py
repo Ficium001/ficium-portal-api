@@ -8,6 +8,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .api.admin import router as admin_router
 from .api.approvals import router as approvals_router
 from .api.catalog import router as catalog_router
 from .api.institutions import router as institutions_router
@@ -52,6 +53,7 @@ async def health() -> dict:
     return {"status": "ok", "service": "ficium-portal-api", "version": settings.version}
 
 
+app.include_router(admin_router)
 app.include_router(institutions_router)
 app.include_router(members_router)
 app.include_router(approvals_router)
