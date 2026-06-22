@@ -335,3 +335,37 @@ async def reject_dual_control(
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
         session.close()
+
+
+class TerminateSessionBody(BaseModel):
+    session_id: str
+    reason:     str
+
+
+@router.post("/sessions/terminate")
+async def terminate_session(
+    body: TerminateSessionBody,
+    claims: dict = Depends(current_claims),
+) -> dict:
+    """Force-terminate an admin session and write an audit entry."""
+    with service_session() as conn:
+        admin_id = _require_admin(claims, conn)
+        conn.execute(
+            text("""
+                UPDATE portal_admin.admin_sessions
+                SET is_active = FALSE, ended_at = now(), end_reason = 'forced'
+                WHERE id = :sid
+            """),
+            {"sid": body.session_id},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO portal_admin.admin_audit_log
+                    (actor_id, action_category, event_label, resource_type, resource_id, outcome, outcome_note)
+                VALUES
+                    (:aid, 'session.terminate', 'Session forcibly terminated',
+                     'admin_session', :sid, 'success', :reason)
+            """),
+            {"aid": admin_id, "sid": body.session_id, "reason": body.reason},
+        )
+        return {"ok": True}
