@@ -53,6 +53,31 @@ async def get_my_group(
     if not sub:
         return None
 
+    # 0. Admin path — platform admins live in admin.user, not institution.member.
+    #    Their modules come from admin.system_group (super_admin → ["*"]).
+    if claims.get("user_role") in ("admin", "super_admin"):
+        row = conn.execute(
+            text("""
+                SELECT jsonb_build_object(
+                    'id',                 sg.id::TEXT,
+                    'slug',               sg.slug,
+                    'label',              sg.label,
+                    'description',        COALESCE(sg.description, ''),
+                    'module_permissions', to_jsonb(sg.module_permissions),
+                    'user_type',          'admin',
+                    'is_system',          true
+                ) AS grp
+                FROM  admin."user" u
+                JOIN  admin.system_group sg ON sg.id = u.system_group_id
+                WHERE u.auth_user_id = :uid
+                LIMIT 1
+            """),
+            {"uid": sub},
+        ).fetchone()
+        if row and row.grp:
+            return row.grp
+        return None
+
     # 1. Custom institution group
     row = conn.execute(
         text("""
