@@ -198,3 +198,140 @@ async def admin_user_groups(claims: dict = Depends(current_claims)) -> list[dict
             """)
         ).fetchall()
         return [r.g for r in rows]
+
+
+# =============================================================================
+# Dual-control mutations
+#
+# These call the existing portal_admin.* SECURITY DEFINER RPCs, which resolve
+# the admin via auth.uid(). We set request.jwt.claims on the session first so
+# auth.uid() returns the ficium-auth sub — reusing all the RPC's built-in
+# logic (self-approval blocks, permission checks, execution, audit) without
+# reimplementing it in Python.
+# =============================================================================
+
+import json as _json
+
+from pydantic import BaseModel
+from sqlalchemy import text as _text
+
+from ..core.db import _session_or_raise
+
+
+def _admin_rpc_session(claims: dict):
+    """A session where auth.uid() resolves to the ficium-auth sub."""
+    SessionLocal = _session_or_raise()
+    claims_json = _json.dumps(claims, separators=(",", ":"))
+    session = SessionLocal()
+    session.execute(
+        _text("SELECT set_config('request.jwt.claims', :c, true)"),
+        {"c": claims_json},
+    )
+    return session
+
+
+class SubmitDualControlBody(BaseModel):
+    action_category: str
+    action_label:    str
+    risk:            str
+    resource_type:   str
+    resource_id:     str | None = None
+    resource_label:  str | None = None
+    payload:         dict = {}
+    payload_before:  dict | None = None
+
+
+@router.post("/dual-control/submit")
+async def submit_dual_control(
+    body: SubmitDualControlBody,
+    claims: dict = Depends(current_claims),
+) -> dict:
+    session = _admin_rpc_session(claims)
+    try:
+        _require_admin(claims, session)
+        row = session.execute(
+            _text("""
+                SELECT portal_admin.admin_submit_dual_control(
+                    :action_category, :action_label, :risk, :resource_type,
+                    :resource_id, :resource_label, :payload, :payload_before
+                ) AS action_id
+            """),
+            {
+                "action_category": body.action_category,
+                "action_label":    body.action_label,
+                "risk":            body.risk,
+                "resource_type":   body.resource_type,
+                "resource_id":     body.resource_id,
+                "resource_label":  body.resource_label,
+                "payload":         _json.dumps(body.payload),
+                "payload_before":  _json.dumps(body.payload_before) if body.payload_before is not None else None,
+            },
+        ).fetchone()
+        session.commit()
+        return {"action_id": str(row.action_id)}
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        session.close()
+
+
+class ApproveBody(BaseModel):
+    action_id: str
+    note:      str | None = None
+
+
+@router.post("/dual-control/approve")
+async def approve_dual_control(
+    body: ApproveBody,
+    claims: dict = Depends(current_claims),
+) -> dict:
+    session = _admin_rpc_session(claims)
+    try:
+        _require_admin(claims, session)
+        session.execute(
+            _text("SELECT portal_admin.admin_approve_dual_control(:aid, :note)"),
+            {"aid": body.action_id, "note": body.note},
+        )
+        session.commit()
+        return {"ok": True}
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        session.close()
+
+
+class RejectBody(BaseModel):
+    action_id: str
+    note:      str
+
+
+@router.post("/dual-control/reject")
+async def reject_dual_control(
+    body: RejectBody,
+    claims: dict = Depends(current_claims),
+) -> dict:
+    session = _admin_rpc_session(claims)
+    try:
+        _require_admin(claims, session)
+        session.execute(
+            _text("SELECT portal_admin.admin_reject_dual_control(:aid, :note)"),
+            {"aid": body.action_id, "note": body.note},
+        )
+        session.commit()
+        return {"ok": True}
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        session.close()
