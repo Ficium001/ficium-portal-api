@@ -66,7 +66,7 @@ async def get_my_group(
                 'is_system',          g.is_system
             ) AS grp
             FROM  institution.member im
-            JOIN  institution.groups g ON g.id = im.custom_group_id
+            JOIN  institution.group g ON g.id = im.custom_group_id
             WHERE im.auth_user_id = :uid
               AND im.active       = true
             LIMIT 1
