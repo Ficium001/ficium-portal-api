@@ -22,7 +22,7 @@ def _rows(result) -> list[dict]:
 async def list_webhooks(conn: Session = Depends(tenant_conn)) -> list[dict]:
     result = conn.execute(
         text("""
-            SELECT * FROM institution.institution_webhooks
+            SELECT * FROM institution.webhook
             ORDER BY created_at DESC
         """)
     )
@@ -31,18 +31,18 @@ async def list_webhooks(conn: Session = Depends(tenant_conn)) -> list[dict]:
 
 @router.get("/products")
 async def list_products(conn: Session = Depends(tenant_conn)) -> list[dict]:
-    """Active products with family label, rate config and SLA defaults."""
+    """Active catalog products with family label, rate model and SLA config."""
     result = conn.execute(
         text("""
             SELECT
                 p.*,
-                pf.label AS family_label,
-                to_jsonb(prc.*) AS rate_config,
-                to_jsonb(psd.*) AS sla_defaults
-            FROM institution.products p
-            LEFT JOIN institution.product_families     pf  ON pf.id  = p.family_id
-            LEFT JOIN institution.product_rate_config  prc ON prc.product_id = p.id
-            LEFT JOIN institution.product_sla_defaults psd ON psd.product_id = p.id
+                pf.label                AS family_label,
+                to_jsonb(prm.*)         AS rate_config,
+                to_jsonb(psla.*)        AS sla_defaults
+            FROM catalog.product p
+            LEFT JOIN catalog.product_family     pf   ON pf.id   = p.family_id
+            LEFT JOIN catalog.product_rate_model prm  ON prm.product_id = p.id
+            LEFT JOIN catalog.product_sla        psla ON psla.product_id = p.id
             WHERE p.active = true
             ORDER BY p.sort_order
         """)
@@ -57,7 +57,7 @@ async def list_audit_events(
 ) -> list[dict]:
     result = conn.execute(
         text("""
-            SELECT * FROM institution.audit_events
+            SELECT * FROM audit.event
             ORDER BY created_at DESC
             LIMIT :lim
         """),
