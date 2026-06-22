@@ -27,7 +27,7 @@ async def get_my_role(
     row = conn.execute(
         text("""
             SELECT *
-            FROM institution.institution_members
+            FROM institution.member
             WHERE auth_user_id = :uid
             LIMIT 1
         """),
@@ -65,7 +65,7 @@ async def get_my_group(
                 'user_type',          'institution',
                 'is_system',          g.is_system
             ) AS grp
-            FROM  institution.institution_members im
+            FROM  institution.member im
             JOIN  institution.groups g ON g.id = im.custom_group_id
             WHERE im.auth_user_id = :uid
               AND im.active       = true
@@ -88,7 +88,7 @@ async def get_my_group(
                 'user_type',          'institution',
                 'is_system',          ug.is_system
             ) AS grp
-            FROM  institution.institution_members im
+            FROM  institution.member im
             JOIN  portal_admin.user_groups ug ON ug.id = im.group_id
             WHERE im.auth_user_id = :uid
               AND im.active       = true
@@ -112,7 +112,7 @@ async def get_my_group_debug(
     row = conn.execute(
         text("""
             SELECT id, auth_user_id, active, group_id, custom_group_id, is_primary_admin
-            FROM institution.institution_members
+            FROM institution.member
             WHERE auth_user_id = :uid
             LIMIT 1
         """),
@@ -129,7 +129,7 @@ async def list_members(
     rows = conn.execute(
         text("""
             SELECT *
-            FROM institution.institution_members
+            FROM institution.member
             WHERE active = true
             ORDER BY created_at
         """)
