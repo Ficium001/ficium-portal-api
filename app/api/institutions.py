@@ -19,12 +19,10 @@ async def get_my_institution(
     claims: dict = Depends(current_claims),
 ) -> dict:
     """
-    Return the caller's institution gate status: approved / suspended / pending.
+    Return the caller's institution profile + gate status.
 
-    Admins are gated by role, not by an institution row — handled first so the
-    request never opens a tenant DB session for them (admins legitimately may
-    not have a real institution row even if a placeholder institution_id is in
-    the token).
+    Admins get a minimal stub (no real institution row).
+    Institution users get the full profile needed by the portal settings page.
     """
     if claims.get("user_role") in _ADMIN_ROLES:
         return {
@@ -39,12 +37,33 @@ async def get_my_institution(
     if not institution_id:
         raise HTTPException(status_code=403, detail="No institution context.")
 
-    # Open a tenant-scoped session only for institution users.
     from ..core.db import tenant_session
     with tenant_session(claims) as conn:
         row = conn.execute(
             text("""
-                SELECT approved, suspended_at, suspension_reason
+                SELECT
+                    id,
+                    name,
+                    legal_name,
+                    institution_type,
+                    reg_number,
+                    country,
+                    regulator,
+                    website,
+                    deployment_model,
+                    modules,
+                    onboarding_stage,
+                    compliance_status,
+                    compliance_notes,
+                    approved,
+                    approved_at,
+                    suspended_at,
+                    suspension_reason,
+                    primary_contact_name,
+                    primary_contact_email,
+                    primary_contact_phone,
+                    created_at,
+                    updated_at
                 FROM institution.institution
                 WHERE id = :id
             """),
@@ -54,10 +73,40 @@ async def get_my_institution(
     if row is None:
         raise HTTPException(status_code=404, detail="Institution not found.")
 
+    if row.suspended_at:
+        raise HTTPException(
+            status_code=403,
+            detail=row.suspension_reason or "This institution has been suspended.",
+        )
+
+    r = row._mapping
+
     return {
+        # Gate fields (used by detectUserType)
         "user_type":         "institution",
-        "institution_id":    institution_id,
-        "approved":          row.approved,
-        "suspended_at":      row.suspended_at.isoformat() if row.suspended_at else None,
-        "suspension_reason": row.suspension_reason,
+
+        # Full profile (used by useMyInstitution / settings page)
+        "id":                    str(r["id"]),
+        "institution_id":        str(r["id"]),
+        "name":                  r["name"],
+        "legal_name":            r["legal_name"],
+        "institution_type":      r["institution_type"],
+        "reg_number":            r["reg_number"],
+        "country":               r["country"],
+        "regulator":             r["regulator"],
+        "website":               r["website"],
+        "deployment_model":      r["deployment_model"],
+        "modules":               r["modules"] if isinstance(r["modules"], list) else [],
+        "onboarding_stage":      r["onboarding_stage"],
+        "compliance_status":     r["compliance_status"],
+        "compliance_notes":      r["compliance_notes"],
+        "approved":              r["approved"],
+        "approved_at":           r["approved_at"].isoformat() if r["approved_at"] else None,
+        "suspended_at":          r["suspended_at"].isoformat() if r["suspended_at"] else None,
+        "suspension_reason":     r["suspension_reason"],
+        "primary_contact_name":  r["primary_contact_name"],
+        "primary_contact_email": r["primary_contact_email"],
+        "primary_contact_phone": r["primary_contact_phone"],
+        "created_at":            r["created_at"].isoformat(),
+        "updated_at":            r["updated_at"].isoformat(),
     }

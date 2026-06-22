@@ -550,18 +550,17 @@ class TestInstitutionsEndpoints:
         assert body["user_type"] == "admin"
         assert body["approved"] is True
 
-    def test_me_institution_user_queries_db(self):
-        """Institution user hits the DB branch — mock tenant_session returns 404."""
+    def test_me_institution_user_no_db_row_returns_404(self):
+        """Institution user, DB returns None → 404 Institution not found."""
         claims = institution_claims()
         app.dependency_overrides[current_claims] = _claims_override(claims)
         app.dependency_overrides[tenant_conn]    = _conn_override()
         try:
             with patch(
                 "app.core.db.tenant_session",
-                side_effect=lambda c: _mock_tenant_session(c),
+                side_effect=lambda c: _mock_tenant_session(c, fetchone=None),
             ):
                 r = TestClient(app, raise_server_exceptions=False).get("/institutions/me")
-            # fetchone returns None → 404 "Institution not found"
             assert r.status_code == 404
         finally:
             app.dependency_overrides.clear()
