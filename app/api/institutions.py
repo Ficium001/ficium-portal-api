@@ -45,7 +45,7 @@ async def get_my_institution(
         row = conn.execute(
             text("""
                 SELECT approved, suspended_at, suspension_reason
-                FROM institution.institutions
+                FROM institution.institution
                 WHERE id = :id
             """),
             {"id": institution_id},
