@@ -133,17 +133,6 @@ async def list_my_bids(
     sql += " ORDER BY submitted_at DESC"
 
     rows = conn.execute(text(sql), params).fetchall()
-
-    # Pre-migration fallback
-    if not rows:
-        fb_sql = "SELECT * FROM institution.institution_bids"
-        fb_params: dict = {}
-        if status:
-            fb_sql += " WHERE status = :st"
-            fb_params["st"] = status
-        fb_sql += " ORDER BY submitted_at DESC"
-        rows = conn.execute(text(fb_sql), fb_params).fetchall()
-
     return [_row(r) for r in rows]
 
 
