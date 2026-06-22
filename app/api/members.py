@@ -160,3 +160,35 @@ async def list_members(
         """)
     ).fetchall()
     return [_row(r) for r in rows]
+
+
+@router.get("/pending")
+async def list_pending_member_actions(
+    conn: Session = Depends(tenant_conn),
+) -> list[dict]:
+    """Pending user.create and user.assign_group actions for this institution."""
+    rows = conn.execute(
+        text("""
+            SELECT
+                id, action_category, action_status, maker_id, maker_role,
+                institution_id, initiated_at, resource_type, resource_id,
+                payload, payload_before, checker_id, checker_role,
+                checker_note, checked_at, expires_at, executed_at,
+                execution_error, created_at
+            FROM institution.pending_actions
+            WHERE action_status = 'pending'
+              AND action_category IN ('user.create', 'user.assign_group')
+            ORDER BY initiated_at DESC
+        """)
+    ).fetchall()
+    result = []
+    for r in rows:
+        m = dict(r._mapping)
+        for k in ("id", "maker_id", "institution_id", "checker_id", "resource_id"):
+            if m.get(k) is not None:
+                m[k] = str(m[k])
+        for k in ("initiated_at", "checked_at", "expires_at", "executed_at", "created_at"):
+            if m.get(k) is not None:
+                m[k] = m[k].isoformat()
+        result.append(m)
+    return result
