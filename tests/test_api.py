@@ -450,10 +450,18 @@ class TestApprovalsEndpoints:
         assert r.status_code == 200
         assert "result" in r.json()
 
-    def test_submit_missing_required_field_returns_4xx(self, auth_client):
-        """Empty body → KeyError on body['action_category']. Must not be 2xx."""
+    def test_submit_missing_required_fields_returns_422(self, auth_client):
+        """Empty body → explicit 422 from field validation."""
         r = auth_client.post("/approvals/submit", json={})
-        assert r.status_code >= 400
+        assert r.status_code == 422
+
+    def test_submit_missing_resource_type_returns_422(self, auth_client):
+        r = auth_client.post("/approvals/submit", json={"action_category": "group.create"})
+        assert r.status_code == 422
+
+    def test_submit_missing_action_category_returns_422(self, auth_client):
+        r = auth_client.post("/approvals/submit", json={"resource_type": "group"})
+        assert r.status_code == 422
 
     def test_submit_missing_body_returns_422(self, auth_client):
         r = auth_client.post("/approvals/submit")

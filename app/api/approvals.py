@@ -49,8 +49,15 @@ async def submit_for_approval(
 ) -> dict:
     """
     Submit an action for dual-control approval.
-    body: { action_category, resource_type, resource_id, payload }
+    body: { action_category, resource_type, resource_id?, payload? }
     """
+    missing = {"action_category", "resource_type"} - set(body)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing required fields: {sorted(missing)}",
+        )
+
     result = conn.execute(
         text("""
             SELECT institution.submit_for_approval(
@@ -58,9 +65,9 @@ async def submit_for_approval(
             ) AS action_id
         """),
         {
-            "cat":   body["action_category"],
-            "rtype": body["resource_type"],
-            "rid":   body.get("resource_id"),
+            "cat":     body["action_category"],
+            "rtype":   body["resource_type"],
+            "rid":     body.get("resource_id"),
             "payload": json.dumps(body.get("payload", {})),
         },
     ).fetchone()
