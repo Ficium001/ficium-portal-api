@@ -1,0 +1,15 @@
+name: Portal API Keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://ficium-portal-api-production.up.railway.app/health)
+          echo "Health: $STATUS"
