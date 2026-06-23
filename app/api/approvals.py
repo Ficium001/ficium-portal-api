@@ -85,6 +85,9 @@ async def submit_for_approval(
     """
     Submit an action for dual-control approval.
     body: { action_category, resource_type, resource_id?, payload? }
+
+    Blocks submission if a pending action already exists for the same
+    resource_id + resource type within the institution (resource lock).
     """
     missing = {"action_category", "resource_type"} - set(body)
     if missing:
@@ -93,6 +96,33 @@ async def submit_for_approval(
             detail=f"Missing required fields: {sorted(missing)}",
         )
 
+    resource_id  = body.get("resource_id")
+    action_category = body["action_category"]
+
+    # ── Resource lock: block if another pending action exists for this resource ──
+    if resource_id:
+        # Extract the domain prefix (e.g. "group" from "group.update_modules")
+        domain = action_category.split(".")[0]
+        conflict = conn.execute(
+            text("""
+                SELECT id, category
+                FROM governance.action
+                WHERE resource_id   = :rid
+                  AND status        = 'pending'
+                  AND split_part(category, '.', 1) = :domain
+                LIMIT 1
+            """),
+            {"rid": resource_id, "domain": domain},
+        ).fetchone()
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A pending '{conflict.category}' action already exists for this resource. "
+                    f"It must be approved or rejected before new changes can be submitted."
+                ),
+            )
+
     result = conn.execute(
         text("""
             SELECT institution.submit_for_approval(
@@ -100,9 +130,9 @@ async def submit_for_approval(
             ) AS action_id
         """),
         {
-            "cat":     body["action_category"],
+            "cat":     action_category,
             "rtype":   body["resource_type"],
-            "rid":     body.get("resource_id"),
+            "rid":     resource_id,
             "payload": json.dumps(body.get("payload", {})),
         },
     ).fetchone()
