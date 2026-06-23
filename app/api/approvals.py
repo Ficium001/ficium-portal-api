@@ -33,13 +33,48 @@ async def list_pending_actions(
     """Pending maker-checker actions for the caller's institution."""
     rows = conn.execute(
         text("""
-            SELECT *
-            FROM institution.pending_actions
-            WHERE action_status = 'pending'
-            ORDER BY expires_at ASC
+            SELECT
+                id,
+                category          AS action_category,
+                status            AS action_status,
+                scope,
+                label,
+                risk,
+                institution_id,
+                maker_id,
+                maker_role,
+                resource_type,
+                resource_id,
+                resource_label,
+                payload,
+                payload_before,
+                checker_id,
+                checker_role,
+                checker_note,
+                checked_at,
+                execution_status,
+                executed_at,
+                execution_error,
+                expires_at,
+                created_at        AS initiated_at,
+                created_at,
+                updated_at
+            FROM governance.action
+            WHERE status = 'pending'
+            ORDER BY expires_at ASC NULLS LAST
         """)
     ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    result = []
+    for row in rows:
+        r = _row_to_dict(row)
+        for k in ("id", "institution_id", "maker_id", "checker_id", "resource_id"):
+            if r.get(k) is not None:
+                r[k] = str(r[k])
+        for k in ("checked_at", "executed_at", "expires_at", "initiated_at", "created_at", "updated_at"):
+            if r.get(k) is not None:
+                r[k] = r[k].isoformat()
+        result.append(r)
+    return result
 
 
 @router.post("/submit")
