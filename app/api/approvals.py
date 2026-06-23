@@ -237,6 +237,9 @@ async def execute_user_update(
     )
     conn.commit()
     return {"ok": True, "field": field, "value": value}
+
+
+@router.post("/{action_id}/provision-user")
 async def provision_user_from_action(
     action_id: str,
     conn: Session = Depends(tenant_conn),
