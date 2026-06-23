@@ -149,3 +149,143 @@ async def reject_action(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"result": result.res if result else None}
+
+
+@router.post("/{action_id}/provision-user")
+async def provision_user_from_action(
+    action_id: str,
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    Provision a new institution user after a user.create action is approved.
+
+    Creates:
+      - auth_portal.auth_users  (ficium-auth login entry, temp password)
+      - institution.member      (links user to institution + group)
+
+    Returns the temporary password so the admin can share it with the new user.
+    Email-based invite can be added later via SMTP integration.
+    """
+    import secrets
+    import string
+    from argon2 import PasswordHasher
+
+    # 1. Load the approved action (scoped to caller's institution via tenant_conn)
+    row = conn.execute(
+        text("""
+            SELECT a.id, a.category, a.status, a.institution_id, a.payload
+            FROM governance.action a
+            WHERE a.id = :aid
+        """),
+        {"aid": action_id},
+    ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Action not found.")
+    if row.category != "user.create":
+        raise HTTPException(status_code=400, detail="Action is not a user.create action.")
+    if row.status != "approved":
+        raise HTTPException(status_code=400, detail=f"Action is not approved (status: {row.status}).")
+
+    payload        = row.payload
+    email          = (payload.get("email") or "").strip().lower()
+    first_name     = (payload.get("first_name") or "").strip()
+    last_name      = (payload.get("last_name") or "").strip()
+    full_name      = f"{first_name} {last_name}".strip() or email
+    custom_group_id = payload.get("custom_group_id")
+    member_role    = payload.get("member_role", "maker")
+    institution_id = str(row.institution_id)
+
+    if not email:
+        raise HTTPException(status_code=400, detail="No email in action payload.")
+    if not custom_group_id:
+        raise HTTPException(status_code=400, detail="No custom_group_id in action payload.")
+
+    # 2. Idempotency — if auth_portal entry already exists, return early
+    existing = conn.execute(
+        text("SELECT id FROM auth_portal.auth_users WHERE email = :email LIMIT 1"),
+        {"email": email},
+    ).fetchone()
+    if existing:
+        # Also ensure member row exists
+        member_exists = conn.execute(
+            text("SELECT id FROM institution.member WHERE auth_user_id = :uid AND institution_id = :iid LIMIT 1"),
+            {"uid": str(existing.id), "iid": institution_id},
+        ).fetchone()
+        if not member_exists:
+            conn.execute(
+                text("""
+                    INSERT INTO institution.member
+                        (institution_id, auth_user_id, email, full_name, role,
+                         is_primary_admin, active, custom_group_id, member_role,
+                         group_id, system_group_id)
+                    VALUES (:iid, :uid, :email, :full_name, 'member',
+                            false, true, :cgid, :mrole,
+                            (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
+                            (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1))
+                """),
+                {"iid": institution_id, "uid": str(existing.id), "email": email,
+                 "full_name": full_name, "cgid": custom_group_id, "mrole": member_role},
+            )
+            conn.commit()
+        return {"ok": True, "created": False, "message": "User already provisioned."}
+
+    # 3. Generate a secure temp password
+    alphabet    = string.ascii_letters + string.digits + "!@#$%"
+    temp_password = "".join(secrets.choice(alphabet) for _ in range(16))
+
+    hasher = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=4, hash_len=32, salt_len=16)
+    pw_hash = hasher.hash(temp_password)
+
+    # 4. Create auth_portal.auth_users
+    new_user = conn.execute(
+        text("""
+            INSERT INTO auth_portal.auth_users
+                (institution_id, email, role, password_hash, is_active,
+                 email_verified, created_at, updated_at)
+            VALUES (:iid, :email, 'institution_member', :pw, true,
+                    true, now(), now())
+            RETURNING id
+        """),
+        {"iid": institution_id, "email": email, "pw": pw_hash},
+    ).fetchone()
+
+    new_user_id = str(new_user.id)
+
+    # 5. Create institution.member
+    conn.execute(
+        text("""
+            INSERT INTO institution.member
+                (institution_id, auth_user_id, email, full_name, role,
+                 is_primary_admin, active, custom_group_id, member_role,
+                 group_id, system_group_id)
+            VALUES (:iid, :uid, :email, :full_name, 'member',
+                    false, true, :cgid, :mrole,
+                    (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
+                    (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1))
+        """),
+        {"iid": institution_id, "uid": new_user_id, "email": email,
+         "full_name": full_name, "cgid": custom_group_id, "mrole": member_role},
+    )
+
+    # 6. Mark execution_status as completed on the governance action
+    conn.execute(
+        text("""
+            UPDATE governance.action
+            SET execution_status = 'executed', executed_at = now()
+            WHERE id = :aid
+        """),
+        {"aid": action_id},
+    )
+
+    conn.commit()
+
+    return {
+        "ok": True,
+        "created": True,
+        "user_id": new_user_id,
+        "email": email,
+        "full_name": full_name,
+        "temp_password": temp_password,
+        "message": "User provisioned. Share the temporary password with the user — they must change it on first login.",
+    }
