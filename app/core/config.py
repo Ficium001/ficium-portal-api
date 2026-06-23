@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # SaaS: Supabase transaction pooler (port 6543, not 5432)
     # Use: postgresql://postgres.[ref]:[password]@aws-0-*.pooler.supabase.com:6543/postgres
     database_url:        str = Field(..., description="Portal Postgres DSN")
-    db_pool_min:         int = 2
+    db_pool_min:         int = 5
     db_pool_max:         int = 10
     db_command_timeout:  float = 30.0
 
