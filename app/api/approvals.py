@@ -181,7 +181,62 @@ async def reject_action(
     return {"result": result.res if result else None}
 
 
-@router.post("/{action_id}/provision-user")
+@router.post("/{action_id}/execute-update")
+async def execute_user_update(
+    action_id: str,
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    Execute a user.update action after checker approval.
+    Applies field changes (full_name, email, member_role) to the member.
+    """
+    row = conn.execute(
+        text("SELECT id, category, status, payload FROM governance.action WHERE id = :aid"),
+        {"aid": action_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Action not found.")
+    if row.category != "user.update":
+        raise HTTPException(status_code=400, detail="Not a user.update action.")
+    if row.status != "approved":
+        raise HTTPException(status_code=400, detail=f"Action not approved (status: {row.status}).")
+
+    payload     = row.payload
+    member_id   = payload.get("member_id")
+    field       = payload.get("field")
+    value       = payload.get("value")
+
+    if not member_id or not field or value is None:
+        raise HTTPException(status_code=400, detail="Invalid payload — missing member_id, field or value.")
+
+    allowed_fields = {"full_name", "email", "member_role"}
+    if field not in allowed_fields:
+        raise HTTPException(status_code=400, detail=f"Invalid field '{field}'.")
+
+    # Apply to institution.member
+    conn.execute(
+        text(f"UPDATE institution.member SET {field} = :value, updated_at = now() WHERE id = :mid"),
+        {"value": value, "mid": member_id},
+    )
+
+    # If email, also update auth_portal.auth_users
+    if field == "email":
+        member = conn.execute(
+            text("SELECT auth_user_id FROM institution.member WHERE id = :mid"),
+            {"mid": member_id},
+        ).fetchone()
+        if member and member.auth_user_id:
+            conn.execute(
+                text("UPDATE auth_portal.auth_users SET email = :value, updated_at = now() WHERE id = :uid"),
+                {"value": value, "uid": str(member.auth_user_id)},
+            )
+
+    conn.execute(
+        text("UPDATE governance.action SET execution_status = 'executed', executed_at = now() WHERE id = :aid"),
+        {"aid": action_id},
+    )
+    conn.commit()
+    return {"ok": True, "field": field, "value": value}
 async def provision_user_from_action(
     action_id: str,
     conn: Session = Depends(tenant_conn),
