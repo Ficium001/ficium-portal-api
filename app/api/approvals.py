@@ -274,6 +274,7 @@ async def provision_user_from_action(
 
     payload        = row.payload
     email          = (payload.get("email") or "").strip().lower()
+    username       = (payload.get("username") or "").strip().lower()
     first_name     = (payload.get("first_name") or "").strip()
     last_name      = (payload.get("last_name") or "").strip()
     full_name      = f"{first_name} {last_name}".strip() or email
@@ -283,6 +284,8 @@ async def provision_user_from_action(
 
     if not email:
         raise HTTPException(status_code=400, detail="No email in action payload.")
+    if not username:
+        raise HTTPException(status_code=400, detail="No username in action payload.")
     if not custom_group_id:
         raise HTTPException(status_code=400, detail="No custom_group_id in action payload.")
 
@@ -326,13 +329,13 @@ async def provision_user_from_action(
     new_user = conn.execute(
         text("""
             INSERT INTO auth_portal.auth_users
-                (institution_id, email, role, password_hash, is_active,
+                (institution_id, email, username, role, password_hash, is_active,
                  email_verified, created_at, updated_at)
-            VALUES (:iid, :email, 'institution_member', :pw, true,
+            VALUES (:iid, :email, :username, 'institution_member', :pw, true,
                     true, now(), now())
             RETURNING id
         """),
-        {"iid": institution_id, "email": email, "pw": pw_hash},
+        {"iid": institution_id, "email": email, "username": username, "pw": pw_hash},
     ).fetchone()
 
     new_user_id = str(new_user.id)
@@ -370,6 +373,7 @@ async def provision_user_from_action(
         "created": True,
         "user_id": new_user_id,
         "email": email,
+        "username": username,
         "full_name": full_name,
         "temp_password": temp_password,
         "message": "User provisioned. Share the temporary password with the user — they must change it on first login.",
