@@ -115,14 +115,16 @@ def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
     claims_json = json.dumps(claims, separators=(",", ":"))
     session = SessionLocal()
     try:
-        # 1. Publish JWT claims for the RLS policies to read.
+        # 1+2 combined into a single roundtrip:
+        #   set_config publishes JWT claims for RLS policies,
+        #   SET LOCAL ROLE drops into non-BYPASSRLS so policies fire.
         session.execute(
-            text("SELECT set_config('request.jwt.claims', :c, true)"),
+            text(
+                "SELECT set_config('request.jwt.claims', :c, true);"
+                " SET LOCAL ROLE authenticated"
+            ),
             {"c": claims_json},
         )
-        # 2. Drop into the non-BYPASSRLS role so policies are enforced.
-        #    Role name is a constant, never user input — safe to inline.
-        session.execute(text("SET LOCAL ROLE authenticated"))
         yield session
         session.commit()
     except Exception:
