@@ -266,6 +266,14 @@ async def update_member(
     updates = {}
     if "full_name" in body and body["full_name"]:
         updates["full_name"] = body["full_name"].strip()
+    if "email" in body and body["email"]:
+        new_email = body["email"].strip().lower()
+        # Update both institution.member and auth_portal.auth_users
+        conn.execute(
+            text("UPDATE auth_portal.auth_users SET email = :email, updated_at = now() WHERE id = :uid"),
+            {"email": new_email, "uid": str(row.auth_user_id)},
+        )
+        updates["email"] = new_email
     if "member_role" in body and body["member_role"]:
         allowed_roles = {"maker", "checker", "viewer", "analyst"}
         if body["member_role"] not in allowed_roles:
