@@ -58,7 +58,7 @@ async def list_audit_events(
     result = conn.execute(
         text("""
             SELECT * FROM audit.event
-            ORDER BY created_at DESC
+            ORDER BY occurred_at DESC
             LIMIT :lim
         """),
         {"lim": limit},
