@@ -369,3 +369,84 @@ async def terminate_session(
             {"aid": admin_id, "sid": body.session_id, "reason": body.reason},
         )
         return {"ok": True}
+
+
+# ─── GET /admin/documents ─────────────────────────────────────────────────────
+# All institution documents across all institutions — for Ficium admin review.
+# Service session: bypasses RLS (admin sees everything).
+
+@router.get("/documents")
+async def admin_list_documents(claims: dict = Depends(current_claims)) -> list[dict]:
+    """All institution compliance documents with institution info and doc type."""
+    with service_session() as conn:
+        _require_admin(claims, conn)
+        rows = conn.execute(
+            text("""
+                SELECT
+                    d.id,
+                    d.institution_id,
+                    i.name              AS institution_name,
+                    i.institution_type,
+                    dt.code             AS doc_type_code,
+                    dt.label            AS doc_type_label,
+                    dt.is_mandatory,
+                    d.file_name,
+                    d.storage_path,
+                    d.mime_type,
+                    d.status,
+                    d.expiry_date,
+                    d.rejection_reason,
+                    d.uploaded_at,
+                    d.reviewed_at,
+                    m.email             AS uploaded_by_email
+                FROM institution.doc d
+                JOIN institution.institution i  ON i.id  = d.institution_id
+                JOIN institution.doc_type dt    ON dt.id = d.doc_type_id
+                LEFT JOIN institution.member m  ON m.id  = d.uploaded_by
+                ORDER BY
+                    CASE d.status WHEN 'pending' THEN 0 WHEN 'rejected' THEN 1 ELSE 2 END,
+                    d.uploaded_at DESC
+            """)
+        ).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+
+# ─── POST /admin/documents/{id}/review ────────────────────────────────────────
+
+@router.post("/documents/{doc_id}/review")
+async def admin_review_document(
+    doc_id: str,
+    body: dict = Body(...),
+    claims: dict = Depends(current_claims),
+) -> dict:
+    """Approve or reject a compliance document. body: { action, rejection_reason? }"""
+    action = body.get("action")
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=422, detail="action must be 'approve' or 'reject'.")
+    if action == "reject" and not body.get("rejection_reason"):
+        raise HTTPException(status_code=422, detail="rejection_reason required when rejecting.")
+
+    with service_session() as conn:
+        admin_id = _require_admin(claims, conn)
+        row = conn.execute(
+            text("""
+                UPDATE institution.doc
+                SET
+                    status           = :status,
+                    rejection_reason = :reason,
+                    reviewed_by      = :reviewer::uuid,
+                    reviewed_at      = now()
+                WHERE id = :id
+                RETURNING id, institution_id, status, rejection_reason, reviewed_at
+            """),
+            {
+                "id":       doc_id,
+                "status":   "approved" if action == "approve" else "rejected",
+                "reason":   body.get("rejection_reason"),
+                "reviewer": admin_id,
+            },
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        conn.commit()
+        return dict(row._mapping)
