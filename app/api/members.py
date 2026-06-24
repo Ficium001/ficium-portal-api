@@ -460,7 +460,7 @@ async def get_member_audit(
                    maker_role, checker_role, created_at, checked_at
             FROM governance.action
             WHERE maker_id = :uid OR checker_id = :uid
-            ORDER BY created_at DESC
+            ORDER BY occurred_at DESC
             LIMIT :lim
         """),
         {"uid": auth_uid, "lim": limit},
