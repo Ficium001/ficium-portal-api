@@ -356,12 +356,15 @@ async def reactivate_member(
 @router.post("/{member_id}/reset-password")
 async def reset_member_password(
     member_id: str,
+    claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """
     Generate a new temporary password for a member.
     Returns the temp password in plaintext — admin must share it with the user.
+    Uses service_session for the auth_users UPDATE (outside institution RLS scope).
     """
+    # 1. Resolve member via tenant_conn (institution-scoped, RLS enforced)
     row = conn.execute(
         text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
         {"mid": member_id},
@@ -377,11 +380,17 @@ async def reset_member_password(
     temp_password = "".join(secrets.choice(alphabet) for _ in range(16))
     pw_hash = _hasher().hash(temp_password)
 
-    conn.execute(
-        text("UPDATE auth_portal.auth_users SET password_hash = :pw, updated_at = now() WHERE id = :uid"),
-        {"pw": pw_hash, "uid": str(row.auth_user_id)},
-    )
-    conn.commit()
+    # 2. Update auth_users via service_session — bypasses RLS on auth_portal schema
+    with service_session() as svc:
+        updated = svc.execute(
+            text("UPDATE auth_portal.auth_users SET password_hash = :pw, updated_at = now() WHERE id = :uid RETURNING id"),
+            {"pw": pw_hash, "uid": str(row.auth_user_id)},
+        ).fetchone()
+        svc.commit()
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Auth user record not found.")
+
     return {
         "ok": True,
         "member_id": member_id,
