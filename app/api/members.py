@@ -384,7 +384,7 @@ async def reset_member_password(
     # 2. Update auth_users via service_session — bypasses RLS on auth_portal schema
     with service_session() as svc:
         updated = svc.execute(
-            text("UPDATE auth_portal.auth_users SET password_hash = :pw, updated_at = now() WHERE id = :uid RETURNING id"),
+            text("UPDATE auth_portal.auth_users SET password_hash = :pw, must_change_password = true, updated_at = now() WHERE id = :uid RETURNING id"),
             {"pw": pw_hash, "uid": str(row.auth_user_id)},
         ).fetchone()
         svc.commit()
