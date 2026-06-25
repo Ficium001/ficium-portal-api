@@ -134,7 +134,7 @@ async def get_bids_bulk(
         owned = conn.execute(
             text("""
                 SELECT id FROM marketplace.request
-                WHERE id = ANY(:ids::uuid[]) AND consumer_id = :cid::uuid
+                WHERE id = ANY(CAST(:ids AS uuid[])) AND consumer_id = CAST(:cid AS uuid)
             """),
             {"ids": body.request_ids, "cid": body.consumer_id},
         ).fetchall()
@@ -153,7 +153,7 @@ async def get_bids_bulk(
                         b.status, b.submitted_at, b.expires_at
                     FROM  marketplace.bid         b
                     JOIN  institution.institution i ON i.id = b.institution_id
-                    WHERE b.request_id = ANY(:ids::uuid[])
+                    WHERE b.request_id = ANY(CAST(:ids AS uuid[]))
                       AND b.status IN ('submitted', 'under_review')
                     ORDER BY b.rate ASC
                 """),
@@ -175,7 +175,7 @@ async def get_bids_bulk(
             owned_legacy = app_conn.execute(
                 text("""
                     SELECT id FROM public.requests
-                    WHERE id = ANY(:ids::uuid[]) AND client_id = :cid::uuid
+                    WHERE id = ANY(CAST(:ids AS uuid[])) AND client_id = CAST(:cid AS uuid)
                 """),
                 {"ids": remaining, "cid": body.consumer_id},
             ).fetchall()
@@ -192,7 +192,7 @@ async def get_bids_bulk(
                             b.submitted_at, b.status
                         FROM  institution.institution_bids b
                         JOIN  institution.institutions     i ON i.id = b.institution_id
-                        WHERE b.request_id = ANY(:ids::uuid[])
+                        WHERE b.request_id = ANY(CAST(:ids AS uuid[]))
                           AND b.status     = 'submitted'
                         ORDER BY b.rate ASC
                     """),
