@@ -235,6 +235,7 @@ def _build_phase1(r, parsed: dict) -> dict:
         "risk_score":              r.risk_score,
         "affordability_score":     r.affordability_score,
         "risk_tier":               _risk_tier(r.risk_score),
+        "age":                     int(r.client_age) if r.client_age else None,
     }
     return {k: v for k, v in phase1.items() if v is not None}
 
@@ -251,6 +252,7 @@ _ENRICH_SQL = """
         r.status::text              AS status,
         r.created_at,
         c.kyc_status,
+        EXTRACT(YEAR FROM AGE(c.date_of_birth))::int AS client_age,
         cd.employment_status,
         cd.employer_name            AS dossier_employer,
         cd.monthly_income,
