@@ -97,8 +97,8 @@ async def get_bids_for_request(
                         b.rate, b.rate_type, b.amount_offered,
                         b.term_months, b.conditions,
                         b.submitted_at, b.status
-                    FROM  institution.institution_bids b
-                    JOIN  institution.institutions     i ON i.id = b.institution_id
+                    FROM  marketplace.bid           b
+                    JOIN  institution.institution   i ON i.id = b.institution_id
                     WHERE b.request_id = :rid
                       AND b.status     = 'submitted'
                     ORDER BY b.rate ASC
@@ -196,8 +196,8 @@ async def get_bids_bulk(
                             b.rate, b.rate_type, b.amount_offered,
                             b.term_months, b.conditions,
                             b.submitted_at, b.status
-                        FROM  institution.institution_bids b
-                        JOIN  institution.institutions     i ON i.id = b.institution_id
+                        FROM  marketplace.bid           b
+                        JOIN  institution.institution   i ON i.id = b.institution_id
                         WHERE b.request_id = ANY(CAST(:ids AS uuid[]))
                           AND b.status     = 'submitted'
                         ORDER BY b.rate ASC
