@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+import uuid as uuid_mod
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query
@@ -28,20 +30,22 @@ def _verify_secret(received: str) -> None:
         raise HTTPException(status_code=403, detail="Invalid service secret.")
 
 
+def _anon_uuid(real_id: str) -> str:
+    """Derive the anonymised consumer UUID stored in Portal DB from the real Supabase user ID."""
+    return str(uuid_mod.UUID(hashlib.md5((real_id + ":ficium-anon-v1:").encode()).hexdigest()))
+
+
 @router.get("/requests/{request_id}/bids")
 async def get_bids_for_request(
     request_id: str,
     consumer_id: str = Query(..., description="Client user ID - must own the request"),
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
 ) -> list[dict]:
-    """
-    Return all submitted bids for a single request (server-to-server only).
-    v2 path: marketplace.request + marketplace.bid (portal DB).
-    Fallback: public.requests + institution_bids (app DB).
-    """
     _verify_secret(x_service_secret)
 
-    # ── v2 path: marketplace.request in portal DB ─────────────────────────────
+    anon_id = _anon_uuid(consumer_id)
+
+    # ── v2 path: portal DB ────────────────────────────────────────────────────
     with service_session() as conn:
         owner = conn.execute(
             text("SELECT consumer_id FROM marketplace.request WHERE id = :rid"),
@@ -49,7 +53,7 @@ async def get_bids_for_request(
         ).fetchone()
 
         if owner is not None:
-            if str(owner.consumer_id) != consumer_id:
+            if str(owner.consumer_id) != anon_id:
                 raise HTTPException(status_code=403, detail="Not the request owner.")
 
             rows = conn.execute(
@@ -72,7 +76,7 @@ async def get_bids_for_request(
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
-    # ── Fallback: public.requests in app DB ───────────────────────────────────
+    # ── Fallback: app DB ──────────────────────────────────────────────────────
     try:
         with app_service_session() as app_conn:
             owner_legacy = app_conn.execute(
@@ -129,6 +133,8 @@ async def get_bids_bulk(
 
     result: dict[str, list[dict]] = {rid: [] for rid in body.request_ids}
 
+    anon_cid = _anon_uuid(body.consumer_id)
+
     # ── v2 path: portal DB ────────────────────────────────────────────────────
     with service_session() as conn:
         owned = conn.execute(
@@ -136,7 +142,7 @@ async def get_bids_bulk(
                 SELECT id FROM marketplace.request
                 WHERE id = ANY(CAST(:ids AS uuid[])) AND consumer_id = CAST(:cid AS uuid)
             """),
-            {"ids": body.request_ids, "cid": body.consumer_id},
+            {"ids": body.request_ids, "cid": anon_cid},
         ).fetchall()
         owned_ids = [str(r.id) for r in owned]
 
