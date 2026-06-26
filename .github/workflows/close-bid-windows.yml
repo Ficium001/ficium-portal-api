@@ -13,7 +13,7 @@ jobs:
       - name: Close expired bid windows
         run: |
           RESPONSE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
-            -X POST "${{ secrets.PORTAL_API_URL }}/marketplace/close-expired" \
+            -X POST "https://ficium-portal-api-production.up.railway.app/marketplace/close-expired" \
             -H "X-Service-Secret: ${{ secrets.APP_SERVICE_SECRET }}" \
             -H "Content-Type: application/json")
           cat /tmp/resp.json
