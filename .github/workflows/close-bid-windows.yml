@@ -1,0 +1,25 @@
+name: Close expired bid windows
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:            # manual trigger for testing
+
+jobs:
+  close-expired:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close expired bid windows
+        run: |
+          RESPONSE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            -X POST "${{ secrets.PORTAL_API_URL }}/marketplace/close-expired" \
+            -H "X-Service-Secret: ${{ secrets.APP_SERVICE_SECRET }}" \
+            -H "Content-Type: application/json")
+          cat /tmp/resp.json
+          if [ "$RESPONSE" != "200" ]; then
+            echo "::error::close-expired returned HTTP $RESPONSE"
+            exit 1
+          fi
+          CLOSED=$(cat /tmp/resp.json | python3 -c "import sys,json; print(json.load(sys.stdin)['closed'])")
+          echo "Closed $CLOSED expired window(s)"

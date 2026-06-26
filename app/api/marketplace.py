@@ -25,7 +25,10 @@ async def list_requests(
                r.country, r.currency, r.amount, r.term_months,
                r.params, r.metadata, r.status,
                r.bid_window_opens_at, r.bid_window_closes_at,
-               r.source, r.created_at
+               r.source, r.created_at,
+               (SELECT COUNT(*) FROM marketplace.bid b
+                WHERE b.request_id = r.id
+                  AND b.status NOT IN ('withdrawn','rejected')) AS bid_count
         FROM marketplace.request r
         JOIN catalog.product        p  ON p.id  = r.product_id
         JOIN catalog.product_family pf ON pf.id = p.family_id
@@ -45,9 +48,10 @@ async def list_requests(
                     SELECT r.id, r.product_type, r.status,
                            r.amount::NUMERIC AS amount, 'MUR' AS currency,
                            r.preferred_term_months AS term_months,
-                           COALESCE(r.decision_deadline, now() + interval '48 hours') AS bid_window_closes_at,
+                           COALESCE(r.decision_deadline, now() + interval '72 hours') AS bid_window_closes_at,
                            r.created_at,
-                           LEFT(md5(r.client_id::text || ':ficium-anon-v1:'), 8) AS consumer_ref
+                           LEFT(md5(r.client_id::text || ':ficium-anon-v1:'), 8) AS consumer_ref,
+                           0 AS bid_count
                     FROM public.requests r WHERE r.status = 'open'
                     ORDER BY r.created_at DESC
                 """))
@@ -84,9 +88,24 @@ async def submit_bid(
     missing = required - set(body.keys())
     if missing:
         raise HTTPException(status_code=422, detail=f"Missing fields: {missing}")
+
     inst_id = claims.get("institution_id")
     if not inst_id:
         raise HTTPException(status_code=403, detail="No institution context.")
+
+    # Window guard — check before hitting the DB trigger
+    req_row = conn.execute(
+        text("SELECT status, bid_window_closes_at FROM marketplace.request WHERE id = :rid"),
+        {"rid": body["request_id"]},
+    ).fetchone()
+    if req_row is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if req_row.status != "bidding":
+        raise HTTPException(status_code=409, detail=f"Request is not open for bidding (status: {req_row.status}).")
+    from datetime import datetime, timezone
+    if req_row.bid_window_closes_at and req_row.bid_window_closes_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="Bid window has closed for this request.")
+
     try:
         result = conn.execute(text("""
             INSERT INTO marketplace.bid
@@ -113,6 +132,7 @@ async def submit_bid(
         }).fetchone()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
     if result is None:
         return {"status": "duplicate", "message": "Bid already submitted."}
     return {"id": str(result.id), "status": result.status, "submitted_at": result.submitted_at.isoformat()}
@@ -125,7 +145,7 @@ async def get_bid(bid_id: str, conn: Session = Depends(tenant_conn)) -> dict:
         raise HTTPException(status_code=404, detail="Bid not found.")
     return _row(row)
 
-# ── POST /marketplace/sync-requests ──────────────────────────────────────────
+# ── POST /marketplace/close-expired ──────────────────────────────────────────
 def _verify_service_secret(received: str) -> None:
     expected = settings.app_service_secret
     if not expected:
@@ -133,6 +153,17 @@ def _verify_service_secret(received: str) -> None:
     if not hmac.compare_digest(received.encode(), expected.encode()):
         raise HTTPException(status_code=403, detail="Invalid service secret.")
 
+@router.post("/close-expired")
+async def close_expired(
+    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
+) -> dict:
+    _verify_service_secret(x_service_secret)
+    with service_session() as conn:
+        result = conn.execute(text("SELECT marketplace.close_expired_windows() AS closed")).fetchone()
+    closed = result.closed if result else 0
+    return {"closed": closed, "message": f"Closed {closed} expired bid window(s)."}
+
+# ── POST /marketplace/sync-requests ──────────────────────────────────────────
 # Phase 1 helpers ─────────────────────────────────────────────────────────────
 def _parse_purpose(purpose: str | None) -> dict:
     if not purpose: return {}
@@ -199,7 +230,6 @@ def _build_phase1(r, parsed: dict) -> dict:
     dsr_cur, dsr_post = _dsr(income, monthly_px, float(r.amount), r.preferred_term_months, parsed)
     ltv = _ltv(float(r.amount), parsed) if col_type not in (None, "none") else None
 
-    # Existing loan balance from snapshot columns
     loan_balance = None
     try:
         loan_balance = float((r.mortgage_balance or 0) + (r.personal_loan_balance or 0) +
@@ -207,35 +237,32 @@ def _build_phase1(r, parsed: dict) -> dict:
     except (TypeError, ValueError):
         pass
 
-    # Employer: prefer employment_details, fallback to dossier
     employer = r.emp_employer_name or r.dossier_employer
 
     phase1 = {
-        # → params (bidding context)
-        "loan_purpose":    parsed.get("purpose"),
-        "collateral_type": col_type,
-        "collateral_sub":  col_sub,
-        "ltv_pct":         ltv,
-        # → metadata (Ficium-attested verified attributes)
-        "kyc_verified":            r.kyc_status == "verified",
-        "employment_status":       r.employment_status,
-        "employment_type":         r.employment_type,          # permanent / contract / self_employed
-        "employer":                employer,                    # name of employer
-        "years_employed":          float(r.years_of_employment) if r.years_of_employment else None,
-        "gross_monthly_income":    income,                     # raw salary in MUR
-        "income_verified":         r.kyc_status == "verified",
-        "dsr_current_pct":         dsr_cur,
-        "dsr_post_pct":            dsr_post,
-        "net_worth_band":          _net_worth_band(net_worth),
-        "has_existing_loans":      r.has_existing_loans,
+        "loan_purpose":               parsed.get("purpose"),
+        "collateral_type":            col_type,
+        "collateral_sub":             col_sub,
+        "ltv_pct":                    ltv,
+        "kyc_verified":               r.kyc_status == "verified",
+        "employment_status":          r.employment_status,
+        "employment_type":            r.employment_type,
+        "employer":                   employer,
+        "years_employed":             float(r.years_of_employment) if r.years_of_employment else None,
+        "gross_monthly_income":       income,
+        "income_verified":            r.kyc_status == "verified",
+        "dsr_current_pct":            dsr_cur,
+        "dsr_post_pct":               dsr_post,
+        "net_worth_band":             _net_worth_band(net_worth),
+        "has_existing_loans":         r.has_existing_loans,
         "existing_monthly_repayment": monthly_px,
-        "existing_loan_balance":   loan_balance,
-        "loan_breakdown":          r.loan_breakdown,           # [{type, outstanding, monthly, bank}]
-        "health_score":            r.health_score,
-        "risk_score":              r.risk_score,
-        "affordability_score":     r.affordability_score,
-        "risk_tier":               _risk_tier(r.risk_score),
-        "age":                     int(r.client_age) if r.client_age else None,
+        "existing_loan_balance":      loan_balance,
+        "loan_breakdown":             r.loan_breakdown,
+        "health_score":               r.health_score,
+        "risk_score":                 r.risk_score,
+        "affordability_score":        r.affordability_score,
+        "risk_tier":                  _risk_tier(r.risk_score),
+        "age":                        int(r.client_age) if r.client_age else None,
     }
     return {k: v for k, v in phase1.items() if v is not None}
 
