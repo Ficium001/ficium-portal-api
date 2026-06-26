@@ -213,3 +213,112 @@ async def get_bids_bulk(
         pass  # fallback unavailable — return what we have from portal DB
 
     return result
+
+
+class AcceptBidRequest(BaseModel):
+    bid_id:      str
+    consumer_id: str   # real Supabase user ID — we derive anon UUID here
+
+
+@router.post("/requests/{request_id}/accept-bid")
+async def accept_bid(
+    request_id: str,
+    body: Annotated[AcceptBidRequest, Body()],
+    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
+) -> dict:
+    """
+    Phase 2 reveal — server-to-server only.
+
+    1. Verify ownership (anon UUID check against Portal DB).
+    2. Fetch borrower PII from App DB.
+    3. Call marketplace.accept_bid() atomically:
+         - winning bid → accepted
+         - all others  → rejected
+         - request     → accepted + winning_bid_id
+         - bid_acceptance row with Phase 2 PII written
+    4. Return institution contact info to caller.
+    """
+    _verify_secret(x_service_secret)
+
+    anon_id = _anon_uuid(body.consumer_id)
+
+    # ── Ownership guard ───────────────────────────────────────────────────────
+    with service_session() as conn:
+        req_row = conn.execute(
+            text("""
+                SELECT r.consumer_id, r.status
+                FROM marketplace.request r
+                WHERE r.id = :rid
+            """),
+            {"rid": request_id},
+        ).fetchone()
+
+    if req_row is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if str(req_row.consumer_id) != anon_id:
+        raise HTTPException(status_code=403, detail="Not the request owner.")
+    if req_row.status in ("accepted", "cancelled", "expired"):
+        raise HTTPException(status_code=409, detail=f"Request already {req_row.status}.")
+
+    # ── Fetch Phase 2 PII from App DB ─────────────────────────────────────────
+    try:
+        with app_service_session() as app_conn:
+            client = app_conn.execute(
+                text("""
+                    SELECT
+                        c.full_name,
+                        c.email,
+                        c.phone,
+                        c.date_of_birth,
+                        CONCAT_WS(', ', c.address_line_1, c.city, c.postal_code) AS address,
+                        k.document_number
+                    FROM public.clients c
+                    LEFT JOIN (
+                        SELECT DISTINCT ON (user_id) user_id, document_number
+                        FROM public.kyc_submissions
+                        WHERE status = 'approved'
+                        ORDER BY user_id, created_at DESC
+                    ) k ON k.user_id = c.id
+                    WHERE c.id = :uid
+                """),
+                {"uid": body.consumer_id},
+            ).fetchone()
+    except AppDatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail="App DB unavailable.") from exc
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client profile not found.")
+
+    phase2 = {
+        "full_name":       client.full_name or "",
+        "email":           client.email or "",
+        "phone":           client.phone,
+        "address":         client.address,
+        "date_of_birth":   client.date_of_birth.isoformat() if client.date_of_birth else None,
+        "document_number": client.document_number,
+    }
+
+    # ── Atomic accept — writes reveal + transitions all statuses ──────────────
+    import json as _json
+    with service_session() as conn:
+        try:
+            result = conn.execute(
+                text("""
+                    SELECT marketplace.accept_bid(
+                        :request_id,
+                        :bid_id,
+                        :consumer_id,
+                        CAST(:phase2 AS jsonb)
+                    ) AS result
+                """),
+                {
+                    "request_id":  request_id,
+                    "bid_id":      body.bid_id,
+                    "consumer_id": anon_id,
+                    "phase2":      _json.dumps(phase2),
+                },
+            ).fetchone()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return dict(result.result) if result else {}
