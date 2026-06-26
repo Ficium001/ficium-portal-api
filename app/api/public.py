@@ -76,39 +76,8 @@ async def get_bids_for_request(
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
-    # ── Fallback: app DB ──────────────────────────────────────────────────────
-    try:
-        with app_service_session() as app_conn:
-            owner_legacy = app_conn.execute(
-                text("SELECT client_id FROM public.requests WHERE id = :rid"),
-                {"rid": request_id},
-            ).fetchone()
-
-            if owner_legacy is None:
-                raise HTTPException(status_code=404, detail="Request not found.")
-            if str(owner_legacy.client_id) != consumer_id:
-                raise HTTPException(status_code=403, detail="Not the request owner.")
-
-            rows = app_conn.execute(
-                text("""
-                    SELECT
-                        b.id, b.request_id, b.institution_id,
-                        i.name      AS institution_name,
-                        b.rate, b.rate_type, b.amount_offered,
-                        b.term_months, b.conditions,
-                        b.submitted_at, b.status
-                    FROM  marketplace.bid           b
-                    JOIN  institution.institution   i ON i.id = b.institution_id
-                    WHERE b.request_id = :rid
-                      AND b.status     = 'submitted'
-                    ORDER BY b.rate ASC
-                """),
-                {"rid": request_id},
-            ).fetchall()
-            return [dict(r._mapping) for r in rows]
-
-    except AppDatabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    # Legacy requests not yet ingested into portal DB have no institution bids.
+    raise HTTPException(status_code=404, detail="Request not found.")
 
 
 class BulkBidsRequest(BaseModel):
@@ -175,43 +144,9 @@ async def get_bids_bulk(
         if not remaining:
             return result
 
-    # ── Fallback: app DB ──────────────────────────────────────────────────────
-    try:
-        with app_service_session() as app_conn:
-            owned_legacy = app_conn.execute(
-                text("""
-                    SELECT id FROM public.requests
-                    WHERE id = ANY(CAST(:ids AS uuid[])) AND client_id = CAST(:cid AS uuid)
-                """),
-                {"ids": remaining, "cid": body.consumer_id},
-            ).fetchall()
-            owned_legacy_ids = [str(r.id) for r in owned_legacy]
-
-            if owned_legacy_ids:
-                rows = app_conn.execute(
-                    text("""
-                        SELECT
-                            b.id, b.request_id, b.institution_id,
-                            i.name      AS institution_name,
-                            b.rate, b.rate_type, b.amount_offered,
-                            b.term_months, b.conditions,
-                            b.submitted_at, b.status
-                        FROM  marketplace.bid           b
-                        JOIN  institution.institution   i ON i.id = b.institution_id
-                        WHERE b.request_id = ANY(CAST(:ids AS uuid[]))
-                          AND b.status     = 'submitted'
-                        ORDER BY b.rate ASC
-                    """),
-                    {"ids": owned_legacy_ids},
-                ).fetchall()
-                for r in rows:
-                    rid = str(r._mapping["request_id"])
-                    if rid in result:
-                        result[rid].append(dict(r._mapping))
-
-    except AppDatabaseUnavailable:
-        pass  # fallback unavailable — return what we have from portal DB
-
+    # Legacy requests not yet ingested into portal DB have no institution bids —
+    # institution.institution and marketplace.bid do not exist on the App DB.
+    # Return what the portal DB gave us; remaining IDs stay as empty lists.
     return result
 
 
