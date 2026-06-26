@@ -209,11 +209,11 @@ async def accept_bid(
                         k.document_number
                     FROM public.clients c
                     LEFT JOIN (
-                        SELECT DISTINCT ON (user_id) user_id, document_number
+                        SELECT DISTINCT ON (client_id) client_id, document_number
                         FROM public.kyc_submissions
                         WHERE status = 'approved'
-                        ORDER BY user_id, created_at DESC
-                    ) k ON k.user_id = c.id
+                        ORDER BY client_id, submitted_at DESC
+                    ) k ON k.client_id = c.id
                     WHERE c.id = :uid
                 """),
                 {"uid": body.consumer_id},
