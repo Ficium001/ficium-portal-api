@@ -18,6 +18,7 @@ from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
 from .api.marketplace import router as marketplace_router
 from .api.members import router as members_router
+from .api.pipeline import router as pipeline_router
 from .api.public import router as public_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
@@ -67,4 +68,5 @@ app.include_router(marketplace_router)
 app.include_router(catalog_router)
 app.include_router(benefits_router)
 app.include_router(documents_router)
+app.include_router(pipeline_router)
 app.include_router(public_router)   # server-to-server, no JWT

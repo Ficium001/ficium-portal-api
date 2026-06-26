@@ -257,3 +257,68 @@ async def accept_bid(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return dict(result.result) if result else {}
+
+
+# ── GET /public/requests/{request_id}/pipeline ────────────────────────────────
+@router.get("/requests/{request_id}/pipeline")
+async def get_pipeline_for_borrower(
+    request_id:        str,
+    consumer_id:       str = Query(...),
+    x_service_secret:  str = Header(default="", alias="X-Service-Secret"),
+) -> dict:
+    """
+    Returns borrower-visible pipeline stages for the client tracker.
+    Server-to-server only (X-Service-Secret).
+    Only returns stages where borrower_visible = true.
+    Returns {"status": "pending"} if no pipeline exists yet.
+    """
+    _verify_secret(x_service_secret)
+
+    anon_id = _anon_uuid(consumer_id)
+
+    with service_session() as conn:
+        pipeline = conn.execute(text("""
+            SELECT
+                lp.id           AS pipeline_id,
+                lp.status,
+                lp.deal_amount,
+                lp.deal_rate,
+                lp.deal_term_months,
+                lp.started_at,
+                lp.completed_at,
+                i.name          AS institution_name
+            FROM marketplace.loan_pipeline lp
+            JOIN institution.institution i ON i.id = lp.institution_id
+            JOIN marketplace.request r     ON r.id = lp.request_id
+            WHERE r.id = :rid AND lp.consumer_id = :cid
+            ORDER BY lp.started_at DESC LIMIT 1
+        """), {"rid": request_id, "cid": anon_id}).fetchone()
+
+    if pipeline is None:
+        return {"status": "pending", "stages": [], "message": "Pipeline not yet created."}
+
+    pipeline_dict = dict(pipeline._mapping)
+
+    with service_session() as conn:
+        stages = conn.execute(text("""
+            SELECT
+                psi.id,
+                psi.position,
+                psi.status,
+                psi.started_at,
+                psi.completed_at,
+                psi.sla_due_at,
+                psd.borrower_label  AS label,
+                psd.stage_key,
+                psd.borrower_visible
+            FROM marketplace.pipeline_stage_instance psi
+            JOIN institution.pipeline_stage_def psd ON psd.id = psi.stage_def_id
+            WHERE psi.pipeline_id = :pid
+              AND psd.borrower_visible = true
+            ORDER BY psi.position
+        """), {"pid": pipeline_dict["pipeline_id"]}).fetchall()
+
+    return {
+        **pipeline_dict,
+        "stages": [dict(s._mapping) for s in stages],
+    }
