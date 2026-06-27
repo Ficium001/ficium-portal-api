@@ -21,8 +21,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..deps import current_claims, tenant_conn
 from ..core.db import service_session
+from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -186,6 +186,8 @@ async def register_document(
         },
     ).fetchone()
     conn.commit()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Document record could not be created.")
     return dict(row._mapping)
 
 
@@ -256,7 +258,10 @@ async def get_upload_url(
     _require_module(claims)
     institution_id = _institution_id(claims)
 
-    import os, httpx, uuid as _uuid
+    import os
+    import uuid as _uuid
+
+    import httpx
     file_name   = body.get("file_name", "file")
     ext         = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "bin"
     object_name = f"{institution_id}/{body.get('doc_type_id', 'misc')}/{_uuid.uuid4()}.{ext}"
