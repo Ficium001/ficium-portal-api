@@ -1,8 +1,13 @@
 from __future__ import annotations
-import hmac, json
+
+import hmac
+import json
+from datetime import UTC
+
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
 from ..deps import current_claims, tenant_conn
@@ -102,8 +107,8 @@ async def submit_bid(
         raise HTTPException(status_code=404, detail="Request not found.")
     if req_row.status != "bidding":
         raise HTTPException(status_code=409, detail=f"Request is not open for bidding (status: {req_row.status}).")
-    from datetime import datetime, timezone
-    if req_row.bid_window_closes_at and req_row.bid_window_closes_at < datetime.now(timezone.utc):
+    from datetime import datetime
+    if req_row.bid_window_closes_at and req_row.bid_window_closes_at < datetime.now(UTC):
         raise HTTPException(status_code=409, detail="Bid window has closed for this request.")
 
     try:
@@ -166,7 +171,8 @@ async def close_expired(
 # ── POST /marketplace/sync-requests ──────────────────────────────────────────
 # Phase 1 helpers ─────────────────────────────────────────────────────────────
 def _parse_purpose(purpose: str | None) -> dict:
-    if not purpose: return {}
+    if not purpose:
+        return {}
     out: dict = {}
     for part in purpose.split("|"):
         part = part.strip()
@@ -176,18 +182,27 @@ def _parse_purpose(purpose: str | None) -> dict:
     return out
 
 def _net_worth_band(nw: float | None) -> str | None:
-    if nw is None: return None
-    if nw < 0:          return "negative"
-    if nw < 500_000:    return "< 500k"
-    if nw < 1_000_000:  return "500k-1M"
-    if nw < 5_000_000:  return "1M-5M"
+    if nw is None:
+        return None
+    if nw < 0:
+        return "negative"
+    if nw < 500_000:
+        return "< 500k"
+    if nw < 1_000_000:
+        return "500k-1M"
+    if nw < 5_000_000:
+        return "1M-5M"
     return "> 5M"
 
 def _risk_tier(risk_score: int | None) -> str | None:
-    if risk_score is None: return None
-    if risk_score < 20: return "A"
-    if risk_score < 40: return "B"
-    if risk_score < 60: return "C"
+    if risk_score is None:
+        return None
+    if risk_score < 20:
+        return "A"
+    if risk_score < 40:
+        return "B"
+    if risk_score < 60:
+        return "C"
     return "D"
 
 def _collateral(product_type: str, parsed: dict) -> tuple[str | None, str | None]:
@@ -212,11 +227,14 @@ def _ltv(amount: float, parsed: dict) -> float | None:
     return None
 
 def _dsr(monthly_income, monthly_loan_payments, amount, term_months, parsed) -> tuple[float | None, float | None]:
-    if not monthly_income: return None, None
+    if not monthly_income:
+        return None, None
     existing = monthly_loan_payments
     if existing is None:
-        try: existing = float(parsed.get("monthly_debt") or 0)
-        except (TypeError, ValueError): existing = 0.0
+        try:
+            existing = float(parsed.get("monthly_debt") or 0)
+        except (TypeError, ValueError):
+            existing = 0.0
     existing = existing or 0.0
     dsr_current = round((existing / monthly_income) * 100, 1)
     dsr_post = round(((existing + amount / term_months) / monthly_income) * 100, 1) if term_months else None
