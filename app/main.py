@@ -9,15 +9,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api.admin import router as admin_router
-from .api.benefits import router as benefits_router
-from .api.documents import router as documents_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
+from .api.benefits import router as benefits_router
 from .api.catalog import router as catalog_router
+from .api.documents import router as documents_router
 from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
 from .api.marketplace import router as marketplace_router
 from .api.members import router as members_router
+from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.public import router as public_router
 from .core.config import settings
@@ -69,4 +70,5 @@ app.include_router(catalog_router)
 app.include_router(benefits_router)
 app.include_router(documents_router)
 app.include_router(pipeline_router)
+app.include_router(notifications_router)
 app.include_router(public_router)   # server-to-server, no JWT
