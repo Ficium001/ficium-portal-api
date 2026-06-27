@@ -256,6 +256,7 @@ async def provision_user_from_action(
     """
     import secrets
     import string
+
     from argon2 import PasswordHasher
 
     # 1. Load the approved action (scoped to caller's institution via tenant_conn)
@@ -341,6 +342,8 @@ async def provision_user_from_action(
         {"iid": institution_id, "email": email, "username": username, "pw": pw_hash},
     ).fetchone()
 
+    if new_user is None:
+        raise HTTPException(status_code=500, detail="Auth user record could not be created.")
     new_user_id = str(new_user.id)
 
     # 5. Create institution.member
