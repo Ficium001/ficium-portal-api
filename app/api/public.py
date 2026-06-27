@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
+from .notifications import _write_notification
 
 log = logging.getLogger(__name__)
 
@@ -255,6 +256,24 @@ async def accept_bid(
             ).fetchone()
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # ── Write bid_accepted notification to winning institution ───────────────
+    if result and result.result:
+        res_data = dict(result.result)
+        winning_institution = res_data.get("institution_id")
+        product_label       = res_data.get("product_label", "loan")
+        if winning_institution:
+            with service_session() as notif_conn:
+                _write_notification(
+                    notif_conn,
+                    str(winning_institution),
+                    kind="bid_accepted",
+                    title="Your bid was accepted!",
+                    body=f"A borrower accepted your {product_label} offer. Their identity has been revealed.",
+                    link="/bids",
+                    metadata={"request_id": request_id, "bid_id": body.bid_id},
+                )
+                notif_conn.commit()
 
     return dict(result.result) if result else {}
 
