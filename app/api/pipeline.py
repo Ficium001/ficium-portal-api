@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from ..core.db import service_session
 from ..deps import current_claims, tenant_conn
+from .notifications import _write_notification
 
 router = APIRouter(prefix="/pipelines", tags=["pipeline"])
 
@@ -233,12 +234,21 @@ async def advance_stage(
                     updated_at   = now()
                 WHERE id = :sid
             """), {"sid": stage_id, "member": member_id, "notes": notes})
+            # Notify institution: a stage is waiting for checker approval
+            _write_notification(
+                conn, institution_id,
+                kind="approval_needed",
+                title="Stage awaiting approval",
+                body="A pipeline stage requires checker sign-off.",
+                link=f"/pipeline/{pipeline_id}",
+                metadata={"pipeline_id": pipeline_id, "stage_id": stage_id},
+            )
             conn.commit()
             return {"status": "awaiting_approval", "stage_id": stage_id, "pipeline_id": pipeline_id}
         else:
             if not member_id:
                 raise HTTPException(status_code=403, detail="Member identity could not be resolved.")
-            return _complete_stage(conn, pipeline_id, stage_id, stage["position"], member_id, notes)
+            return _complete_stage(conn, pipeline_id, stage_id, stage["position"], member_id, notes, institution_id or "")
 
 
 # ── POST /pipelines/{id}/stages/{stage_id}/approve ────────────────────────────
@@ -292,17 +302,18 @@ async def approve_stage(
 
         if not member_id:
             raise HTTPException(status_code=403, detail="Member identity could not be resolved.")
-        return _complete_stage(conn, pipeline_id, stage_id, stage["position"], member_id, notes)
+        return _complete_stage(conn, pipeline_id, stage_id, stage["position"], member_id, notes, institution_id or "")
 
 
 # ── Shared: complete a stage + activate next (or close pipeline) ───────────────
 def _complete_stage(
     conn: Session,
-    pipeline_id: str,
-    stage_id:    str,
-    position:    int,
-    member_id:   str,
-    notes:       str | None,
+    pipeline_id:    str,
+    stage_id:       str,
+    position:       int,
+    member_id:      str,
+    notes:          str | None,
+    institution_id: str = "",
 ) -> dict:
     # Mark this stage complete
     conn.execute(text("""
@@ -334,6 +345,15 @@ def _complete_stage(
             SET current_stage_id = :nid, updated_at = now()
             WHERE id = :pid
         """), {"nid": next_stage["id"], "pid": pipeline_id})
+        # Notify institution: pipeline advanced to next stage
+        _write_notification(
+            conn, institution_id,
+            kind="pipeline_advanced",
+            title="Pipeline stage completed",
+            body="A processing stage has been completed and the next stage is now active.",
+            link=f"/pipeline/{pipeline_id}",
+            metadata={"pipeline_id": pipeline_id, "completed_stage_id": stage_id},
+        )
         conn.commit()
         return {"status": "advanced", "next_stage_id": next_stage["id"], "pipeline_id": pipeline_id}
     else:
