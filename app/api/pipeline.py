@@ -17,7 +17,7 @@
 # =============================================================================
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -236,6 +236,8 @@ async def advance_stage(
             conn.commit()
             return {"status": "awaiting_approval", "stage_id": stage_id, "pipeline_id": pipeline_id}
         else:
+            if not member_id:
+                raise HTTPException(status_code=403, detail="Member identity could not be resolved.")
             return _complete_stage(conn, pipeline_id, stage_id, stage["position"], member_id, notes)
 
 
@@ -288,6 +290,8 @@ async def approve_stage(
             WHERE id = :sid
         """), {"sid": stage_id, "member": member_id, "notes": notes})
 
+        if not member_id:
+            raise HTTPException(status_code=403, detail="Member identity could not be resolved.")
         return _complete_stage(conn, pipeline_id, stage_id, stage["position"], member_id, notes)
 
 
