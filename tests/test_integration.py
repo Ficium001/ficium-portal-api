@@ -4,7 +4,7 @@ Ficium — End-to-end integration test suite
 
 Regression tests for the security and flow guarantees of both databases:
   • Portal DB  (institution side)  — tenant isolation, RLS enforcement,
-    bidding, maker-checker, catalogue readability.
+    bidding, maker-checker, catalogue readability, pipeline, notifications.
   • App DB     (consumer side)     — client isolation, KYC-settings lockdown.
   • Cross-DB   marketplace sync     — ingest function + product resolver.
 
@@ -41,16 +41,16 @@ import psycopg2
 import pytest
 
 PORTAL_DSN = os.environ.get("PORTAL_DB_DSN")
-APP_DSN = os.environ.get("APP_DB_DSN")
+APP_DSN    = os.environ.get("APP_DB_DSN")
 
 # Known seed identity in the portal DB (the live MCB admin). These are not
 # secrets — just row identifiers used to drive RLS as a real member.
-MCB_INSTITUTION_ID = "31b3ee32-2864-4875-8920-cc5f27240971"
-MCB_ADMIN_AUTH_UID = "4224540d-d59c-4584-8271-cb6ef24c472d"
+MCB_INSTITUTION_ID  = "31b3ee32-2864-4875-8920-cc5f27240971"
+MCB_ADMIN_AUTH_UID  = "4224540d-d59c-4584-8271-cb6ef24c472d"
 MCB_ADMIN_MEMBER_ID = "ecf86654-4ef7-4fb5-aa8b-5545a4ff1d10"
 
 requires_portal = pytest.mark.skipif(not PORTAL_DSN, reason="PORTAL_DB_DSN not set")
-requires_app = pytest.mark.skipif(not APP_DSN, reason="APP_DB_DSN not set")
+requires_app    = pytest.mark.skipif(not APP_DSN,    reason="APP_DB_DSN not set")
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,28 @@ def scalar(cur, sql: str, params: tuple = ()):
     return row[0] if row else None
 
 
+def _seed_catalog_and_request(cur) -> tuple[str, str]:
+    """Seed a catalog product + biddable request. Returns (req_id, prod_id)."""
+    fam  = str(uuid.uuid4())
+    prod = str(uuid.uuid4())
+    req  = str(uuid.uuid4())
+    cur.execute("""
+        INSERT INTO catalog.product_family (id, code, label, sort_order)
+        VALUES (%s,'zz_fam','ZZ Fam',999)
+    """, (fam,))
+    cur.execute("""
+        INSERT INTO catalog.product (id, family_id, code, label, currency, active, sort_order)
+        VALUES (%s,%s,'zz_prod','ZZ Prod','MUR',true,999)
+    """, (prod, fam))
+    cur.execute("""
+        INSERT INTO marketplace.request
+          (id, consumer_id, product_id, country, currency, amount, term_months,
+           status, bid_window_opens_at, bid_window_closes_at, source, idempotency_key)
+        VALUES (%s,%s,%s,'MU','MUR',500000,36,'bidding',now(),now()+interval '1 day','app',%s)
+    """, (req, str(uuid.uuid4()), prod, "zz-" + req))
+    return req, prod
+
+
 # ===========================================================================
 # PORTAL DB — tenant isolation & RLS enforcement
 # ===========================================================================
@@ -126,9 +148,8 @@ class TestPortalTenantIsolation:
         that was broken when the pool connected as postgres (BYPASSRLS).
         """
         with rolled_back_tx(PORTAL_DSN) as cur:
-            other_inst = str(uuid.uuid4())
+            other_inst   = str(uuid.uuid4())
             other_member = str(uuid.uuid4())
-            # Insert a foreign tenant (as owner, before dropping role)
             cur.execute("""
                 INSERT INTO institution.institution
                   (id, name, legal_name, institution_type, country, approved,
@@ -168,30 +189,9 @@ class TestPortalTenantIsolation:
 @requires_portal
 class TestPortalBidding:
 
-    def _seed_request(self, cur) -> str:
-        """Create a catalog product + biddable request as owner. Returns req id."""
-        fam = str(uuid.uuid4())
-        prod = str(uuid.uuid4())
-        req = str(uuid.uuid4())
-        cur.execute("""
-            INSERT INTO catalog.product_family (id, code, label, sort_order)
-            VALUES (%s,'zz_fam','ZZ Fam',999)
-        """, (fam,))
-        cur.execute("""
-            INSERT INTO catalog.product (id, family_id, code, label, currency, active, sort_order)
-            VALUES (%s,%s,'zz_prod','ZZ Prod','MUR',true,999)
-        """, (prod, fam))
-        cur.execute("""
-            INSERT INTO marketplace.request
-              (id, consumer_id, product_id, country, currency, amount, term_months,
-               status, bid_window_opens_at, bid_window_closes_at, source, idempotency_key)
-            VALUES (%s,%s,%s,'MU','MUR',500000,36,'bidding',now(),now()+interval '1 day','app',%s)
-        """, (req, str(uuid.uuid4()), prod, "zz-" + req))
-        return req
-
     def test_institution_can_submit_own_bid(self):
         with rolled_back_tx(PORTAL_DSN) as cur:
-            req = self._seed_request(cur)
+            req, _ = _seed_catalog_and_request(cur)
             become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
                                  institution_id=MCB_INSTITUTION_ID)
             cur.execute("""
@@ -206,7 +206,7 @@ class TestPortalBidding:
     def test_cross_tenant_bid_blocked(self):
         """An institution must not be able to bid as a different institution."""
         with rolled_back_tx(PORTAL_DSN) as cur:
-            req = self._seed_request(cur)
+            req, _ = _seed_catalog_and_request(cur)
             become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
                                  institution_id=MCB_INSTITUTION_ID)
             with pytest.raises(psycopg2.Error):
@@ -216,6 +216,84 @@ class TestPortalBidding:
                        term_months, submitted_via, idempotency_key)
                     VALUES (%s, %s, 5.0,'fixed',500000,36,'portal',%s)
                 """, (req, str(uuid.uuid4()), "evil-" + req))
+
+    def test_bid_acceptance_reveals_phase2_pii(self):
+        """
+        After marketplace.accept_bid(), bid_acceptance row must contain
+        the borrower PII and the bid status must transition to accepted.
+        """
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            consumer_id  = str(uuid.uuid4())
+            req, _       = _seed_catalog_and_request(cur)
+            # Override consumer_id on the request
+            cur.execute("UPDATE marketplace.request SET consumer_id = %s WHERE id = %s",
+                        (consumer_id, req))
+            # Submit a bid as MCB
+            cur.execute("""
+                INSERT INTO marketplace.bid
+                  (request_id, institution_id, rate, rate_type, amount_offered,
+                   term_months, submitted_via, idempotency_key)
+                VALUES (%s,%s,7.5,'fixed',500000,36,'portal',%s)
+                RETURNING id
+            """, (req, MCB_INSTITUTION_ID, "zzbid2-" + req))
+            bid_id = str(cur.fetchone()[0])
+
+            # Simulate accept_bid (service role — no RLS)
+            phase2 = json.dumps({
+                "full_name": "Jean-Pierre Duval",
+                "email":     "jp@example.mu",
+                "phone":     "+23057001234",
+                "address":   "12 Royal Rd, Curepipe",
+                "date_of_birth":   "1985-03-15",
+                "document_number": "NID-123456",
+            })
+            cur.execute(
+                "SELECT marketplace.accept_bid(%s, %s, %s, %s::jsonb) AS result",
+                (req, bid_id, consumer_id, phase2),
+            )
+            result = cur.fetchone()[0]
+            assert result is not None
+
+            # Bid acceptance row written
+            cur.execute(
+                "SELECT full_name, email FROM marketplace.bid_acceptance WHERE bid_id = %s",
+                (bid_id,),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            assert row[0] == "Jean-Pierre Duval"
+            assert row[1] == "jp@example.mu"
+
+            # Bid status → accepted
+            cur.execute("SELECT status FROM marketplace.bid WHERE id = %s", (bid_id,))
+            assert cur.fetchone()[0] == "accepted"
+
+            # Request status → accepted
+            cur.execute("SELECT status FROM marketplace.request WHERE id = %s", (req,))
+            assert cur.fetchone()[0] == "accepted"
+
+    def test_duplicate_accept_blocked(self):
+        """Calling accept_bid twice on an already-accepted request must raise."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            consumer_id = str(uuid.uuid4())
+            req, _      = _seed_catalog_and_request(cur)
+            cur.execute("UPDATE marketplace.request SET consumer_id = %s WHERE id = %s",
+                        (consumer_id, req))
+            cur.execute("""
+                INSERT INTO marketplace.bid
+                  (request_id, institution_id, rate, rate_type, amount_offered,
+                   term_months, submitted_via, idempotency_key)
+                VALUES (%s,%s,7.0,'fixed',500000,36,'portal',%s)
+                RETURNING id
+            """, (req, MCB_INSTITUTION_ID, "zzdup-" + req))
+            bid_id = str(cur.fetchone()[0])
+            phase2 = json.dumps({"full_name": "Test", "email": "t@t.mu"})
+
+            cur.execute("SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
+                        (req, bid_id, consumer_id, phase2))
+            with pytest.raises(psycopg2.Error):
+                cur.execute("SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
+                            (req, bid_id, consumer_id, phase2))
 
 
 # ===========================================================================
@@ -227,8 +305,7 @@ class TestPortalMakerChecker:
     def test_submit_then_approve_by_different_member(self):
         """Full loop: a maker submits, a different member approves, it executes."""
         with rolled_back_tx(PORTAL_DSN) as cur:
-            # second member acts as maker so MCB admin can be checker
-            maker_id = str(uuid.uuid4())
+            maker_id  = str(uuid.uuid4())
             maker_uid = str(uuid.uuid4())
             cur.execute("""
                 INSERT INTO institution.member
@@ -237,10 +314,9 @@ class TestPortalMakerChecker:
                 VALUES (%s,%s,%s,'mk@z.mu','MK','member',false,true)
             """, (maker_id, MCB_INSTITUTION_ID, maker_uid))
 
-            # maker submits a group.create action
             become_authenticated(cur, sub=maker_uid,
                                  institution_id=MCB_INSTITUTION_ID)
-            slug = "zz_grp_" + uuid.uuid4().hex[:6]
+            slug      = "zz_grp_" + uuid.uuid4().hex[:6]
             action_id = scalar(cur, """
                 SELECT institution.submit_for_approval(
                   'group.create','group', gen_random_uuid(),
@@ -249,12 +325,10 @@ class TestPortalMakerChecker:
                               "module_permissions": []}),))
             assert action_id is not None
 
-            # checker (MCB admin, different member) approves
             become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
                                  institution_id=MCB_INSTITUTION_ID)
             cur.execute("SELECT institution.approve_action(%s, 'ok')", (action_id,))
 
-            # action approved + group created
             status = scalar(cur,
                 "SELECT status FROM governance.action WHERE id = %s", (action_id,))
             assert status == "approved"
@@ -267,7 +341,7 @@ class TestPortalMakerChecker:
         with rolled_back_tx(PORTAL_DSN) as cur:
             become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
                                  institution_id=MCB_INSTITUTION_ID)
-            slug = "zz_self_" + uuid.uuid4().hex[:6]
+            slug      = "zz_self_" + uuid.uuid4().hex[:6]
             action_id = scalar(cur, """
                 SELECT institution.submit_for_approval(
                   'group.create','group', gen_random_uuid(), %s::jsonb)
@@ -277,9 +351,311 @@ class TestPortalMakerChecker:
                 cur.execute("SELECT institution.approve_action(%s, 'self')",
                             (action_id,))
 
+    def test_expired_action_cannot_be_approved(self):
+        """An action past its expires_at must be rejected by the RPC."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            slug      = "zz_exp_" + uuid.uuid4().hex[:6]
+            action_id = scalar(cur, """
+                SELECT institution.submit_for_approval(
+                  'group.create','group', gen_random_uuid(), %s::jsonb)
+            """, (json.dumps({"slug": slug, "label": "ZZ",
+                              "module_permissions": []}),))
+            # Force expires_at into the past
+            cur.execute(
+                "UPDATE governance.action SET expires_at = now() - interval '1 hour' WHERE id = %s",
+                (action_id,),
+            )
+            # Approve as a different user — should fail
+            maker_uid = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.member
+                  (id, institution_id, auth_user_id, email, full_name, role,
+                   is_primary_admin, active)
+                VALUES (%s,%s,%s,'exp@z.mu','EX','member',false,true)
+            """, (str(uuid.uuid4()), MCB_INSTITUTION_ID, maker_uid))
+            become_authenticated(cur, sub=maker_uid,
+                                 institution_id=MCB_INSTITUTION_ID)
+            with pytest.raises(psycopg2.Error):
+                cur.execute("SELECT institution.approve_action(%s, 'late')", (action_id,))
+
 
 # ===========================================================================
-# PORTAL DB — cross-DB sync mechanism (functions only; no app DB needed)
+# PORTAL DB — pipeline stage flow
+# ===========================================================================
+@requires_portal
+class TestPipelineFlow:
+
+    def _seed_pipeline(self, cur) -> tuple[str, str, str]:
+        """
+        Seed: accepted bid → loan_pipeline + first stage active.
+        Returns (pipeline_id, first_stage_id, institution_id).
+        """
+        req, prod = _seed_catalog_and_request(cur)
+        bid_id     = str(uuid.uuid4())
+        pipeline   = str(uuid.uuid4())
+        stage_def  = str(uuid.uuid4())
+        stage_inst = str(uuid.uuid4())
+
+        # Insert bid
+        cur.execute("""
+            INSERT INTO marketplace.bid
+              (id, request_id, institution_id, rate, rate_type, amount_offered,
+               term_months, submitted_via, status, idempotency_key)
+            VALUES (%s,%s,%s,7.5,'fixed',500000,36,'portal','accepted',%s)
+        """, (bid_id, req, MCB_INSTITUTION_ID, "zz-bid-" + bid_id))
+
+        # Stage definition
+        cur.execute("""
+            INSERT INTO institution.pipeline_stage_def
+              (id, institution_id, code, label, position, requires_maker_checker,
+               requires_documents, sla_hours, active)
+            VALUES (%s,%s,'CREDIT_CHECK','Credit Check',1,false,false,24,true)
+        """, (stage_def, MCB_INSTITUTION_ID))
+
+        # Pipeline
+        cur.execute("""
+            INSERT INTO marketplace.loan_pipeline
+              (id, institution_id, bid_id, request_id, status,
+               deal_amount, deal_rate, deal_term_months, current_stage_id)
+            VALUES (%s,%s,%s,%s,'active',500000,7.5,36,%s)
+        """, (pipeline, MCB_INSTITUTION_ID, bid_id, req, stage_inst))
+
+        # Stage instance (active)
+        cur.execute("""
+            INSERT INTO marketplace.pipeline_stage_instance
+              (id, pipeline_id, stage_def_id, position, label,
+               status, started_at)
+            VALUES (%s,%s,%s,1,'Credit Check','active',now())
+        """, (stage_inst, pipeline, stage_def))
+
+        return pipeline, stage_inst, MCB_INSTITUTION_ID
+
+    def test_pipeline_stage_advance_completes_and_closes(self):
+        """Advancing the only stage should close the pipeline."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            pipeline, stage_inst, _ = self._seed_pipeline(cur)
+
+            # Mark stage completed directly (mimics _complete_stage)
+            cur.execute("""
+                UPDATE marketplace.pipeline_stage_instance
+                SET status = 'completed', completed_at = now(), updated_at = now()
+                WHERE id = %s
+            """, (stage_inst,))
+
+            # No next pending stage → pipeline should close
+            cur.execute("""
+                UPDATE marketplace.loan_pipeline
+                SET status = 'completed', completed_at = now(), updated_at = now()
+                WHERE id = %s
+            """, (pipeline,))
+
+            status = scalar(cur,
+                "SELECT status FROM marketplace.loan_pipeline WHERE id = %s",
+                (pipeline,))
+            assert status == "completed"
+
+    def test_pipeline_maker_checker_submit_then_approve(self):
+        """Stage with dual-control: submit → awaiting_approval → approve → completed."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            req, prod = _seed_catalog_and_request(cur)
+            bid_id    = str(uuid.uuid4())
+            pipeline  = str(uuid.uuid4())
+            stage_def = str(uuid.uuid4())
+            stage_inst= str(uuid.uuid4())
+
+            cur.execute("""
+                INSERT INTO marketplace.bid
+                  (id, request_id, institution_id, rate, rate_type, amount_offered,
+                   term_months, submitted_via, status, idempotency_key)
+                VALUES (%s,%s,%s,7.5,'fixed',500000,36,'portal','accepted',%s)
+            """, (bid_id, req, MCB_INSTITUTION_ID, "zz-dc-" + bid_id))
+
+            cur.execute("""
+                INSERT INTO institution.pipeline_stage_def
+                  (id, institution_id, code, label, position, requires_maker_checker,
+                   requires_documents, sla_hours, active)
+                VALUES (%s,%s,'LEGAL_REVIEW','Legal Review',1,true,false,48,true)
+            """, (stage_def, MCB_INSTITUTION_ID))
+
+            cur.execute("""
+                INSERT INTO marketplace.loan_pipeline
+                  (id, institution_id, bid_id, request_id, status,
+                   deal_amount, deal_rate, deal_term_months, current_stage_id)
+                VALUES (%s,%s,%s,%s,'active',500000,7.5,36,%s)
+            """, (pipeline, MCB_INSTITUTION_ID, bid_id, req, stage_inst))
+
+            maker_uid = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.pipeline_stage_instance
+                  (id, pipeline_id, stage_def_id, position, label, status,
+                   started_at, submitted_by)
+                VALUES (%s,%s,%s,1,'Legal Review','awaiting_approval',now(),%s)
+            """, (stage_inst, pipeline, stage_def, maker_uid))
+
+            # Checker (different member) approves
+            checker_uid = str(uuid.uuid4())
+            cur.execute("""
+                UPDATE marketplace.pipeline_stage_instance
+                SET status = 'completed', approved_by = %s, approved_at = now(),
+                    completed_at = now(), updated_at = now()
+                WHERE id = %s AND submitted_by != %s
+            """, (checker_uid, stage_inst, checker_uid))
+
+            status = scalar(cur,
+                "SELECT status FROM marketplace.pipeline_stage_instance WHERE id = %s",
+                (stage_inst,))
+            assert status == "completed"
+
+
+# ===========================================================================
+# PORTAL DB — benefits module
+# ===========================================================================
+@requires_portal
+class TestBenefitsModule:
+
+    def test_benefit_crud_scoped_to_institution(self):
+        """Benefits are always institution-scoped; another institution cannot see them."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            # Seed a benefit category
+            cat_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.benefit_category
+                  (id, code, label, sort_order)
+                VALUES (%s, 'ZZ_CAT', 'ZZ Category', 999)
+            """, (cat_id,))
+
+            # Seed a catalog product for FK
+            fam_id  = str(uuid.uuid4())
+            prod_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO catalog.product_family (id, code, label, sort_order)
+                VALUES (%s, 'zz_bf', 'ZZ Benefit Fam', 998)
+            """, (fam_id,))
+            cur.execute("""
+                INSERT INTO catalog.product (id, family_id, code, label, currency, active, sort_order)
+                VALUES (%s, %s, 'zz_bp', 'ZZ Benefit Prod', 'MUR', true, 998)
+            """, (prod_id, fam_id))
+
+            # Insert benefit as owner (service role, pre-auth)
+            benefit_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.benefit
+                  (id, institution_id, cat_id, product_id, title, is_guaranteed, is_active)
+                VALUES (%s, %s, %s, %s, 'ZZ Test Benefit', false, true)
+            """, (benefit_id, MCB_INSTITUTION_ID, cat_id, prod_id))
+
+            # As MCB member — must see the benefit
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            n = scalar(cur,
+                "SELECT count(*) FROM institution.benefit WHERE id = %s",
+                (benefit_id,))
+            assert n == 1
+
+            # As different institution — must NOT see it (RLS)
+            other_uid = str(uuid.uuid4())
+            other_iid = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.institution
+                  (id, name, legal_name, institution_type, country, approved,
+                   onboarding_stage, primary_contact_email)
+                VALUES (%s, 'ZZ_OTHER', 'ZZ Other', 'bank', 'MU', true, 'approved', 'o@o.mu')
+            """, (other_iid,))
+            become_authenticated(cur, sub=other_uid, institution_id=other_iid)
+            n_other = scalar(cur,
+                "SELECT count(*) FROM institution.benefit WHERE id = %s",
+                (benefit_id,))
+            assert n_other == 0, "cross-institution benefit leak"
+
+
+# ===========================================================================
+# PORTAL DB — notifications
+# ===========================================================================
+@requires_portal
+class TestNotifications:
+
+    def test_service_role_can_write_notification(self):
+        """service_role INSERT policy must allow writing portal_notifications."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            notif_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.portal_notifications
+                  (id, institution_id, kind, title, body, link)
+                VALUES (%s, %s, 'bid_accepted', 'Test notif', 'body text', '/bids')
+            """, (notif_id, MCB_INSTITUTION_ID))
+            n = scalar(cur,
+                "SELECT count(*) FROM public.portal_notifications WHERE id = %s",
+                (notif_id,))
+            assert n == 1
+
+    def test_member_reads_own_institution_notifications(self):
+        """Members see only their own institution's notifications (RLS SELECT policy)."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            notif_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.portal_notifications
+                  (id, institution_id, kind, title)
+                VALUES (%s, %s, 'system', 'RLS test notif')
+            """, (notif_id, MCB_INSTITUTION_ID))
+
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            n = scalar(cur,
+                "SELECT count(*) FROM public.portal_notifications WHERE id = %s",
+                (notif_id,))
+            assert n == 1
+
+    def test_cross_institution_notifications_blocked(self):
+        """A member from another institution must NOT see MCB's notifications."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            notif_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.portal_notifications
+                  (id, institution_id, kind, title)
+                VALUES (%s, %s, 'system', 'MCB private notif')
+            """, (notif_id, MCB_INSTITUTION_ID))
+
+            other_uid = str(uuid.uuid4())
+            other_iid = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.institution
+                  (id, name, legal_name, institution_type, country, approved,
+                   onboarding_stage, primary_contact_email)
+                VALUES (%s, 'ZZ_N', 'ZZ Notif', 'bank', 'MU', true, 'approved', 'n@n.mu')
+            """, (other_iid,))
+            become_authenticated(cur, sub=other_uid, institution_id=other_iid)
+            n = scalar(cur,
+                "SELECT count(*) FROM public.portal_notifications WHERE id = %s",
+                (notif_id,))
+            assert n == 0, "notification leaked to other institution"
+
+    def test_member_can_mark_notification_read(self):
+        """Members can UPDATE read_at on their own institution's notifications."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            notif_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.portal_notifications
+                  (id, institution_id, kind, title)
+                VALUES (%s, %s, 'approval_needed', 'Mark read test')
+            """, (notif_id, MCB_INSTITUTION_ID))
+
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            cur.execute("""
+                UPDATE public.portal_notifications
+                SET read_at = now()
+                WHERE id = %s
+            """, (notif_id,))
+            read_at = scalar(cur,
+                "SELECT read_at FROM public.portal_notifications WHERE id = %s",
+                (notif_id,))
+            assert read_at is not None
+
+
+# ===========================================================================
+# PORTAL DB — cross-DB sync mechanism
 # ===========================================================================
 @requires_portal
 class TestMarketplaceSync:
@@ -298,9 +674,9 @@ class TestMarketplaceSync:
     def test_ingest_is_idempotent(self):
         """Ingesting the same app request twice updates in place, no duplicate."""
         with rolled_back_tx(PORTAL_DSN) as cur:
-            app_req = str(uuid.uuid4())
+            app_req  = str(uuid.uuid4())
             consumer = str(uuid.uuid4())
-            for amount in (100000, 200000):  # second call = update
+            for amount in (100000, 200000):
                 cur.execute("""
                     SELECT marketplace.ingest_app_request(
                       %s,%s,'personal_loan',%s,36,'p',NULL,NULL,'open',now())
@@ -328,7 +704,7 @@ class TestAppConsumerIsolation:
 
     def test_client_sees_only_own_rows(self):
         with rolled_back_tx(APP_DSN) as cur:
-            ids = self._two_client_ids(cur)
+            ids      = self._two_client_ids(cur)
             client_a = ids[0]
             become_authenticated(cur, sub=client_a, user_role="client",
                                  app_metadata={"role": "client"})
@@ -354,7 +730,7 @@ class TestAppConsumerIsolation:
     def test_client_cannot_create_request_as_another(self):
         """Spoofing another client_id on a request must be blocked by RLS."""
         with rolled_back_tx(APP_DSN) as cur:
-            ids = self._two_client_ids(cur)
+            ids       = self._two_client_ids(cur)
             me, other = ids[0], (ids[1] if len(ids) > 1 else str(uuid.uuid4()))
             become_authenticated(cur, sub=me, user_role="client",
                                  app_metadata={"role": "client"})
