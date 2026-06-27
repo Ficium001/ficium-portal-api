@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path
 from sqlalchemy import text
@@ -168,6 +167,8 @@ async def create_benefit(
         },
     ).fetchone()
     conn.commit()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Benefit record could not be created.")
     return dict(row._mapping)
 
 
@@ -240,6 +241,8 @@ async def update_benefit(
         {**updates, "id": benefit_id},
     ).fetchone()
     conn.commit()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Benefit not found or no changes applied.")
     return dict(row._mapping)
 
 
