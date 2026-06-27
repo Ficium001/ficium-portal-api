@@ -9,10 +9,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from sqlalchemy import text
+import json as _json
 
-from ..core.db import service_session
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy import text as _text  # noqa: F811 (alias for internal use)
+
+from ..core.db import _session_or_raise, service_session
 from ..deps import current_claims
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -70,6 +74,8 @@ async def admin_metrics(claims: dict = Depends(current_claims)) -> dict:
                 ) AS m
             """)
         ).fetchone()
+        if row is None:
+            return {}
         return row.m
 
 
@@ -210,12 +216,6 @@ async def admin_user_groups(claims: dict = Depends(current_claims)) -> list[dict
 # reimplementing it in Python.
 # =============================================================================
 
-import json as _json
-
-from pydantic import BaseModel
-from sqlalchemy import text as _text
-
-from ..core.db import _session_or_raise
 
 
 def _admin_rpc_session(claims: dict):
