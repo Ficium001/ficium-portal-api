@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import secrets
+import string
+
+from argon2 import PasswordHasher
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -202,10 +206,6 @@ async def list_pending_member_actions(
 # Member management endpoints
 # =============================================================================
 
-from fastapi import Body
-import secrets
-import string
-from argon2 import PasswordHasher
 
 
 def _hasher() -> PasswordHasher:
