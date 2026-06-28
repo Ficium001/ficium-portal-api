@@ -66,11 +66,24 @@ async def get_bids_for_request(
                         b.rate, b.rate_type, b.rate_valid_days,
                         b.amount_offered, b.term_months,
                         b.conditions, b.fee_structure,
-                        b.status, b.submitted_at, b.expires_at
+                        b.status, b.submitted_at, b.expires_at,
+                        COALESCE(
+                          jsonb_agg(
+                            jsonb_build_object(
+                              'title',        bb.title,
+                              'value_display',bb.value_display,
+                              'is_guaranteed',bb.is_guaranteed,
+                              'cat_code',     bb.cat_code
+                            ) ORDER BY bb.is_guaranteed DESC
+                          ) FILTER (WHERE bb.id IS NOT NULL),
+                          '[]'::jsonb
+                        ) AS benefits
                     FROM  marketplace.bid         b
                     JOIN  institution.institution i ON i.id = b.institution_id
+                    LEFT JOIN marketplace.bid_benefit bb ON bb.bid_id = b.id
                     WHERE b.request_id = :rid
                       AND b.status IN ('submitted', 'under_review')
+                    GROUP BY b.id, i.name, i.logo_url
                     ORDER BY b.rate ASC
                 """),
                 {"rid": request_id},
@@ -126,11 +139,29 @@ async def get_bids_bulk(
                         b.rate, b.rate_type, b.rate_valid_days,
                         b.amount_offered, b.term_months,
                         b.conditions, b.fee_structure,
-                        b.status, b.submitted_at, b.expires_at
+                        b.status, b.submitted_at, b.expires_at,
+                        COALESCE(
+                          jsonb_agg(
+                            jsonb_build_object(
+                              'title',        bb.title,
+                              'value_display',bb.value_display,
+                              'is_guaranteed',bb.is_guaranteed,
+                              'cat_code',     bb.cat_code
+                            ) ORDER BY bb.is_guaranteed DESC
+                          ) FILTER (WHERE bb.id IS NOT NULL),
+                          '[]'::jsonb
+                        ) AS benefits
                     FROM  marketplace.bid         b
                     JOIN  institution.institution i ON i.id = b.institution_id
+                    LEFT JOIN marketplace.bid_benefit bb ON bb.bid_id = b.id
                     WHERE b.request_id = ANY(CAST(:ids AS uuid[]))
                       AND b.status IN ('submitted', 'under_review')
+                    GROUP BY b.id, b.request_id, b.institution_id,
+                             i.name, i.logo_url,
+                             b.rate, b.rate_type, b.rate_valid_days,
+                             b.amount_offered, b.term_months,
+                             b.conditions, b.fee_structure,
+                             b.status, b.submitted_at, b.expires_at
                     ORDER BY b.rate ASC
                 """),
                 {"ids": owned_ids},
