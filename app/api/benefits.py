@@ -104,7 +104,7 @@ async def create_benefit(
     """
     _require_module(claims)
     institution_id = _institution_id(claims)
-    member_id      = claims.get("member_id")
+    member_id      = claims.get("member_id") or claims.get("sub")
 
     required = {"cat_id", "title"}
     missing  = required - set(body)
@@ -114,30 +114,25 @@ async def create_benefit(
     is_guaranteed = bool(body.get("is_guaranteed", False))
 
     if is_guaranteed:
-        # Route through governance.action (maker-checker)
-        # Cast payload to jsonb via CAST() — psycopg2 misparses :param::type
+        # Route through maker-checker via submit_for_approval RPC.
+        # The DB function resolves maker_id from auth.uid() (JWT claims GUC).
         import json as _json
-        action_id = str(uuid.uuid4())
-        conn.execute(
+        result = conn.execute(
             text("""
-                INSERT INTO governance.action (
-                    id, institution_id, category, status,
-                    maker_id, maker_role, resource_type, payload
-                ) VALUES (
-                    :id, :iid, 'benefit.create', 'pending',
-                    :maker, :role, 'benefit', CAST(:payload AS jsonb)
-                )
+                SELECT institution.submit_for_approval(
+                    :cat, :rtype, NULL, CAST(:payload AS jsonb)
+                ) AS action_id
             """),
             {
-                "id":      action_id,
-                "iid":     institution_id,
-                "maker":   member_id,
-                "role":    claims.get("user_role", "member"),
+                "cat":     "benefit.create",
+                "rtype":   "benefit",
                 "payload": _json.dumps({**body, "institution_id": institution_id}),
             },
-        )
+        ).fetchone()
         conn.commit()
-        return {"pending": True, "action_id": action_id}
+        if result is None:
+            raise HTTPException(status_code=500, detail="submit_for_approval returned no action id.")
+        return {"pending": True, "action_id": str(result.action_id)}
 
     # Non-guaranteed — direct insert
     row = conn.execute(
@@ -189,7 +184,7 @@ async def update_benefit(
     """
     _require_module(claims)
     institution_id = _institution_id(claims)
-    member_id      = claims.get("member_id")
+    member_id      = claims.get("member_id") or claims.get("sub")
 
     # Verify ownership
     existing = conn.execute(
@@ -205,31 +200,23 @@ async def update_benefit(
 
     if is_guaranteed:
         import json as _json
-        action_id = str(uuid.uuid4())
-        conn.execute(
+        result = conn.execute(
             text("""
-                INSERT INTO governance.action (
-                    id, institution_id, category, status,
-                    maker_id, maker_role, resource_type, resource_id,
-                    payload, payload_before
-                ) VALUES (
-                    :id, :iid, 'benefit.update', 'pending',
-                    :maker, :role, 'benefit', :resource_id,
-                    CAST(:payload AS jsonb), CAST(:before AS jsonb)
-                )
+                SELECT institution.submit_for_approval(
+                    :cat, :rtype, :rid, CAST(:payload AS jsonb)
+                ) AS action_id
             """),
             {
-                "id":          action_id,
-                "iid":         institution_id,
-                "maker":       member_id,
-                "role":        claims.get("user_role", "member"),
-                "resource_id": benefit_id,
-                "payload":     _json.dumps(body),
-                "before":      _json.dumps(dict(existing._mapping), default=str),
+                "cat":     "benefit.update",
+                "rtype":   "benefit",
+                "rid":     benefit_id,
+                "payload": _json.dumps({**body, "payload_before": dict(existing._mapping) if existing else {}}),
             },
-        )
+        ).fetchone()
         conn.commit()
-        return {"pending": True, "action_id": action_id}
+        if result is None:
+            raise HTTPException(status_code=500, detail="submit_for_approval returned no action id.")
+        return {"pending": True, "action_id": str(result.action_id)}
 
     # Non-guaranteed — direct update
     allowed = {"title", "description", "value_display", "conditions",
