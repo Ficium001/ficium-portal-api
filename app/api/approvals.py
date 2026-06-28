@@ -31,7 +31,7 @@ def _row_to_dict(row) -> dict:
 # The prefix is split_part(category, '.', 1).
 CATEGORY_MODULE: dict[str, str] = {
     "bid":      "inst:bid_approval",
-    "benefit":  "inst:products",
+    "benefit":  "inst:benefits",
     "product":  "inst:products",
     "user":     "inst:team",
     "group":    "inst:team",
@@ -86,7 +86,7 @@ async def list_pending_actions(
     # Map action-category prefix → required module permission
     CATEGORY_MODULE: dict[str, str] = {
         "bid":         "inst:bid_approval",
-        "benefit":     "inst:products",
+        "benefit":     "inst:benefits",
         "user":        "inst:team",
         "group":       "inst:team",
         "api_key":     "inst:settings",
