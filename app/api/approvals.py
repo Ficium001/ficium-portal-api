@@ -17,7 +17,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..deps import tenant_conn
+from ..deps import tenant_conn, current_claims as get_claims
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
@@ -26,11 +26,90 @@ def _row_to_dict(row) -> dict:
     return dict(row._mapping)
 
 
+# ── Category → module permission mapping ──────────────────────────────────────
+# Determines which module_permissions a caller needs to see/approve an action.
+# The prefix is split_part(category, '.', 1).
+CATEGORY_MODULE: dict[str, str] = {
+    "bid":      "inst:bid_approval",
+    "benefit":  "inst:products",
+    "product":  "inst:products",
+    "user":     "inst:team",
+    "group":    "inst:team",
+    "api_key":  "inst:settings",
+    "sla":      "inst:settings",
+    "webhook":  "inst:webhooks",
+    "document": "inst:documents",
+}
+
+
+def _caller_permitted(category: str, claims: dict) -> bool:
+    """Return True if the caller's module_permissions cover this action category."""
+    is_super = claims.get("user_role", "") in ("super_admin", "institution_super_admin")
+    if is_super:
+        return True
+    prefix  = category.split(".")[0]
+    module  = CATEGORY_MODULE.get(prefix)
+    perms   = claims.get("module_permissions", [])
+    return module is None or module in perms
+
+
+def _check_action_permission(
+    action_id: str, claims: dict, conn: Session
+) -> None:
+    """
+    Fetch the action category and verify the caller has the required module.
+    Raises 404 if not found (scoped by institution via RLS), 403 if not permitted.
+    """
+    row = conn.execute(
+        text("SELECT category FROM governance.action WHERE id = :aid LIMIT 1"),
+        {"aid": action_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Action not found.")
+    if not _caller_permitted(row.category, claims):
+        raise HTTPException(
+            status_code=403,
+            detail=f"You do not have permission to action '{row.category}' requests.",
+        )
+
+
 @router.get("/pending")
 async def list_pending_actions(
-    conn: Session = Depends(tenant_conn),
+    conn:   Session = Depends(tenant_conn),
+    claims: dict    = Depends(get_claims),
 ) -> list[dict]:
-    """Pending maker-checker actions for the caller's institution."""
+    """
+    Pending maker-checker actions scoped to the caller's module permissions.
+    Only actions whose category maps to a module the caller holds are returned.
+    e.g. bid.* requires inst:bid_approval; benefit.* requires inst:products.
+    """
+    # Map action-category prefix → required module permission
+    CATEGORY_MODULE: dict[str, str] = {
+        "bid":         "inst:bid_approval",
+        "benefit":     "inst:products",
+        "user":        "inst:team",
+        "group":       "inst:team",
+        "api_key":     "inst:settings",
+        "webhook":     "inst:webhooks",
+        "document":    "inst:documents",
+        "product":     "inst:products",
+        "sla":         "inst:settings",
+    }
+
+    perms: list[str] = claims.get("module_permissions", [])
+    # super_admin bypass — if role is super_admin see everything
+    is_super = claims.get("user_role", "") in ("super_admin", "institution_super_admin")
+
+    # Build the set of permitted category prefixes
+    allowed_prefixes: list[str] = []
+    for prefix, module in CATEGORY_MODULE.items():
+        if is_super or module in perms:
+            allowed_prefixes.append(prefix)
+
+    if not allowed_prefixes and not is_super:
+        return []
+
+    # Filter by split_part(category, '.', 1) IN (allowed_prefixes)
     rows = conn.execute(
         text("""
             SELECT
@@ -61,8 +140,16 @@ async def list_pending_actions(
                 updated_at
             FROM governance.action
             WHERE status = 'pending'
+              AND (
+                :is_super
+                OR split_part(category, '.', 1) = ANY(:prefixes)
+              )
             ORDER BY expires_at ASC NULLS LAST
-        """)
+        """),
+        {
+            "is_super": is_super,
+            "prefixes": allowed_prefixes,
+        }
     ).fetchall()
     result = []
     for row in rows:
@@ -147,10 +234,12 @@ async def submit_for_approval(
 @router.post("/{action_id}/approve")
 async def approve_action(
     action_id: str,
-    body: dict = Body(default={}),
-    conn: Session = Depends(tenant_conn),
+    body:   dict    = Body(default={}),
+    conn:   Session = Depends(tenant_conn),
+    claims: dict    = Depends(get_claims),
 ) -> dict:
-    """Approve a pending action (institution admins only — enforced in RPC)."""
+    """Approve a pending action — caller must hold the module for this action category."""
+    _check_action_permission(action_id, claims, conn)
     try:
         result = conn.execute(
             text("SELECT institution.approve_action(:aid, :note) AS res"),
@@ -164,13 +253,15 @@ async def approve_action(
 @router.post("/{action_id}/reject")
 async def reject_action(
     action_id: str,
-    body: dict = Body(...),
-    conn: Session = Depends(tenant_conn),
+    body:   dict    = Body(...),
+    conn:   Session = Depends(tenant_conn),
+    claims: dict    = Depends(get_claims),
 ) -> dict:
-    """Reject a pending action with a required note."""
+    """Reject a pending action — caller must hold the module for this action category."""
     note = body.get("note")
     if not note:
         raise HTTPException(status_code=422, detail="A rejection note is required.")
+    _check_action_permission(action_id, claims, conn)
     try:
         result = conn.execute(
             text("SELECT institution.reject_action(:aid, :note) AS res"),
