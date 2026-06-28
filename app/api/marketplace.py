@@ -38,6 +38,8 @@ async def list_requests(
         JOIN catalog.product        p  ON p.id  = r.product_id
         JOIN catalog.product_family pf ON pf.id = p.family_id
         WHERE r.status IN ('open', 'bidding')
+          AND r.bid_window_closes_at > now()
+          AND r.bid_window_opens_at  <= now()
     """
     params: dict = {}
     if product_type:
