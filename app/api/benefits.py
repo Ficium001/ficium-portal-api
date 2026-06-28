@@ -106,10 +106,17 @@ async def create_benefit(
     institution_id = _institution_id(claims)
     member_id      = claims.get("member_id") or claims.get("sub")
 
-    required = {"cat_id", "title"}
-    missing  = required - set(body)
-    if missing:
-        raise HTTPException(status_code=422, detail=f"Missing fields: {sorted(missing)}")
+    # Validate required fields are present AND non-empty
+    cat_id = body.get("cat_id") or ""
+    title  = (body.get("title") or "").strip()
+    if not cat_id:
+        raise HTTPException(status_code=422, detail="Category is required.")
+    if not title:
+        raise HTTPException(status_code=422, detail="Title is required.")
+
+    # Coerce empty strings to None for optional UUID/text fields
+    def _or_none(v: object) -> object:
+        return v if v not in (None, "") else None
 
     is_guaranteed = bool(body.get("is_guaranteed", False))
 
@@ -152,14 +159,14 @@ async def create_benefit(
         """),
         {
             "iid":           institution_id,
-            "product_id":    body.get("product_id"),
-            "cat_id":        body["cat_id"],
-            "title":         body["title"],
-            "description":   body.get("description"),
-            "value_display": body.get("value_display"),
-            "conditions":    body.get("conditions"),
-            "valid_from":    body.get("valid_from"),
-            "valid_until":   body.get("valid_until"),
+            "product_id":    _or_none(body.get("product_id")),
+            "cat_id":        cat_id,
+            "title":         title,
+            "description":   _or_none(body.get("description")),
+            "value_display": _or_none(body.get("value_display")),
+            "conditions":    _or_none(body.get("conditions")),
+            "valid_from":    _or_none(body.get("valid_from")),
+            "valid_until":   _or_none(body.get("valid_until")),
             "created_by":    member_id,
         },
     ).fetchone()
