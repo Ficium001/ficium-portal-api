@@ -44,7 +44,7 @@ def _write_notification(
     conn.execute(text("""
         INSERT INTO public.portal_notifications
             (institution_id, kind, title, body, link, metadata)
-        SELECT :iid, :kind, :title, :body, :link, :meta::jsonb
+        SELECT :iid, :kind, :title, :body, :link, CAST(:meta AS jsonb)
         WHERE NOT EXISTS (
             SELECT 1 FROM public.portal_notifications
             WHERE institution_id = :iid

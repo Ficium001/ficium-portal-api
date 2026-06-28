@@ -114,16 +114,18 @@ async def create_benefit(
     is_guaranteed = bool(body.get("is_guaranteed", False))
 
     if is_guaranteed:
-        # Route through institution dual-control
+        # Route through governance.action (maker-checker)
+        # Cast payload to jsonb via CAST() — psycopg2 misparses :param::type
+        import json as _json
         action_id = str(uuid.uuid4())
         conn.execute(
             text("""
-                INSERT INTO institution.pending_actions (
-                    id, institution_id, action_category, action_status,
+                INSERT INTO governance.action (
+                    id, institution_id, category, status,
                     maker_id, maker_role, resource_type, payload
                 ) VALUES (
-                    :id, :iid, 'benefit_create', 'pending',
-                    :maker, :role, 'benefit', :payload::jsonb
+                    :id, :iid, 'benefit.create', 'pending',
+                    :maker, :role, 'benefit', CAST(:payload AS jsonb)
                 )
             """),
             {
@@ -131,7 +133,7 @@ async def create_benefit(
                 "iid":     institution_id,
                 "maker":   member_id,
                 "role":    claims.get("user_role", "member"),
-                "payload": __import__("json").dumps({**body, "institution_id": institution_id}),
+                "payload": _json.dumps({**body, "institution_id": institution_id}),
             },
         )
         conn.commit()
@@ -202,17 +204,18 @@ async def update_benefit(
     is_guaranteed = bool(body.get("is_guaranteed", existing.is_guaranteed))
 
     if is_guaranteed:
+        import json as _json
         action_id = str(uuid.uuid4())
         conn.execute(
             text("""
-                INSERT INTO institution.pending_actions (
-                    id, institution_id, action_category, action_status,
+                INSERT INTO governance.action (
+                    id, institution_id, category, status,
                     maker_id, maker_role, resource_type, resource_id,
                     payload, payload_before
                 ) VALUES (
-                    :id, :iid, 'benefit_update', 'pending',
+                    :id, :iid, 'benefit.update', 'pending',
                     :maker, :role, 'benefit', :resource_id,
-                    :payload::jsonb, :before::jsonb
+                    CAST(:payload AS jsonb), CAST(:before AS jsonb)
                 )
             """),
             {
@@ -221,8 +224,8 @@ async def update_benefit(
                 "maker":       member_id,
                 "role":        claims.get("user_role", "member"),
                 "resource_id": benefit_id,
-                "payload":     __import__("json").dumps(body),
-                "before":      __import__("json").dumps(dict(existing._mapping), default=str),
+                "payload":     _json.dumps(body),
+                "before":      _json.dumps(dict(existing._mapping), default=str),
             },
         )
         conn.commit()

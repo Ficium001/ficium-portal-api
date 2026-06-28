@@ -434,7 +434,7 @@ async def admin_review_document(
                 SET
                     status           = :status,
                     rejection_reason = :reason,
-                    reviewed_by      = :reviewer::uuid,
+                    reviewed_by      = CAST(:reviewer AS uuid),
                     reviewed_at      = now()
                 WHERE id = :id
                 RETURNING id, institution_id, status, rejection_reason, reviewed_at
