@@ -115,14 +115,15 @@ def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
     claims_json = json.dumps(claims, separators=(",", ":"))
     session = SessionLocal()
     try:
-        # 1+2 combined into a single roundtrip:
-        #   set_config publishes JWT claims for RLS policies,
-        #   SET LOCAL ROLE drops into non-BYPASSRLS so policies fire.
+        # set_config publishes JWT claims so auth.uid() / auth.jwt() resolve
+        # for RLS policies. We do NOT issue SET LOCAL ROLE because:
+        #   1. pgbouncer transaction mode resets session state between txns anyway
+        #   2. The pooler connection user lacks permission to SET ROLE authenticated
+        #   3. Supabase PostgREST itself only uses set_config — not SET ROLE
+        # RLS enforcement relies on the policies using current_setting(
+        # 'request.jwt.claims') to scope queries, not on the session role.
         session.execute(
-            text(
-                "SELECT set_config('request.jwt.claims', :c, true);"
-                " SET LOCAL ROLE authenticated"
-            ),
+            text("SELECT set_config('request.jwt.claims', :c, true)"),
             {"c": claims_json},
         )
         yield session
