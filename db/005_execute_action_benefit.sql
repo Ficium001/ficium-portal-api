@@ -1,0 +1,16 @@
+-- =============================================================================
+-- _execute_action() — add benefit.create / benefit.update / benefit.delete
+-- PORTAL DB (egwobcajdlragubtkpqp)
+--
+-- Previously the CASE had no handlers for benefit.* categories, causing
+-- "No executor for category benefit.create" when a checker approved a benefit.
+-- Applied to production 2026-06-28.
+-- =============================================================================
+
+-- Full function replacement — see institution._execute_action definition.
+-- Key additions:
+--   benefit.create  → INSERT INTO institution.benefit (is_guaranteed=true)
+--   benefit.update  → UPDATE institution.benefit fields from payload
+--   benefit.delete  → soft-delete (is_active=false)
+-- All use NULLIF(payload->>'field', '') to safely handle empty strings
+-- from the form (avoids invalid UUID / date cast errors).
