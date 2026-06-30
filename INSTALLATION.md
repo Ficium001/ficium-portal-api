@@ -35,7 +35,12 @@ APP_SERVICE_SECRET=<shared secret — same value set in Vercel + Supabase Vault>
 AUTH_JWKS_URL=https://ficium-auth-production.up.railway.app/.well-known/jwks.json
 AUTH_ISSUER=ficium-auth
 AUTH_AUDIENCE=authenticated
-ALLOWED_ORIGINS=https://ficium-portal.vercel.app,https://ficium.vercel.app
+ALLOWED_ORIGINS=https://ficium-portal.vercel.app,https://portal.ficium.net
+# Regex covering all Vercel preview deployments automatically.
+# IMPORTANT: if you set this in Railway, do not set it to an empty
+# string — that disables regex matching entirely. Leave it UNSET to
+# use the safe code default, or copy the value below explicitly.
+ALLOWED_ORIGIN_REGEX=^https://ficium-portal[a-z0-9.\-]*\.vercel\.app$
 DEPLOYMENT_MODEL=saas
 ```
 

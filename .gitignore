@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
 .env
-.env.*
+.env.local
+.env.*.local
+# Allow .env.example — it contains no secrets and must be tracked
+!.env.example
 *.pem
 *.key
 .venv/
