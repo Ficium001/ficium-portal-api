@@ -14,8 +14,7 @@ from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
-def _rows(result) -> list[dict]:  return [dict(r._mapping) for r in result.fetchall()]
-def _row(r)       -> dict:        return dict(r._mapping)
+def _row(r) -> dict: return dict(r._mapping)
 
 # ── GET /marketplace/requests ─────────────────────────────────────────────────
 @router.get("/requests")
@@ -47,24 +46,14 @@ async def list_requests(
         params["pt"] = product_type
     sql += " ORDER BY r.bid_window_closes_at ASC"
     rows = conn.execute(text(sql), params).fetchall()
-
-    if not rows:
-        try:
-            with app_service_session() as app_conn:
-                result = app_conn.execute(text("""
-                    SELECT r.id, r.product_type, r.status,
-                           r.amount::NUMERIC AS amount, 'MUR' AS currency,
-                           r.preferred_term_months AS term_months,
-                           COALESCE(r.decision_deadline, now() + interval '72 hours') AS bid_window_closes_at,
-                           r.created_at,
-                           LEFT(md5(r.client_id::text || ':ficium-anon-v1:'), 8) AS consumer_ref,
-                           0 AS bid_count
-                    FROM public.requests r WHERE r.status = 'open'
-                    ORDER BY r.created_at DESC
-                """))
-                return _rows(result)
-        except AppDatabaseUnavailable:
-            return []
+    # No fallback to the App DB here: marketplace.request (Portal DB) is the
+    # single source of truth post Phase-1-sync, and is RLS-scoped by
+    # institution + product_scope. A raw App DB fallback previously bypassed
+    # both — every open request, every institution, every product, with no
+    # filtering at all — and triggered any time a member's scoped query
+    # legitimately returned zero rows (e.g. a product-restricted group with
+    # no current matches). Removed rather than "fixed to be scoped" so there
+    # is exactly one authorization path to maintain, not two that can drift.
     return [_row(r) for r in rows]
 
 # ── GET /marketplace/my-bids ──────────────────────────────────────────────────
