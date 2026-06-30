@@ -4,15 +4,32 @@
 # Uses psycopg2 (sync) via SQLAlchemy connection pool.
 # Connects via Supabase transaction pooler (port 6543, pgbouncer).
 #
-# RLS contract: every request sets request.jwt.claims via set_config()
-# so auth.uid() resolves correctly and RLS enforces tenant isolation.
-# We do NOT issue SET LOCAL ROLE because:
-#   1. pgbouncer in transaction mode resets session state between transactions
-#   2. The pooler connection user lacks permission to SET ROLE authenticated
-#   3. Supabase PostgREST itself only uses set_config — not SET ROLE
+# RLS contract: every request, inside tenant_session():
+#   1. set_config('request.jwt.claims', ...) so auth.uid() / auth.jwt()
+#      resolve for RLS policies.
+#   2. SET LOCAL ROLE authenticated, so RLS is actually evaluated. The
+#      pooler connects as `postgres`, which carries BYPASSRLS — without
+#      this role switch every RLS policy on every table is silently
+#      inert, regardless of how correct the policy itself is. (This was
+#      previously omitted — see incident notes below.)
 #
-# RLS policies must be written to check auth.uid() (which reads the GUC),
-# not to check current_role. This is standard Supabase RLS practice.
+# Both are SET LOCAL / transaction-scoped, auto-resetting on COMMIT or
+# ROLLBACK, which is required and safe under pgbouncer transaction-mode
+# pooling (session state resets between transactions anyway).
+#
+# `authenticated` must hold USAGE + table grants on every schema/table the
+# routers touch (institution, marketplace, catalog, governance, audit,
+# portal_admin, admin) — verified current as of 2026-06-30.
+#
+# INCIDENT (2026-06-30): the SET LOCAL ROLE step was missing entirely.
+# Every tenant_conn-based endpoint ran as `postgres` (BYPASSRLS=true),
+# so all RLS policies — not just product/institution scoping added that
+# day, every pre-existing one too — were never enforced; only each
+# endpoint's own explicit WHERE clauses provided any isolation, and at
+# least one endpoint (GET /marketplace/requests) had none. Restored the
+# role switch and granted the few tables that were missing `authenticated`
+# grants as a result (institution.doc, institution.doc_type,
+# institution.compliance, marketplace.bid_benefit).
 # =============================================================================
 
 from __future__ import annotations
@@ -116,16 +133,20 @@ def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
     session = SessionLocal()
     try:
         # set_config publishes JWT claims so auth.uid() / auth.jwt() resolve
-        # for RLS policies. We do NOT issue SET LOCAL ROLE because:
-        #   1. pgbouncer transaction mode resets session state between txns anyway
-        #   2. The pooler connection user lacks permission to SET ROLE authenticated
-        #   3. Supabase PostgREST itself only uses set_config — not SET ROLE
-        # RLS enforcement relies on the policies using current_setting(
-        # 'request.jwt.claims') to scope queries, not on the session role.
+        # for RLS policies.
         session.execute(
             text("SELECT set_config('request.jwt.claims', :c, true)"),
             {"c": claims_json},
         )
+        # SET LOCAL ROLE authenticated — drops BYPASSRLS so the policies set
+        # above actually get evaluated. The pooler connects as `postgres`
+        # (rolbypassrls=true, confirmed via pg_roles); without this, every
+        # RLS policy on every table is a no-op regardless of how it's
+        # written. `postgres` is already a member of `authenticated` (no
+        # extra GRANT needed for the role switch itself — confirmed via
+        # pg_auth_members), and `authenticated` holds USAGE + the required
+        # table grants on every schema/table the routers touch.
+        session.execute(text("SET LOCAL ROLE authenticated"))
         yield session
         session.commit()
     except Exception:
