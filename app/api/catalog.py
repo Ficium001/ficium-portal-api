@@ -58,30 +58,40 @@ async def list_audit_events(
     """
     Return institution audit events ordered newest-first.
 
-    Column aliases ensure the frontend AuditEvent type is satisfied:
-      occurred_at  → created_at   (frontend reads e.created_at)
-      action       → event_label  (frontend reads e.event_label)
-
-    state_before / state_after are included for the row detail panel.
+    audit.event schema notes:
+      - 'action' stores the full dotted category string (e.g. 'bid.submit')
+      - There is no separate 'action_category' column — we derive it by
+        stripping the last segment: 'bid.submit' → action_category='bid',
+        event_label='bid.submit'
+      - No state_before / state_after columns on this table
+      - occurred_at → created_at  (frontend reads e.created_at)
     """
     rows = conn.execute(
         text("""
             SELECT
                 id,
                 actor_id,
+                actor_type,
                 actor_role,
                 actor_ip,
-                action_category,
-                action           AS event_label,
+                -- Derive action_category from the dotted action string.
+                -- 'bid.submit'  → 'bid'
+                -- 'user.login'  → 'user'
+                -- 'login'       → 'login'  (no dot — use action itself)
+                CASE
+                    WHEN action LIKE '%.%'
+                    THEN left(action, length(action) - length(split_part(action, '.', -1)) - 1)
+                    ELSE action
+                END                  AS action_category,
+                action               AS event_label,
                 resource_type,
                 resource_label,
                 resource_id,
-                state_before,
-                state_after,
                 outcome,
                 outcome_note,
-                occurred_at      AS created_at
+                occurred_at          AS created_at
             FROM audit.event
+            WHERE institution_id = (current_setting('request.jwt.claims', true)::jsonb->>'institution_id')::uuid
             ORDER BY occurred_at DESC
             LIMIT :lim
         """),
@@ -96,9 +106,10 @@ async def list_audit_events(
             row["id"] = str(row["id"])
         if row.get("actor_id"):
             row["actor_id"] = str(row["actor_id"])
+        if row.get("resource_id"):
+            row["resource_id"] = str(row["resource_id"])
         if row.get("created_at"):
             row["created_at"] = row["created_at"].isoformat()
-        # state_before / state_after are already dicts from JSONB; leave as-is
         result.append(row)
     return result
 
