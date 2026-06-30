@@ -55,15 +55,52 @@ async def list_audit_events(
     limit: int = Query(default=50, le=500),
     conn: Session = Depends(tenant_conn),
 ) -> list[dict]:
-    result = conn.execute(
+    """
+    Return institution audit events ordered newest-first.
+
+    Column aliases ensure the frontend AuditEvent type is satisfied:
+      occurred_at  → created_at   (frontend reads e.created_at)
+      action       → event_label  (frontend reads e.event_label)
+
+    state_before / state_after are included for the row detail panel.
+    """
+    rows = conn.execute(
         text("""
-            SELECT * FROM audit.event
+            SELECT
+                id,
+                actor_id,
+                actor_role,
+                actor_ip,
+                action_category,
+                action           AS event_label,
+                resource_type,
+                resource_label,
+                resource_id,
+                state_before,
+                state_after,
+                outcome,
+                outcome_note,
+                occurred_at      AS created_at
+            FROM audit.event
             ORDER BY occurred_at DESC
             LIMIT :lim
         """),
         {"lim": limit},
-    )
-    return _rows(result)
+    ).fetchall()
+
+    result = []
+    for r in rows:
+        row = dict(r._mapping)
+        # Serialise UUIDs and timestamps to strings
+        if row.get("id"):
+            row["id"] = str(row["id"])
+        if row.get("actor_id"):
+            row["actor_id"] = str(row["actor_id"])
+        if row.get("created_at"):
+            row["created_at"] = row["created_at"].isoformat()
+        # state_before / state_after are already dicts from JSONB; leave as-is
+        result.append(row)
+    return result
 
 
 @router.post("/sla-config")
