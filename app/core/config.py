@@ -52,8 +52,8 @@ class Settings(BaseSettings):
     app_service_secret: str = Field(default="", description="X-Service-Secret for s2s calls")
 
     # ── CORS ──────────────────────────────────────────────────
-    allowed_origins:      str = ""
-    allowed_origin_regex: str = r"^https://ficium-portal[a-z0-9.\-]*\.vercel\.app$"
+    allowed_origins:      str = "https://ficium-portal.vercel.app,https://portal.ficium.net"
+    allowed_origin_regex: str = r"^https://(ficium-portal[a-z0-9.\-]*\.vercel\.app|[a-z0-9.\-]*\.ficium\.net)$"
 
     # ── Deployment ────────────────────────────────────────────
     deployment_model: str = "saas"
