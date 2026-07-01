@@ -29,6 +29,8 @@ from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..core.ssrf import validate_webhook_url, WebhookUrlError
+
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -112,6 +114,12 @@ def create_webhook(
     if bad:
         raise HTTPException(status_code=422, detail=f"Unknown event types: {bad}")
 
+    # SSRF guard: reject internal/metadata/private targets before storing.
+    try:
+        validate_webhook_url(str(body.endpoint_url))
+    except WebhookUrlError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
     raw_secret = _generate_signing_secret()
 
     row = conn.execute(
@@ -173,6 +181,10 @@ def update_webhook(
     if body.label is not None:
         updates.append("label = :label"); params["label"] = body.label
     if body.endpoint_url is not None:
+        try:
+            validate_webhook_url(str(body.endpoint_url))
+        except WebhookUrlError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
         updates.append("endpoint_url = :url"); params["url"] = str(body.endpoint_url)
     if body.event_types is not None:
         updates.append("event_types = CAST(:events AS jsonb)")

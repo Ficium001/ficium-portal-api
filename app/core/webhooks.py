@@ -109,6 +109,18 @@ async def _fire_single(
     for attempt in range(retry_max + 1):
         attempts += 1
         try:
+            # Defence-in-depth: re-validate at send time. A hostname that was
+            # public at registration could later resolve to a private IP
+            # (DNS rebinding). Block that before making the request.
+            from .ssrf import validate_webhook_url, WebhookUrlError
+            try:
+                validate_webhook_url(webhook["endpoint_url"])
+            except WebhookUrlError as exc:
+                status_code = None
+                response_body = f"blocked by SSRF guard: {exc}"[:2000]
+                delivered = False
+                break
+
             async with httpx.AsyncClient(timeout=timeout_s) as client:
                 resp = await client.post(
                     webhook["endpoint_url"],
