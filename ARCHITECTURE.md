@@ -1,10 +1,8 @@
 # ficium-portal-api — Architecture
 
-_Last updated: 27 June 2026_
+_Last updated: 1 July 2026_
 
-The portable data API for the Ficium Portal. It verifies ficium-auth RS256 tokens and serves institution-scoped data with Postgres row-level security enforced — doing exactly what Supabase's PostgREST does, but without PostgREST, so the same database security layer runs on any Postgres. This is the keystone of the platform's lift-and-shift story (ADR-001).
-
-For the full platform picture, see `ficium-portal/ARCHITECTURE.md`.
+The portable data API for the Ficium Portal and the primary integration point for institution bank systems. It verifies ficium-auth RS256 tokens (portal users) and institution API keys (machine-to-machine), enforces RLS, and manages the full marketplace + pipeline lifecycle. For the full platform picture, see `ficium-portal/ARCHITECTURE.md`.
 
 ---
 
@@ -12,8 +10,8 @@ For the full platform picture, see `ficium-portal/ARCHITECTURE.md`.
 
 The Portal's security model lives in the **database**: RLS policies and `SECURITY DEFINER` functions that resolve the caller through `auth.uid()`. This service replicates PostgREST's behaviour:
 
-1. Verify the ficium-auth token (RS256, against cached JWKS).
-2. Open a DB transaction and `set_config('request.jwt.claims', <claims>, true)`.
+1. Verify the caller (RS256 JWT or SHA-256 API key lookup).
+2. Open a DB transaction and `set_config('request.jwt.claims', <claims>, true)` + `SET LOCAL ROLE authenticated`.
 3. Run the existing queries — RLS enforces tenant isolation unchanged.
 
 No business logic is duplicated from the database; the API is a thin, portable shell around the SQL security layer.
@@ -24,21 +22,19 @@ No business logic is duplicated from the database; the API is a thin, portable s
 
 ```
 app/
-  api/      institutions, members, groups, approvals, marketplace, catalog,
-            documents, benefits, admin, auth_provision, public
-  core/     config.py, db.py (tenant_session / app_service_session / pooler),
-            security.py (JWKS/RS256)
-  deps.py   claim extraction → request context
-  main.py   app + router wiring
+  api/        institutions, members, groups, approvals, marketplace, catalog,
+              documents, benefits, pipeline, pipeline_templates, notifications,
+              admin, auth_provision, public,
+              api_keys, webhooks,          ← key management
+              v1/marketplace               ← /v1/ public API
+  core/       config.py, db.py, security.py (JWT),
+              api_keys.py (key verification), webhooks.py (dispatcher)
+  deps.py     current_claims / api_key_claims / api_or_jwt_claims / require_scope
+  main.py     app + router wiring
 db/
-  000_auth_shim.sql   auth.uid()/jwt()/role() + authenticated/anon (non-Supabase)
-  001_workflow.sql    workflow helpers
-  003_expiry_notify.sql   close_expired_windows() + pg_net notification dispatch
-  004_accept_bid_reveal.sql   accept_bid() with bid financials in return
-  README.md           load order
+  000_auth_shim.sql, 001_workflow.sql, 003_expiry_notify.sql, 004_accept_bid_reveal.sql
 docs/
-  ADR-001-portable-portal-data-layer.md
-  ADR-002-identity-migration.md
+  ADR-001 … ADR-002 … API-INTEGRATION-GUIDE.md
 ```
 
 ---
@@ -46,110 +42,186 @@ docs/
 ## 3. Deployment topology
 
 ```
-ficium-portal (Vercel SPA)                 ficium (Vercel SPA — consumer app)
-     │  Bearer <ficium-auth RS256 JWT>          │  X-Service-Secret
-     ▼                                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    ficium-portal-api                         │
-│                    (FastAPI · Railway)                       │
-│                                                             │
-│  security.py  verify RS256 (kid → JWKS, 5min cache)        │
-│  deps.py      extract claims                                │
-│  tenant_session()  SET request.jwt.claims (per request)    │
-│  app_service_session()  direct App DB connection           │
-└──────────┬────────────────────────────────────┬────────────┘
-           │ psycopg2, transaction pooler :6543  │ APP_DATABASE_URL
-           ▼                                    ▼
-┌──────────────────────────┐     ┌───────────────────────────────┐
-│  Portal DB (Institution) │     │  App DB (Consumer)            │
-│  egwobcajdlragubtkpqp   │     │  wixfhjlsjkiwfvqewvmt         │
-│  ap-southeast-1          │     │  ap-south-1                   │
-│                          │     │                               │
-│  institution.*           │     │  public.clients               │
-│  marketplace.*           │     │  public.requests              │
-│  governance.*            │     │  public.kyc_submissions       │
-│  catalog.*               │     │  (Phase 2 PII fetch only)     │
-│  bid_notify.*            │     └───────────────────────────────┘
-└──────────────────────────┘
-           ▲
-           │ JWKS (cached 5min)
-┌──────────┴────────────────┐
-│      ficium-auth           │
-│  /.well-known/jwks.json    │
-└────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Institution LOS / Middleware / Scripts                                      │
+│  Bearer: fic_live_<hex>  (API key)                                          │
+└─────────────────────────┬───────────────────────────────────────────────────┘
+                          │                Bearer: RS256 JWT
+                          │        ┌───────────────────────────────────────┐
+                          │        │   ficium-portal (Vercel SPA)          │
+                          │        │   Browser — human operators           │
+                          │        └───────────────┬───────────────────────┘
+                          │                        │
+                          ▼                        ▼
+               ┌──────────────────────────────────────────────────┐
+               │              ficium-portal-api                    │
+               │              (FastAPI · Railway)                  │
+               │                                                   │
+               │  /api-keys   /webhooks   /v1/*                   │
+               │  api_keys.py — SHA-256 key lookup                │
+               │  webhooks.py — HMAC-signed delivery, retry       │
+               │                                                   │
+               │  /institutions  /members  /marketplace  etc.      │
+               │  security.py — RS256 JWT + JWKS cache            │
+               │  deps.py — api_or_jwt_claims / require_scope     │
+               │  tenant_session() — SET jwt.claims + ROLE        │
+               └──────────┬──────────────────────┬───────────────┘
+                          │                      │
+           psycopg2       │  :6543               │  APP_DATABASE_URL
+           tx pooler      ▼                      ▼
+          ┌───────────────────────────┐ ┌────────────────────────────┐
+          │  Portal DB (Institution)  │ │  App DB (Consumer)         │
+          │  egwobcajdlragubtkpqp    │ │  wixfhjlsjkiwfvqewvmt      │
+          │  ap-southeast-1          │ │  ap-south-1                │
+          │                          │ │                            │
+          │  institution.*           │ │  public.clients            │
+          │   └── api_key            │ │  public.requests           │
+          │   └── webhook            │ │  public.kyc_submissions    │
+          │   └── webhook_delivery   │ │  (Phase 2 PII fetch only)  │
+          │  marketplace.*           │ └────────────────────────────┘
+          │  governance.*            │
+          │  catalog.*               │
+          │  audit.*                 │        ┌────────────────────┐
+          └───────────────────────────┘        │   ficium-auth      │
+                                               │  (Railway)         │
+                          JWKS (5 min cache)◄──┤  /.well-known/     │
+                                               │  jwks.json         │
+                                               └────────────────────┘
+
+ficium (Vercel SPA — consumer app)
+  │  X-Service-Secret
+  ▼
+/public/*  routes (no JWT)
 ```
 
 ---
 
-## 4. Two DB connections
+## 4. Two authentication paths
 
-| Session | DSN variable | Schema | When used |
-|---------|-------------|--------|-----------|
-| `tenant_session()` | `DATABASE_URL` | Institution (Portal DB) | All institution data routes |
-| `app_service_session()` | `APP_DATABASE_URL` | Consumer (App DB) | Phase 2 PII fetch, marketplace sync |
+### 4a. RS256 JWT (portal users)
 
-The App DB connection is a direct service-level credential, not tenant-scoped. It is used only for:
-- `POST /marketplace/sync-requests` — read open consumer requests + financial data
-- `POST /public/requests/:id/accept-bid` — fetch consumer PII for Phase 2 reveal
+`app/core/security.py` — `verify_token()`:
+1. Decode token header → extract `kid`.
+2. Fetch JWKS from ficium-auth (cached 5 min; force-refresh on unknown kid).
+3. Verify RS256 signature, `iss=ficium-auth`, `aud=authenticated`, `exp`.
+4. Return claims dict. `deps.current_claims()` wraps this as a FastAPI dependency.
+5. `tenant_session(claims)` opens DB transaction, runs `SET request.jwt.claims` + `SET LOCAL ROLE authenticated`.
 
-This is a known architectural debt: `APP_DATABASE_URL` should be replaced by a service JWT call once `ficium-auth` client-credentials grant is built (ADR-002).
+### 4b. Institution API keys (machine-to-machine)
+
+`app/core/api_keys.py` — `verify_api_key()`:
+1. Key format: `fic_live_<64 hex chars>` (32 random bytes).
+2. SHA-256(raw_key) → lookup in `institution.api_key.key_hash`.
+3. Validate: `active=true`, `mc_status='approved'`, `revoked_at IS NULL`, `expires_at > now()`.
+4. Update `last_used_at` + `last_used_ip` (best-effort, non-blocking).
+5. Return `{institution_id, scopes, key_id, auth_method="api_key"}`.
+
+`deps.api_or_jwt_claims()` detects the path by prefix (`fic_live_` → key, anything else → JWT) and returns a unified claims dict. `deps.require_scope("scope")` is a dependency factory that gate-checks scope for API key callers (JWT callers bypass scope checks — they have full portal access).
+
+Keys require maker-checker approval before activation. Raw key never stored — only SHA-256 hash. Shown to the user exactly once at creation.
 
 ---
 
-## 5. Marketplace lifecycle
+## 5. Three DB session types
+
+| Session | DSN variable | Role | RLS | When used |
+|---------|-------------|------|-----|-----------|
+| `tenant_session(claims)` | `DATABASE_URL` | `authenticated` | Enforced | All institution data routes (JWT path) |
+| `service_session()` | `DATABASE_URL` | `postgres` | Bypassed | API key routes, webhooks, admin, s2s |
+| `app_service_session()` | `APP_DATABASE_URL` | `postgres` | Bypassed | Phase 2 PII fetch, marketplace sync |
+
+API key routes use `service_session()` with explicit `WHERE institution_id = :iid` filtering from claims — the equivalent of RLS but at the SQL layer, since API keys don't carry JWT claims for `auth.uid()`.
+
+---
+
+## 6. Webhook dispatcher
+
+`app/core/webhooks.py` — `dispatch_event(institution_id, event_type, payload)`:
 
 ```
-POST /marketplace/sync-requests
-  ← called by pg_net (App DB trigger) or pg_cron (5min sweep)
-  → pull open requests from App DB (_ENRICH_SQL)
-  → enrich with financial data (income, employment, loans, snapshot)
-  → marketplace.ingest_app_request() on Portal DB
-  → returns { pulled, synced, failed }
+dispatch_event("f192050a-...", "bid.accepted", {...})
+  → service_session()
+  → SELECT institution.webhook WHERE institution_id=? AND event_types @> [event_type] AND active=true
+  → asyncio.gather(*[_fire_single(wh, ...) for wh in webhooks])
+      → HMAC-SHA256(signing_secret, payload_bytes) → X-Ficium-Signature-256
+      → POST endpoint_url (timeout=webhook.timeout_ms)
+      → on failure: sleep 5s/25s/125s, retry up to retry_max
+      → INSERT institution.webhook_delivery (status, attempts, response_status, ...)
+      → UPDATE institution.webhook (last_fired_at, failure_count)
+      → if failure_count >= 10: SET active=false
+```
 
-POST /marketplace/bids  (maker)
-  → validate bid window + request status
-  → governance.submit_for_approval(action='bid.submit', payload={...})
-  → returns pending governance.action id
+Called with `asyncio.create_task()` so delivery is fire-and-forget from the API response. Current event emission points:
+- `POST /v1/bids` → `bid.accepted` (confirmation to LOS after successful submission)
+- `PUT /v1/pipeline/.../advance` → `pipeline.stage_changed`
+- `POST /public/requests/:id/accept-bid` → `bid.accepted` (winning institution notified)
 
-POST /approvals/{id}/approve  (checker)
-  → governance.approve_action()
-  → _execute_action('bid.submit')
-  → INSERT INTO marketplace.bid
-  → trg_bid_notify fires (pg_net → bid-notify handler)
+---
 
-POST /public/requests/{id}/accept-bid  (s2s from Vercel)
-  → _anon_uuid ownership check
-  → fetch Phase 2 PII from App DB
+## 7. /v1/ versioned public API
+
+All routes under `/v1/` form a stable, versioned contract for institution integrations. Breaking changes will go under `/v2/`. Key design properties:
+
+- Accepts API key **or** JWT (unified via `api_or_jwt_claims`)
+- Scope-gated at the dependency layer (`require_scope`)
+- Server-enforced compliance check on bid submission (`product_config` lookup)
+- Explicit `WHERE institution_id` filtering throughout (no RLS reliance for API key callers)
+- Fires webhooks on state changes
+- OpenAPI spec auto-generated at `/docs` and `/openapi.json`
+
+---
+
+## 8. Marketplace lifecycle
+
+```
+Sync (App DB → Portal DB):
+  pg_net trigger on public.requests INSERT
+  → POST /marketplace/sync-requests
+  → marketplace.ingest_app_request()
+
+Bid submission (API key path — LOS):
+  POST /v1/bids
+  → compliance gate (product_config check)
+  → INSERT marketplace.bid
+  → dispatch_event(bid.accepted)
+
+Bid submission (JWT path — portal human):
+  POST /marketplace/bids
+  → governance.submit_for_approval()
+  POST /approvals/{id}/approve (checker)
+  → INSERT marketplace.bid
+  → pg_net → bid-notify → Resend email
+
+Bid acceptance (consumer):
+  POST /public/requests/{id}/accept-bid  (s2s, Vercel)
   → marketplace.accept_bid() atomic:
       bid → accepted, others → rejected
-      request → accepted + winning_bid_id
-      bid_acceptance (PII stored on Portal DB)
-      pipeline auto-created from institution template
-  → returns institution contact + bid financials
+      request → accepted, bid_acceptance PII row
+      pipeline created from institution.pipeline_template
+  → dispatch_event(bid.accepted) → institution webhook
 
-POST /marketplace/close-expired  (GitHub Actions, every 30 min)
+Pipeline advance (LOS):
+  PUT /v1/pipeline/{id}/stages/{sid}/advance
+  → stage: in_progress → completed
+  → next stage: pending → in_progress (or pipeline completed)
+  → dispatch_event(pipeline.stage_changed)
+
+Bid window close (cron):
+  POST /marketplace/close-expired  (GitHub Actions, every 30 min)
   → marketplace.close_expired_windows()
-  → request status: 'closed' (has bids) or 'expired' (no bids)
-  → fires pg_net → request-expired handler (for expired only)
 ```
 
 ---
 
-## 6. Portability (non-Supabase deployments)
+## 9. Portability (non-Supabase deployments)
 
-For client-cloud or on-prem Postgres, run `db/000_auth_shim.sql` before the Portal migrations. It recreates:
-- `auth.uid()` — reads from `request.jwt.claims` GUC
-- `auth.jwt()` — same
-- `auth.role()` — returns `'authenticated'` when GUC is set
-- `authenticated` and `anon` roles
-
-This makes existing RLS policies work unchanged on any Postgres. Do **not** run the shim on Supabase — the platform owns those objects there.
+For client-cloud or on-prem Postgres, run `db/000_auth_shim.sql` before Portal migrations. It recreates `auth.uid()`, `auth.jwt()`, `auth.role()`, and the `authenticated`/`anon` roles so RLS policies work unchanged on any Postgres. Do **not** run on Supabase — the platform owns those objects there.
 
 ---
 
-## 7. Connection constraints
+## 10. Connection constraints
 
-- **Transaction pooler only (port 6543):** psycopg2, not asyncpg. Supabase blocks direct port 5432 on free plan.
+- **Transaction pooler only (port 6543):** psycopg2 (sync). Supabase blocks direct port 5432 on pooled plans.
 - **Username:** `postgres.<project-ref>` (pooler tenant prefix, not plain `postgres`).
-- **No `SET ROLE`:** pgbouncer transaction mode prohibits session-level role changes. RLS keys on the GUC, not `current_role`.
-- **Sync driver:** psycopg2 (not asyncpg) — asyncpg requires a direct connection for session setup.
+- **`SET LOCAL ROLE authenticated`:** emitted inside `tenant_session()` — required because the pooler connects as `postgres` which carries `BYPASSRLS`. Without this, all RLS policies are silently inert. (This was a critical incident on 30 June 2026 — see `db.py` incident notes.)
+- **Sync driver only:** asyncpg requires a direct persistent connection for session setup, which pgbouncer transaction mode doesn't support.
