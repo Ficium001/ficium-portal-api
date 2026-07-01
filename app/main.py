@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api.admin import router as admin_router
+from .api.api_keys import router as api_keys_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
 from .api.benefits import router as benefits_router
@@ -22,6 +23,8 @@ from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
 from .api.public import router as public_router
+from .api.v1.marketplace import router as v1_marketplace_router
+from .api.webhooks import router as webhooks_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
 
@@ -73,4 +76,7 @@ app.include_router(documents_router)
 app.include_router(pipeline_templates_router)
 app.include_router(pipeline_router)
 app.include_router(notifications_router)
-app.include_router(public_router)   # server-to-server, no JWT
+app.include_router(public_router)       # server-to-server, no JWT
+app.include_router(api_keys_router)     # institution API key management
+app.include_router(webhooks_router)     # webhook CRUD + delivery log
+app.include_router(v1_marketplace_router)  # /v1/ versioned public API
