@@ -13,7 +13,7 @@
 # =============================================================================
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -282,12 +282,12 @@ async def update_stage(
 
 
 # ── DELETE /pipelines/templates/{id}/stages/{sid} ─────────────────────────────
-@router.delete("/{template_id}/stages/{stage_id}", status_code=204)
+@router.delete("/{template_id}/stages/{stage_id}")
 async def delete_stage(
     template_id: str,
     stage_id:    str,
     claims:      dict = Depends(current_claims),
-) -> None:
+) -> Response:
     institution_id = claims.get("institution_id")
     if not institution_id:
         raise HTTPException(status_code=403, detail="Not associated with an institution.")
@@ -313,3 +313,4 @@ async def delete_stage(
             FROM ranked WHERE s.id = ranked.id
         """), {"tid": template_id})
         sconn.commit()
+    return Response(status_code=204)
