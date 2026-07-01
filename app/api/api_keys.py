@@ -84,11 +84,9 @@ def list_keys(
                 ak.last_used_ip::text,
                 ak.revoked_at,
                 ak.rejection_note,
-                req.username AS requested_by_username,
-                appr.username AS approved_by_username
+                admin.get_user_display_name(ak.requested_by) AS requested_by_username,
+                admin.get_user_display_name(ak.approved_by)  AS approved_by_username
             FROM institution.api_key ak
-            LEFT JOIN admin."user" req  ON req.id  = ak.requested_by
-            LEFT JOIN admin."user" appr ON appr.id = ak.approved_by
             WHERE ak.institution_id = CAST(:iid AS uuid)
               AND ak.revoked_at IS NULL
             ORDER BY ak.created_at DESC
