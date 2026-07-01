@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from ...core.webhooks import dispatch_event
 from ...deps import api_or_jwt_claims, require_scope, service_session
 from ...core.db import service_session as _svc
+from ...core.ratelimit import limiter
 
 import asyncio
 
@@ -191,7 +192,9 @@ class BidSubmitRequest(BaseModel):
 
 
 @router.post("/bids", status_code=201, dependencies=[Depends(require_scope("bids:write"))])
+@limiter.limit("60/minute")  # tighter than global default — bid writes are the key abuse vector
 def submit_bid(
+    request: Request,  # required by slowapi's per-route limiter
     body: Annotated[BidSubmitRequest, Body()],
     claims: dict[str, Any] = Depends(api_or_jwt_claims),
 ) -> dict:

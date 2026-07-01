@@ -7,7 +7,11 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
+from .core.ratelimit import limiter
 from .api.admin import router as admin_router, public_router as admin_public_router
 from .api.api_keys import router as api_keys_router
 from .api.approvals import router as approvals_router
@@ -46,6 +50,12 @@ app = FastAPI(
     version=settings.version,
     lifespan=lifespan,
 )
+
+# Rate limiting — per-tenant (institution_id from JWT) with IP fallback.
+# Default 600/min per bucket; returns 429 with Retry-After when exceeded.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 _origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
 app.add_middleware(
