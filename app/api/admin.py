@@ -19,11 +19,62 @@ from sqlalchemy import text as _text  # noqa: F811 (alias for internal use)
 from ..core.db import _session_or_raise, service_session
 from ..deps import current_claims
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+
+def _is_active_admin(claims: dict) -> str:
+    """
+    Verify the caller is an active platform admin. Returns admin_users.id.
+    Opens its own short-lived service session so it can run as a route
+    dependency (before the handler) as well as inline.
+    """
+    sub = claims.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="No subject in token.")
+    with service_session() as conn:
+        row = conn.execute(
+            text("""
+                SELECT id FROM portal_admin.admin_users
+                WHERE auth_user_id = :uid AND status = 'active'
+                LIMIT 1
+            """),
+            {"uid": sub},
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=403, detail="Not an active admin.")
+    return str(row.id)
+
+
+async def require_admin_dep(claims: dict = Depends(current_claims)) -> str:
+    """
+    Router-level admin guard — runs BEFORE every handler on the guarded
+    router as defense-in-depth. Even if a future admin route forgets its
+    inline _require_admin() call, this dependency still blocks non-admins.
+
+    NOTE: FastAPI router-level dependencies cannot be overridden per-route
+    (dependencies=[] on a route does NOT bypass them). Routes that must be
+    reachable by non-admins — currently only /admin/me, which returns null
+    rather than 403 — live on `public_router` below instead.
+    """
+    return _is_active_admin(claims)
+
+
+# Guarded router: require_admin_dep runs before EVERY route registered here.
+router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin_dep)],
+)
+
+# Unguarded router for the handful of /admin/* routes that intentionally
+# serve non-admins (they do their own softer checks). Same prefix, no
+# router-level guard. Both are included by main.py.
+public_router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 def _require_admin(claims: dict, conn) -> str:
-    """Verify the caller is an active platform admin. Returns their admin_users.id."""
+    """
+    Inline admin check (kept for handlers that need the admin_users.id).
+    Verify the caller is an active platform admin. Returns their admin_users.id.
+    """
     sub = claims.get("sub")
     if not sub:
         raise HTTPException(status_code=401, detail="No subject in token.")
@@ -40,7 +91,7 @@ def _require_admin(claims: dict, conn) -> str:
     return str(row.id)
 
 
-@router.get("/me")
+@public_router.get("/me")  # unguarded: returns null (not 403) for non-admins by design
 async def admin_me(claims: dict = Depends(current_claims)) -> dict | None:
     sub = claims.get("sub")
     with service_session() as conn:

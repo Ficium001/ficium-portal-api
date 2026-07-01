@@ -8,7 +8,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api.admin import router as admin_router
+from .api.admin import router as admin_router, public_router as admin_public_router
 from .api.api_keys import router as api_keys_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
@@ -64,6 +64,7 @@ async def health() -> dict:
 
 
 app.include_router(admin_router)
+app.include_router(admin_public_router)
 app.include_router(institutions_router)
 app.include_router(members_router)
 app.include_router(approvals_router)
