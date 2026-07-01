@@ -17,15 +17,64 @@
 # =============================================================================
 from __future__ import annotations
 
+import asyncio
+import logging
+
+import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..core.config import settings
 from ..core.db import service_session
 from ..deps import current_claims, tenant_conn
 from .notifications import _write_notification
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/pipelines", tags=["pipeline"])
+
+
+def _notify_borrower_stage_advanced(
+    pipeline_id: str,
+    stage_id:    str,
+    pipeline_complete: bool = False,
+) -> None:
+    """
+    Best-effort push to the Ficium App Vercel backend to notify the borrower
+    that their loan pipeline has moved forward. Fire-and-forget.
+
+    The Vercel endpoint writes a public.notification row + sends a Resend email.
+    """
+    vercel_url = getattr(settings, "vercel_app_url", "")
+    secret     = getattr(settings, "app_service_secret", "")
+    if not vercel_url or not secret:
+        return  # not configured — skip silently
+
+    async def _fire() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{vercel_url}/api/internal",
+                    json={
+                        "action":            "pipeline-stage-advanced",
+                        "pipeline_id":       pipeline_id,
+                        "stage_id":          stage_id,
+                        "pipeline_complete": pipeline_complete,
+                    },
+                    headers={"X-Service-Secret": secret},
+                )
+        except Exception:  # noqa: BLE001
+            log.warning("borrower_pipeline_notify_failed", pipeline_id=pipeline_id)
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(_fire())
+        else:
+            loop.run_until_complete(_fire())
+    except RuntimeError:
+        pass  # no event loop in sync context — skip
 
 def _rows(result) -> list[dict]:  return [dict(r._mapping) for r in result.fetchall()]
 def _one(result)  -> dict | None:
@@ -355,6 +404,10 @@ def _complete_stage(
             metadata={"pipeline_id": pipeline_id, "completed_stage_id": stage_id},
         )
         conn.commit()
+
+        # Notify borrower via Vercel (fire-and-forget, best-effort)
+        _notify_borrower_stage_advanced(pipeline_id, stage_id)
+
         return {"status": "advanced", "next_stage_id": next_stage["id"], "pipeline_id": pipeline_id}
     else:
         # All stages done — close pipeline
@@ -364,4 +417,7 @@ def _complete_stage(
             WHERE id = :pid
         """), {"pid": pipeline_id})
         conn.commit()
+
+        _notify_borrower_stage_advanced(pipeline_id, stage_id, pipeline_complete=True)
+
         return {"status": "completed", "pipeline_id": pipeline_id}

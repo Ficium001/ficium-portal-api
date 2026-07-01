@@ -401,7 +401,10 @@ class TestMarketplaceEndpoints:
             app.dependency_overrides.clear()
 
     def test_submit_bid_valid_payload_reaches_db(self, auth_client):
-        """Valid payload + institution context → 200 (duplicate path with mock None)."""
+        """Valid payload + institution context.
+        Mock DB returns None for request lookup → 404 (request not found).
+        Confirms endpoint performs a request existence guard before inserting.
+        """
         r = auth_client.post(
             "/marketplace/bids",
             json={
@@ -413,8 +416,8 @@ class TestMarketplaceEndpoints:
                 "idempotency_key":  str(uuid.uuid4()),
             },
         )
-        # Mock returns None fetchone → "duplicate" → 200, or 400 on DB error
-        assert r.status_code in (200, 400)
+        # Mock fetchone=None → request existence guard fires → 404 is correct
+        assert r.status_code == 404
 
     def test_get_bid_not_found_returns_404(self, auth_client):
         r = auth_client.get(f"/marketplace/bids/{uuid.uuid4()}")
@@ -434,21 +437,20 @@ class TestApprovalsEndpoints:
         assert r.status_code == 200
         assert isinstance(r.json(), list)
 
-    def test_approve_action_with_mock_db_returns_200(self, auth_client):
-        """approve_action passes None result through as {"result": None} — not an error."""
+    def test_approve_action_with_mock_db_returns_404(self, auth_client):
+        """approve_action with mock DB (fetchone=None) → action not found → 404."""
         r = auth_client.post(f"/approvals/{uuid.uuid4()}/approve", json={"note": "ok"})
-        assert r.status_code == 200
-        assert "result" in r.json()
+        assert r.status_code == 404
 
     def test_reject_action_no_note_returns_422(self, auth_client):
         """Rejection without a note is a 422."""
         r = auth_client.post(f"/approvals/{uuid.uuid4()}/reject", json={})
         assert r.status_code == 422
 
-    def test_reject_action_with_note_returns_200(self, auth_client):
+    def test_reject_action_with_note_returns_404(self, auth_client):
+        """reject_action with mock DB (fetchone=None) → action not found → 404."""
         r = auth_client.post(f"/approvals/{uuid.uuid4()}/reject", json={"note": "not compliant"})
-        assert r.status_code == 200
-        assert "result" in r.json()
+        assert r.status_code == 404
 
     def test_submit_missing_required_fields_returns_422(self, auth_client):
         """Empty body → explicit 422 from field validation."""

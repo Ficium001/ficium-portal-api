@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from datetime import UTC
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
+from ..core.webhooks import dispatch_event
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
@@ -30,6 +32,7 @@ async def list_requests(
                r.params, r.metadata, r.status,
                r.bid_window_opens_at, r.bid_window_closes_at,
                r.source, r.created_at,
+               r.ficium_risk_tier, r.ficium_score,
                (SELECT COUNT(*) FROM marketplace.bid b
                 WHERE b.request_id = r.id
                   AND b.status NOT IN ('withdrawn','rejected')) AS bid_count
@@ -154,10 +157,36 @@ async def close_expired(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
 ) -> dict:
     _verify_service_secret(x_service_secret)
+
+    # Collect bids on about-to-expire requests BEFORE closing them
+    # so we can notify each institution whose bid was rejected
     with service_session() as conn:
+        rejected_bids = conn.execute(text("""
+            SELECT b.institution_id, b.id AS bid_id, b.request_id
+            FROM marketplace.bid b
+            JOIN marketplace.request r ON r.id = b.request_id
+            WHERE r.status = 'open'
+              AND r.bid_window_closes_at < now()
+              AND b.status IN ('submitted', 'under_review')
+        """)).fetchall()
+
         result = conn.execute(text("SELECT marketplace.close_expired_windows() AS closed")).fetchone()
+
     closed = result.closed if result else 0
-    return {"closed": closed, "message": f"Closed {closed} expired bid window(s)."}
+
+    # Fire bid.rejected webhooks for each affected institution
+    for bid in rejected_bids:
+        asyncio.create_task(dispatch_event(
+            str(bid.institution_id),
+            "bid.rejected",
+            {
+                "bid_id":     str(bid.bid_id),
+                "request_id": str(bid.request_id),
+                "reason":     "request_expired",
+            },
+        ))
+
+    return {"closed": closed, "message": f"Closed {closed} expired bid window(s).", "bids_rejected": len(rejected_bids)}
 
 # ── POST /marketplace/sync-requests ──────────────────────────────────────────
 # Phase 1 helpers ─────────────────────────────────────────────────────────────
@@ -350,12 +379,13 @@ async def sync_requests(
 
     synced, failed = 0, 0
     errors: list[str] = []
+    new_requests: list[dict] = []  # collect for webhook dispatch
     with service_session() as conn:
         for r in app_rows:
             try:
                 parsed = _parse_purpose(r.purpose)
                 phase1 = _build_phase1(r, parsed)
-                conn.execute(text(_INGEST_SQL), {
+                result = conn.execute(text(_INGEST_SQL + " RETURNING is_new"), {
                     "id":           r.id,
                     "consumer_id":  r.client_id,
                     "product_type": r.product_type,
@@ -366,10 +396,60 @@ async def sync_requests(
                     "status":       r.status,
                     "created_at":   r.created_at,
                     "phase1":       json.dumps(phase1),
-                })
+                }).fetchone()
                 synced += 1
+                # Only fire webhook for genuinely new requests (not re-syncs)
+                if result and getattr(result, "is_new", False):
+                    new_requests.append({
+                        "request_id": r.id,
+                        "product_type": r.product_type,
+                        "amount": float(r.amount or 0),
+                        "term_months": r.preferred_term_months,
+                    })
             except Exception as e:
-                failed += 1
-                if len(errors) < 10:
-                    errors.append(f"{r.id}: {e}")
+                # RETURNING is_new may fail if ingest function doesn't expose it —
+                # fall back gracefully without breaking the sync
+                if "is_new" in str(e):
+                    try:
+                        conn.execute(text(_INGEST_SQL), {
+                            "id": r.id, "consumer_id": r.client_id,
+                            "product_type": r.product_type, "amount": r.amount,
+                            "term": r.preferred_term_months, "max_rate": r.max_rate,
+                            "deadline": r.decision_deadline, "status": r.status,
+                            "created_at": r.created_at, "phase1": json.dumps(phase1),
+                        })
+                        synced += 1
+                    except Exception as e2:
+                        failed += 1
+                        if len(errors) < 10:
+                            errors.append(f"{r.id}: {e2}")
+                else:
+                    failed += 1
+                    if len(errors) < 10:
+                        errors.append(f"{r.id}: {e}")
+
+    # Dispatch request.new webhook to all institutions with matching product config
+    # Fire-and-forget per new request — don't block the sync response
+    if new_requests:
+        with service_session() as conn:
+            institution_rows = conn.execute(
+                text("""
+                    SELECT DISTINCT i.id AS institution_id, pc.product_type
+                    FROM institution.product_config pc
+                    JOIN institution.institution i ON i.id = pc.institution_id
+                    WHERE pc.is_active = true
+                      AND pc.product_type = ANY(CAST(:pts AS text[]))
+                """),
+                {"pts": list({r["product_type"] for r in new_requests})},
+            ).fetchall()
+
+        for inst_row in institution_rows:
+            matching = [r for r in new_requests if r["product_type"] == inst_row.product_type]
+            for req in matching:
+                asyncio.create_task(dispatch_event(
+                    str(inst_row.institution_id),
+                    "request.new",
+                    {**req, "source": "marketplace_sync"},
+                ))
+
     return {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
