@@ -64,7 +64,21 @@ def init_pool() -> None:
             pool_size=settings.db_pool_min,
             max_overflow=settings.db_pool_max - settings.db_pool_min,
             pool_pre_ping=True,
-            connect_args={"sslmode": "require"},
+            # Recycle connections before Supabase's pooler drops idle ones
+            # (default server idle timeout is ~10 min). Without this, a
+            # connection can go stale in the pool and the next request eats a
+            # "server closed the connection unexpectedly" before pre_ping
+            # replaces it. 5 min stays safely under the server timeout.
+            pool_recycle=300,
+            connect_args={
+                "sslmode": "require",
+                # TCP keepalives keep long-lived pooled connections from being
+                # silently reaped by intermediate NAT/load balancers.
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
+            },
         )
         _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
         log.info("db_pool_ready", min=settings.db_pool_min, max=settings.db_pool_max)
@@ -75,7 +89,14 @@ def init_pool() -> None:
             pool_size=settings.db_pool_min,
             max_overflow=settings.db_pool_max - settings.db_pool_min,
             pool_pre_ping=True,
-            connect_args={"sslmode": "require"},
+            pool_recycle=300,
+            connect_args={
+                "sslmode": "require",
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
+            },
         )
         _AppSessionLocal = sessionmaker(bind=_app_engine, autocommit=False, autoflush=False)
         log.info("app_db_pool_ready")
