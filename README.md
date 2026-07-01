@@ -106,6 +106,23 @@ All endpoints accept `fic_live_*` API keys with the appropriate scope, or a port
 
 ---
 
+## Security
+
+Full model in **[SECURITY.md](./SECURITY.md)**. In brief:
+
+- **Tenant isolation** via RLS — enforced by `tenant_session()` which sets JWT
+  claims *and* `SET LOCAL ROLE authenticated` (the pooler is `postgres`/BYPASSRLS,
+  so the role switch is what actually engages RLS). All tenant tables are
+  `ENABLE` + `FORCE ROW LEVEL SECURITY`.
+- **Double-blind marketplace** — `marketplace.request` holds only an opaque
+  `consumer_id`; PII is revealed only on bid acceptance.
+- **Rate limiting** (`core/ratelimit.py`), **SSRF guard** on webhook URLs
+  (`core/ssrf.py`), **admin guard** at router level, **RS256-pinned** JWT
+  verification, and **allowlist-only** dynamic SQL.
+- Adding a tenant-scoped table? See the checklist in SECURITY.md §2.
+
+---
+
 ## API Key scopes
 
 | Scope | What it permits |
