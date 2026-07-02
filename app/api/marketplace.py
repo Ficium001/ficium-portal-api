@@ -144,6 +144,99 @@ async def get_bid(bid_id: str, conn: Session = Depends(tenant_conn)) -> dict:
         raise HTTPException(status_code=404, detail="Bid not found.")
     return _row(row)
 
+# ── POST /marketplace/requests/{request_id}/reject ──────────────────────────
+@router.post("/requests/{request_id}/reject")
+async def reject_request(
+    request_id: str,
+    body: dict = Body(default={}),
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    Institution explicitly declines a marketplace request (distinct from
+    simply not bidding on it). The App DB's reject_request() SECURITY
+    DEFINER function is the single authority for the status transition,
+    the borrower notification, and the audit trail (request_decisions) —
+    this endpoint only validates institution visibility/eligibility first,
+    then mirrors the decline onto the Portal DB copy so it drops out of
+    every institution's open queue immediately.
+    """
+    inst_id = claims.get("institution_id")
+    if not inst_id:
+        raise HTTPException(status_code=403, detail="No institution context.")
+
+    reason = (body.get("reason") or "").strip() or None
+    if reason and len(reason) > 500:
+        raise HTTPException(status_code=422, detail="Reason too long (max 500 chars).")
+
+    # RLS-scoped visibility/state pre-check before the App DB round-trip.
+    req_row = conn.execute(
+        text("SELECT id, status FROM marketplace.request WHERE id = :rid"),
+        {"rid": request_id},
+    ).fetchone()
+    if req_row is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if req_row.status != "bidding":
+        raise HTTPException(status_code=409, detail=f"Request is not open (status: {req_row.status}).")
+
+    try:
+        with app_service_session() as app_conn:
+            result = app_conn.execute(
+                text("SELECT public.reject_request(CAST(:rid AS uuid), CAST(:iid AS uuid), :reason) AS result"),
+                {"rid": request_id, "iid": inst_id, "reason": reason},
+            ).fetchone()
+    except AppDatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    payload = result.result if result else {"ok": False, "error": "no_response"}
+    if not payload.get("ok"):
+        err = payload.get("error", "reject_failed")
+        status_code = 409 if err in ("request_not_open", "request_not_found") else 400
+        raise HTTPException(status_code=status_code, detail=err)
+
+    # Mirror onto the Portal DB copy — don't wait on the next pull-sync,
+    # which only ever ingests App DB requests that are still 'open'.
+    conn.execute(
+        text("""
+            UPDATE marketplace.request
+            SET status = 'cancelled', cancelled_at = now(), cancellation_reason = :reason
+            WHERE id = :rid
+        """),
+        {"rid": request_id, "reason": reason or "Declined by institution"},
+    )
+
+    asyncio.create_task(dispatch_event(str(inst_id), "request.rejected", {
+        "request_id": request_id,
+        "reason": reason,
+    }))
+
+    # Best-effort audit trail entry — never blocks or fails the reject itself.
+    try:
+        with service_session() as audit_conn:
+            audit_conn.execute(
+                text("""
+                    INSERT INTO audit.event
+                        (id, occurred_at, actor_id, actor_type, actor_email, actor_role,
+                         institution_id, action, resource_type, resource_id, outcome, metadata)
+                    VALUES
+                        (gen_random_uuid(), now(), CAST(:actor_id AS uuid), 'member', :actor_email, :actor_role,
+                         CAST(:inst_id AS uuid), 'request.reject', 'marketplace_request', CAST(:rid AS uuid),
+                         'success', jsonb_build_object('reason', :reason))
+                """),
+                {
+                    "actor_id": claims.get("sub"),
+                    "actor_email": claims.get("email"),
+                    "actor_role": claims.get("user_role"),
+                    "inst_id": inst_id,
+                    "rid": request_id,
+                    "reason": reason,
+                },
+            )
+    except Exception:
+        pass  # audit is best-effort; core action already committed
+
+    return {"ok": True, "request_id": request_id, "status": "rejected"}
+
 # ── POST /marketplace/close-expired ──────────────────────────────────────────
 def _verify_service_secret(received: str) -> None:
     expected = settings.app_service_secret
