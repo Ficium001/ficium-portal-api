@@ -299,6 +299,30 @@ class TestPublicEndpoints:
         # 404 (request not found in mock) is acceptable — secret was valid
         assert r.status_code in (200, 404, 503)
 
+    def test_market_intelligence_wrong_secret_returns_403(self, client):
+        r = client.get(
+            "/public/market-intelligence",
+            headers={"X-Service-Secret": "wrong"},
+        )
+        assert r.status_code == 403
+
+    def test_market_intelligence_no_secret_returns_403(self, client):
+        r = client.get("/public/market-intelligence")
+        assert r.status_code == 403
+
+    def test_market_intelligence_valid_secret_returns_expected_shape(self, client):
+        with patch("app.api.public.service_session", side_effect=_mock_service_session):
+            r = client.get(
+                "/public/market-intelligence",
+                headers={"X-Service-Secret": "test-secret-1234"},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body.keys()) == {"marketRates", "acceptanceIntel", "competitiveness"}
+        assert isinstance(body["marketRates"], list)
+        assert isinstance(body["acceptanceIntel"], list)
+        assert isinstance(body["competitiveness"], list)
+
 
 # ===========================================================================
 # Members
