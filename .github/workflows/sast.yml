@@ -1,0 +1,33 @@
+name: SAST
+
+# Static analysis security scan. CodeQL's code-scanning upload requires
+# GitHub Advanced Security, which isn't enabled on this private repo.
+# Semgrep runs the same kind of analysis as a plain CI gate -- pass/fail
+# on findings, no GHAS dependency, no SARIF upload.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Semgrep scan (auto ruleset)
+        # Report-only for now: brand-new gate with no triaged baseline.
+        # Once the first run's findings are triaged (real issues fixed,
+        # false positives added to .semgrepignore), remove
+        # continue-on-error to make this a real gate.
+        run: semgrep scan --config=auto
+        continue-on-error: true
