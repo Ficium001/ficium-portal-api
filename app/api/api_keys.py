@@ -144,6 +144,8 @@ def create_key(
         },
     ).fetchone()
     conn.commit()
+    if row is None:
+        raise HTTPException(status_code=500, detail="API key insert returned no row.")
 
     return {
         **dict(row._mapping),

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from datetime import UTC
 from typing import Any
 
 import structlog
@@ -106,8 +107,8 @@ def verify_api_key(conn: Session, raw_key: str, client_ip: str | None = None) ->
         raise ApiKeyError("API key has been revoked.")
 
     # Import here to avoid circular; sqlalchemy text + now() comparison
-    from datetime import datetime, timezone
-    if row.expires_at is not None and row.expires_at < datetime.now(timezone.utc):
+    from datetime import datetime
+    if row.expires_at is not None and row.expires_at < datetime.now(UTC):
         raise ApiKeyError("API key has expired.")
 
     # Best-effort telemetry update

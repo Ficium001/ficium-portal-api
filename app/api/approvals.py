@@ -17,7 +17,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..deps import tenant_conn, current_claims as get_claims
+from ..deps import current_claims as get_claims
+from ..deps import tenant_conn
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 

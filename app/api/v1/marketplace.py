@@ -16,19 +16,18 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
-from ...core.webhooks import dispatch_event
-from ...deps import api_or_jwt_claims, require_scope, service_session
 from ...core.db import service_session as _svc
 from ...core.ratelimit import limiter
-
-import asyncio
+from ...core.webhooks import dispatch_event
+from ...deps import api_or_jwt_claims, require_scope
 
 router = APIRouter(prefix="/v1", tags=["v1-public-api"])
 
@@ -220,8 +219,8 @@ def submit_bid(
         if req.status != "open":
             raise HTTPException(status_code=409, detail=f"Request is {req.status}, not open.")
         
-        from datetime import datetime, timezone
-        if req.bid_window_closes_at and req.bid_window_closes_at < datetime.now(timezone.utc):
+        from datetime import datetime
+        if req.bid_window_closes_at and req.bid_window_closes_at < datetime.now(UTC):
             raise HTTPException(status_code=409, detail="Bid window has closed.")
 
         # Check for duplicate active bid
@@ -279,6 +278,8 @@ def submit_bid(
             },
         ).fetchone()
         conn.commit()
+        if row is None:
+            raise HTTPException(status_code=500, detail="Bid insert returned no row.")
         result = dict(row._mapping)
 
     # Fire webhook to the institution (confirmation their system bid was received)
@@ -461,6 +462,8 @@ def analytics_summary(
             {"iid": iid, "days": days},
         ).fetchone()
 
+    if bids is None or pipelines is None:
+        raise HTTPException(status_code=500, detail="Intelligence query returned no row.")
     bid_d = dict(bids._mapping)
     pip_d = dict(pipelines._mapping)
 

@@ -33,7 +33,6 @@ import hmac
 import json
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -112,7 +111,7 @@ async def _fire_single(
             # Defence-in-depth: re-validate at send time. A hostname that was
             # public at registration could later resolve to a private IP
             # (DNS rebinding). Block that before making the request.
-            from .ssrf import validate_webhook_url, WebhookUrlError
+            from .ssrf import WebhookUrlError, validate_webhook_url
             try:
                 validate_webhook_url(webhook["endpoint_url"])
             except WebhookUrlError as exc:

@@ -534,7 +534,8 @@ class TestBenefitsModule:
                 VALUES (%s, 'zz_bf', 'ZZ Benefit Fam', 998)
             """, (fam_id,))
             cur.execute("""
-                INSERT INTO catalog.product (id, family_id, code, label, currency, active, sort_order)
+                INSERT INTO catalog.product
+                    (id, family_id, code, label, currency, active, sort_order)
                 VALUES (%s, %s, 'zz_bp', 'ZZ Benefit Prod', 'MUR', true, 998)
             """, (prod_id, fam_id))
 

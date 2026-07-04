@@ -11,8 +11,8 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from .core.ratelimit import limiter
-from .api.admin import router as admin_router, public_router as admin_public_router
+from .api.admin import public_router as admin_public_router
+from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
@@ -31,6 +31,7 @@ from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
+from .core.ratelimit import limiter
 
 log = structlog.get_logger()
 
@@ -54,7 +55,7 @@ app = FastAPI(
 # Rate limiting — per-tenant (institution_id from JWT) with IP fallback.
 # Default 600/min per bucket; returns 429 with Retry-After when exceeded.
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 app.add_middleware(SlowAPIMiddleware)
 
 _origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]

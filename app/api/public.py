@@ -291,6 +291,7 @@ async def accept_bid(
     # ── Write notification + fire webhooks to winning institution ────────────
     if result and result.result:
         import asyncio as _asyncio
+
         from ..core.webhooks import dispatch_event as _dispatch
 
         res_data = dict(result.result)

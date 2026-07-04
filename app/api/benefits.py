@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import uuid
-
 from fastapi import APIRouter, Body, Depends, HTTPException, Path
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -191,7 +189,6 @@ async def update_benefit(
     """
     _require_module(claims)
     institution_id = _institution_id(claims)
-    member_id      = claims.get("member_id") or claims.get("sub")
 
     # Verify ownership
     existing = conn.execute(

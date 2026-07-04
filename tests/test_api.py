@@ -31,7 +31,7 @@ import os
 import uuid
 from contextlib import contextmanager
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,10 +40,9 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/tes
 os.environ.setdefault("APP_DATABASE_URL", "postgresql://test:test@localhost:5432/test")
 os.environ.setdefault("APP_SERVICE_SECRET", "test-secret-1234")
 
-from app.core.security import TokenError      # noqa: E402
+from app.core.security import TokenError  # noqa: E402
 from app.deps import current_claims, tenant_conn  # noqa: E402
-from app.main import app                       # noqa: E402
-
+from app.main import app  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Test identities

@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import secrets
@@ -29,8 +28,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..core.ssrf import validate_webhook_url, WebhookUrlError
-
+from ..core.ssrf import WebhookUrlError, validate_webhook_url
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -137,7 +135,7 @@ def create_webhook(
             "iid": iid,
             "label": body.label,
             "url": str(body.endpoint_url),
-            "secret": json.dumps(list(body.event_types)),
+            "events": json.dumps(list(body.event_types)),
             "retry": body.retry_max,
             "timeout": body.timeout_ms,
             # We store the raw secret directly (it IS the secret, not a hash)
@@ -146,6 +144,8 @@ def create_webhook(
         },
     ).fetchone()
     conn.commit()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Webhook insert returned no row.")
 
     return {
         **dict(row._mapping),
@@ -179,22 +179,27 @@ def update_webhook(
     params: dict[str, Any] = {"wid": webhook_id, "iid": iid}
 
     if body.label is not None:
-        updates.append("label = :label"); params["label"] = body.label
+        updates.append("label = :label")
+        params["label"] = body.label
     if body.endpoint_url is not None:
         try:
             validate_webhook_url(str(body.endpoint_url))
         except WebhookUrlError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-        updates.append("endpoint_url = :url"); params["url"] = str(body.endpoint_url)
+        updates.append("endpoint_url = :url")
+        params["url"] = str(body.endpoint_url)
     if body.event_types is not None:
         updates.append("event_types = CAST(:events AS jsonb)")
         params["events"] = json.dumps(body.event_types)
     if body.active is not None:
-        updates.append("active = :active"); params["active"] = body.active
+        updates.append("active = :active")
+        params["active"] = body.active
     if body.retry_max is not None:
-        updates.append("retry_max = :retry"); params["retry"] = body.retry_max
+        updates.append("retry_max = :retry")
+        params["retry"] = body.retry_max
     if body.timeout_ms is not None:
-        updates.append("timeout_ms = :timeout"); params["timeout"] = body.timeout_ms
+        updates.append("timeout_ms = :timeout")
+        params["timeout"] = body.timeout_ms
 
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update.")
@@ -212,6 +217,8 @@ def update_webhook(
         params,
     ).fetchone()
     conn.commit()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Webhook not found.")
     return dict(row._mapping)
 
 

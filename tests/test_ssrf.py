@@ -8,7 +8,7 @@
 
 import pytest
 
-from app.core.ssrf import validate_webhook_url, WebhookUrlError
+from app.core.ssrf import WebhookUrlError, validate_webhook_url
 
 
 class TestBlockedTargets:

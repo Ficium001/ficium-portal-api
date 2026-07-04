@@ -142,6 +142,8 @@ async def create_template(
             "iid": institution_id, "name": name, "desc": description,
             "code": product_code, "dflt": is_default, "creator": member_id,
         }))
+        if tmpl is None:
+            raise HTTPException(status_code=500, detail="Template insert returned no row.")
 
         stages_created = []
         for pos, s in enumerate(stages_input, start=1):
@@ -259,6 +261,8 @@ async def update_template(
             "active": body.get("is_active"),
         }))
         sconn.commit()
+        if tmpl is None:
+            raise HTTPException(status_code=404, detail="Template not found.")
         return tmpl
 
 
@@ -290,11 +294,14 @@ async def add_stage(
         if not tmpl:
             raise HTTPException(status_code=404, detail="Template not found.")
 
-        max_pos = _one(sconn.execute(text("""
+        max_pos_row = _one(sconn.execute(text("""
             SELECT COALESCE(MAX(position), 0) AS max_pos
             FROM institution.pipeline_stage_def
             WHERE template_id = :tid AND institution_id = :iid
-        """), {"tid": template_id, "iid": institution_id}))["max_pos"]
+        """), {"tid": template_id, "iid": institution_id}))
+        if max_pos_row is None:
+            raise HTTPException(status_code=500, detail="Position query returned no row.")
+        max_pos = max_pos_row["max_pos"]
 
         stage = _one(sconn.execute(text("""
             INSERT INTO institution.pipeline_stage_def
@@ -320,6 +327,8 @@ async def add_stage(
             "bvis":   body.get("borrower_visible", True),
         }))
         sconn.commit()
+        if stage is None:
+            raise HTTPException(status_code=500, detail="Stage insert returned no row.")
         return stage
 
 
@@ -377,6 +386,8 @@ async def update_stage(
             "bvis":   body.get("borrower_visible"),
         }))
         sconn.commit()
+        if stage is None:
+            raise HTTPException(status_code=404, detail="Stage not found.")
         return stage
 
 

@@ -18,9 +18,9 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 import httpx
+import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -30,7 +30,7 @@ from ..core.db import service_session
 from ..deps import current_claims, tenant_conn
 from .notifications import _write_notification
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 router = APIRouter(prefix="/pipelines", tags=["pipeline"])
 
