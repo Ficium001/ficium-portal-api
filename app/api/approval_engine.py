@@ -362,11 +362,11 @@ async def simulate_routing(
     _require_module(claims)
     try:
         rule = doa.evaluate(_load_rules(conn, body["entity_type"]), _params_from(body))
-    except doa.NoMatchingRule:
+    except doa.NoMatchingRule as exc:
         raise HTTPException(
             status_code=409,
             detail="No DoA rule matched — the catch-all rule is missing.",
-        )
+        ) from exc
     tpl = conn.execute(text("""
         SELECT t.id, t.name, t.version,
                jsonb_agg(jsonb_build_object(
@@ -395,11 +395,11 @@ async def route_entity(
     params["entity_type"] = body["entity_type"]
     try:
         rule = doa.evaluate(_load_rules(conn, body["entity_type"]), _params_from(params))
-    except doa.NoMatchingRule:
+    except doa.NoMatchingRule as exc:
         raise HTTPException(
             status_code=409,
             detail="No DoA rule matched — the catch-all rule is missing.",
-        )
+        ) from exc
     row = _engine_call(conn, """
         SELECT institution.approvals_route(
           :iid, :entity_type, :entity_id, :maker,

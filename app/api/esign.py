@@ -27,7 +27,6 @@ import io
 import json
 import os
 import secrets
-from typing import Any
 
 import httpx
 import structlog

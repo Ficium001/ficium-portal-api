@@ -7,18 +7,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
 class EntityParams:
     entity_type: str
-    amount: Optional[Decimal] = None
-    currency: Optional[str] = None
-    risk_tier: Optional[str] = None
-    product_type: Optional[str] = None
-    secured: Optional[bool] = None
-    tenor_months: Optional[int] = None
+    amount: Decimal | None = None
+    currency: str | None = None
+    risk_tier: str | None = None
+    product_type: str | None = None
+    secured: bool | None = None
+    tenor_months: int | None = None
 
 
 @dataclass(frozen=True)
