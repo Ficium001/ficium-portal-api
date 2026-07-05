@@ -39,6 +39,18 @@ from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
 
+def _row_or_500(row, context: str):
+    """Narrow Row | None from SQL function calls that must return a row."""
+    if row is None:
+        log.error("esign_missing_row", context=context)
+        raise HTTPException(status_code=500, detail="Internal error.")
+    return row
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "0.0.0.0"
+
+
 def service_conn():
     """FastAPI dependency wrapper over core.db.service_session (privileged,
     outside tenant RLS — used ONLY for signer-token resolution where no
@@ -200,6 +212,7 @@ async def create_envelope(
                 detail="This document requires a completed approval first.",
             ) from e
         raise
+    row = _row_or_500(row, "esign_create_envelope")
     env_id = str(row.id)
     conn.execute(text(
         "UPDATE institution.esign_envelope SET status = 'sent' WHERE id = :id"
@@ -319,7 +332,7 @@ async def ceremony_state(
         "SELECT institution.esign_append_event(:e, :s, 'viewed', '{}', "
         "CAST(:ip AS inet), :ua)"
     ), {"e": s.envelope_id, "s": s.id,
-        "ip": request.client.host, "ua": request.headers.get("user-agent", "")})
+        "ip": _client_ip(request), "ua": request.headers.get("user-agent", "")})
     conn.commit()
     doc_url = await _storage_signed_url(s.document_path)
     return {
@@ -368,11 +381,12 @@ async def verify_otp(
     valid = (
         row is not None and row.otp_hash is not None
         and row.otp_attempts < OTP_MAX_ATTEMPTS
-        and conn.execute(text("SELECT :e > now() AS ok"),
-                         {"e": row.otp_expires_at}).fetchone().ok
+        and bool(getattr(conn.execute(text("SELECT :e > now() AS ok"),
+                                      {"e": row.otp_expires_at}).fetchone(),
+                         "ok", False))
         and hmac.compare_digest(row.otp_hash, _otp_hash(otp))
     )
-    ip, ua = request.client.host, request.headers.get("user-agent", "")
+    ip, ua = _client_ip(request), request.headers.get("user-agent", "")
     if valid:
         conn.execute(text("""
             UPDATE institution.esign_signer
@@ -404,7 +418,7 @@ async def sign(
     try:
         row = conn.execute(text(
             "SELECT institution.esign_sign(:id, CAST(:ip AS inet), :ua) AS status"
-        ), {"id": s.id, "ip": request.client.host,
+        ), {"id": s.id, "ip": _client_ip(request),
             "ua": request.headers.get("user-agent", "")}).fetchone()
     except Exception as e:  # noqa: BLE001
         msg = str(e)
@@ -419,6 +433,7 @@ async def sign(
             if code in msg:
                 raise HTTPException(status_code=status, detail=detail) from e
         raise
+    row = _row_or_500(row, "esign_sign")
     status = row.status
     conn.commit()
     if status == "completed":
@@ -437,7 +452,7 @@ async def decline(
         raise HTTPException(status_code=422, detail="A brief reason is required.")
     conn.execute(text(
         "SELECT institution.esign_decline(:id, :reason, CAST(:ip AS inet), :ua)"
-    ), {"id": s.id, "reason": reason, "ip": request.client.host,
+    ), {"id": s.id, "reason": reason, "ip": _client_ip(request),
         "ua": request.headers.get("user-agent", "")})
     conn.commit()
     return {"ok": True}
@@ -452,9 +467,9 @@ async def _seal(conn: Session, envelope_id: str) -> None:
     from reportlab.lib.units import mm
     from reportlab.pdfgen import canvas
 
-    env = conn.execute(text(
+    env = _row_or_500(conn.execute(text(
         "SELECT * FROM institution.esign_envelope WHERE id = :id"
-    ), {"id": envelope_id}).fetchone()
+    ), {"id": envelope_id}).fetchone(), "esign_seal_envelope")
     signers = conn.execute(text("""
         SELECT sign_order, display_name, email, party, signed_at, signed_ip
         FROM institution.esign_signer WHERE envelope_id = :id ORDER BY sign_order

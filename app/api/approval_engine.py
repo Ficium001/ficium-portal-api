@@ -29,6 +29,13 @@ from ..core import doa
 from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
+
+def _row_or_500(row):
+    """Narrow Row | None from INSERT ... RETURNING / SQL function calls."""
+    if row is None:
+        raise HTTPException(status_code=500, detail="Internal error.")
+    return row
+
 router = APIRouter(prefix="/approval-engine", tags=["approval-engine"])
 
 MODULE_KEY = "inst:approvals"
@@ -131,7 +138,7 @@ async def create_committee(
         "tie_break": body.get("tie_break"), "allow_abstain": body.get("allow_abstain"),
     }).fetchone()
     conn.commit()
-    return {"id": str(row.id)}
+    return {"id": str(_row_or_500(row).id)}
 
 
 @router.post("/committees/{committee_id}/members")
@@ -213,14 +220,14 @@ async def create_template(
     if seqs != list(range(1, len(seqs) + 1)):
         raise HTTPException(status_code=422, detail="Stage seq must be contiguous from 1.")
 
-    tpl = conn.execute(text("""
+    tpl = _row_or_500(conn.execute(text("""
         INSERT INTO institution.approval_template
           (institution_id, name, entity_type, created_by)
         VALUES (:iid, :name, :entity_type, :uid) RETURNING id
     """), {
         "iid": _institution_id(claims), "uid": claims["sub"],
         "name": body["name"], "entity_type": body["entity_type"],
-    }).fetchone()
+    }).fetchone())
     for s in stages:
         conn.execute(text("""
             INSERT INTO institution.approval_stage_def
@@ -349,7 +356,7 @@ async def create_doa_rule(
         "template_id": body["template_id"],
     }).fetchone()
     conn.commit()
-    return {"id": str(row.id)}
+    return {"id": str(_row_or_500(row).id)}
 
 
 @router.post("/doa-rules/simulate")
