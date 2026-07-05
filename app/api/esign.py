@@ -27,11 +27,12 @@ import io
 import json
 import os
 import secrets
+from typing import Any
 
 import httpx
 import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from sqlalchemy import text
+from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
@@ -39,7 +40,7 @@ from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
 
-def _row_or_500(row, context: str):
+def _row_or_500(row: Row[Any] | None, context: str) -> Row[Any]:
     """Narrow Row | None from SQL function calls that must return a row."""
     if row is None:
         log.error("esign_missing_row", context=context)

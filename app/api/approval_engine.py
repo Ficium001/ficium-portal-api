@@ -22,7 +22,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from sqlalchemy import text
+from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
 from ..core import doa
@@ -30,7 +30,7 @@ from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
 
-def _row_or_500(row):
+def _row_or_500(row: Row[Any] | None) -> Row[Any]:
     """Narrow Row | None from INSERT ... RETURNING / SQL function calls."""
     if row is None:
         raise HTTPException(status_code=500, detail="Internal error.")
