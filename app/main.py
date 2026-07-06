@@ -32,6 +32,7 @@ from .api.webhooks import router as webhooks_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
 from .core.ratelimit import limiter
+from .core.response_headers import DefaultResponseHeadersMiddleware
 
 log = structlog.get_logger()
 
@@ -57,6 +58,7 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(DefaultResponseHeadersMiddleware)
 
 _origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
 app.add_middleware(
