@@ -14,11 +14,13 @@ from slowapi.middleware import SlowAPIMiddleware
 from .api.admin import public_router as admin_public_router
 from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
+from .api.approval_engine import router as approval_engine_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
 from .api.benefits import router as benefits_router
 from .api.catalog import router as catalog_router
 from .api.documents import router as documents_router
+from .api.esign import router as esign_router
 from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
 from .api.marketplace import router as marketplace_router
@@ -81,12 +83,14 @@ app.include_router(admin_public_router)
 app.include_router(institutions_router)
 app.include_router(members_router)
 app.include_router(approvals_router)
+app.include_router(approval_engine_router)  # configurable chains (inst:approvals)
 app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
 app.include_router(catalog_router)
 app.include_router(benefits_router)
 app.include_router(documents_router)
+app.include_router(esign_router)        # e-signature envelopes + public ceremony
 app.include_router(pipeline_templates_router)
 app.include_router(pipeline_router)
 app.include_router(notifications_router)

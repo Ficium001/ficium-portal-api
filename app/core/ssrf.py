@@ -93,7 +93,7 @@ def validate_webhook_url(url: str, *, require_https: bool = True) -> None:
     except socket.gaierror as e:
         raise WebhookUrlError(f"Webhook URL host does not resolve: {host}") from e
 
-    resolved = {info[4][0] for info in infos}
+    resolved = {str(info[4][0]) for info in infos}
     if not resolved:
         raise WebhookUrlError(f"Webhook URL host does not resolve: {host}")
 
