@@ -22,7 +22,7 @@ jobs:
       image: semgrep/semgrep
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Semgrep scan (auto ruleset)
         # Report-only for now: brand-new gate with no triaged baseline.
