@@ -33,9 +33,15 @@ from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
+from .core.observability import (
+    RequestObservabilityMiddleware,
+    configure_logging,
+    metrics_endpoint,
+)
 from .core.ratelimit import limiter
 from .core.response_headers import DefaultResponseHeadersMiddleware
 
+configure_logging(env=settings.env, level=settings.log_level)
 log = structlog.get_logger()
 
 
@@ -63,6 +69,7 @@ app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(DefaultResponseHeadersMiddleware)
 
 _origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+app.add_middleware(RequestObservabilityMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -78,6 +85,7 @@ async def health() -> dict:
     return {"status": "ok", "service": "ficium-portal-api", "version": settings.version}
 
 
+app.add_route("/metrics", metrics_endpoint, methods=["GET"], include_in_schema=False)
 app.include_router(admin_router)
 app.include_router(admin_public_router)
 app.include_router(institutions_router)
