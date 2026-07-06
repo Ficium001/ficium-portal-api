@@ -30,6 +30,11 @@ class DefaultResponseHeadersMiddleware(BaseHTTPMiddleware):
         if not response.headers.get("cache-control"):
             response.headers["Cache-Control"] = "no-store"
 
+        # X-Content-Type-Options: prevent MIME sniffing on every API
+        # response — closes the DevTools Issues panel error "Response should
+        # include 'x-content-type-options' header".
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+
         # Ensure JSON responses declare charset explicitly.
         content_type = response.headers.get("content-type", "")
         if content_type.startswith("application/json") and "charset" not in content_type:
