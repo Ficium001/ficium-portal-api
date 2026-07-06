@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
-from datetime import UTC
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..core.bidding import BidInput, BidPlacementError, place_bid
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
 from ..core.webhooks import dispatch_event
@@ -92,49 +92,32 @@ async def submit_bid(
     if not inst_id:
         raise HTTPException(status_code=403, detail="No institution context.")
 
-    # Window guard — check before hitting the DB trigger
-    req_row = conn.execute(
-        text("SELECT status, bid_window_closes_at FROM marketplace.request WHERE id = :rid"),
-        {"rid": body["request_id"]},
-    ).fetchone()
-    if req_row is None:
-        raise HTTPException(status_code=404, detail="Request not found.")
-    if req_row.status != "bidding":
-        raise HTTPException(status_code=409, detail=f"Request is not open for bidding (status: {req_row.status}).")
-    from datetime import datetime
-    if req_row.bid_window_closes_at and req_row.bid_window_closes_at < datetime.now(UTC):
-        raise HTTPException(status_code=409, detail="Bid window has closed for this request.")
-
+    bid = BidInput(
+        request_id=body["request_id"],
+        institution_id=str(inst_id),
+        rate=body["rate"],
+        rate_type=body.get("rate_type", "fixed"),
+        amount_offered=body["amount_offered"],
+        term_months=body["term_months"],
+        rate_valid_days=body.get("rate_valid_days"),
+        conditions=body.get("conditions", {}),
+        fee_structure=body.get("fee_structure", {}),
+        idempotency_key=body.get("idempotency_key"),
+        submitted_via="portal",
+    )
     try:
-        result = conn.execute(text("""
-            INSERT INTO marketplace.bid
-                (request_id, institution_id, rate, rate_type, rate_valid_days,
-                 amount_offered, term_months, conditions, fee_structure,
-                 submitted_via, idempotency_key)
-            VALUES
-                (:request_id, :institution_id, :rate, :rate_type, :rate_valid_days,
-                 :amount_offered, :term_months, CAST(:conditions AS jsonb),
-                 CAST(:fee_structure AS jsonb), 'portal', :idempotency_key)
-            ON CONFLICT (institution_id, request_id, idempotency_key) DO NOTHING
-            RETURNING id, status, submitted_at
-        """), {
-            "request_id":      body["request_id"],
-            "institution_id":  inst_id,
-            "rate":            body["rate"],
-            "rate_type":       body.get("rate_type", "fixed"),
-            "rate_valid_days": body.get("rate_valid_days"),
-            "amount_offered":  body["amount_offered"],
-            "term_months":     body["term_months"],
-            "conditions":      json.dumps(body.get("conditions", {})),
-            "fee_structure":   json.dumps(body.get("fee_structure", {})),
-            "idempotency_key": body.get("idempotency_key"),
-        }).fetchone()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        result = place_bid(conn, bid)
+    except BidPlacementError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    conn.commit()
 
-    if result is None:
+    if result.duplicate:
         return {"status": "duplicate", "message": "Bid already submitted."}
-    return {"id": str(result.id), "status": result.status, "submitted_at": result.submitted_at.isoformat()}
+    return {
+        "id": result.id,
+        "status": result.status,
+        "submitted_at": result.submitted_at.isoformat() if result.submitted_at else None,
+    }
 
 # ── GET /marketplace/bids/{bid_id} ───────────────────────────────────────────
 @router.get("/bids/{bid_id}")
