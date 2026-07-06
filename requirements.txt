@@ -8,7 +8,7 @@ pydantic-settings==2.14.2
 python-jose[cryptography]==3.5.0
 httpx==0.28.1
 structlog==26.1.0
-argon2-cffi==23.1.0
+argon2-cffi==25.1.0
 slowapi==0.1.10
 reportlab==4.2.5
 pypdf==5.1.0
