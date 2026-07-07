@@ -235,6 +235,19 @@ async def update_template(
         if not existing:
             raise HTTPException(status_code=404, detail="Template not found.")
 
+        # Guard: a template cannot be activated with zero stages — it would
+        # match a bid acceptance and produce a pipeline with nothing to run.
+        if body.get("is_active") is True:
+            stage_count = sconn.execute(text("""
+                SELECT COUNT(*) FROM institution.pipeline_stage_def
+                WHERE template_id = :tid AND is_active = true
+            """), {"tid": template_id}).scalar()
+            if not stage_count:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Cannot activate a template with no stages. Add at least one stage first.",
+                )
+
         # If promoting to default, demote the current default first
         if body.get("is_default") is True and not existing["is_default"]:
             sconn.execute(text("""
