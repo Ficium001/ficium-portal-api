@@ -80,7 +80,7 @@ def _institution_id(claims: dict) -> str:
 
 def _require_module(claims: dict) -> None:
     role = claims.get("user_role", "")
-    if role in ("super_admin", "institution_super_admin"):
+    if role in ("admin", "super_admin"):
         return
     if MODULE_KEY not in claims.get("module_permissions", []):
         raise HTTPException(
@@ -89,7 +89,11 @@ def _require_module(claims: dict) -> None:
 
 
 def _require_admin(claims: dict) -> None:
-    if claims.get("user_role", "") not in ("super_admin", "institution_super_admin"):
+    # NOTE: must match the ("admin", "super_admin") convention used everywhere
+    # else in this codebase (see documents.py:_ADMINS, institutions.py:_ADMIN_ROLES,
+    # marketplace.py, members.py). "institution_super_admin" is not a role this
+    # system ever issues, so the previous check could never pass for any user.
+    if claims.get("user_role", "") not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Requires institution admin.")
 
 

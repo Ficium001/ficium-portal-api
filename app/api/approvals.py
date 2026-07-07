@@ -45,7 +45,7 @@ CATEGORY_MODULE: dict[str, str] = {
 
 def _caller_permitted(category: str, claims: dict) -> bool:
     """Return True if the caller's module_permissions cover this action category."""
-    is_super = claims.get("user_role", "") in ("super_admin", "institution_super_admin")
+    is_super = claims.get("user_role", "") in ("admin", "super_admin")
     if is_super:
         return True
     prefix  = category.split(".")[0]
@@ -99,7 +99,7 @@ async def list_pending_actions(
 
     perms: list[str] = claims.get("module_permissions", [])
     # super_admin bypass — if role is super_admin see everything
-    is_super = claims.get("user_role", "") in ("super_admin", "institution_super_admin")
+    is_super = claims.get("user_role", "") in ("admin", "super_admin")
 
     # Build the set of permitted category prefixes
     allowed_prefixes: list[str] = []
