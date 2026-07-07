@@ -13,9 +13,22 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/members", tags=["members"])
+
+
+def _require_institution_admin(claims: dict) -> None:
+    """
+    Gate for member-management actions (role change, deactivate, reactivate,
+    password reset). Distinct from the platform-admin check in get_my_group
+    above — this one intentionally DOES include institution_admin, since
+    it's institution-side admins (e.g. a bank's own admin users) who are
+    meant to manage their own institution's members.
+    """
+    if claims.get("user_role") not in INSTITUTION_ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Requires institution admin.")
 
 
 def _row(row) -> dict:
@@ -254,6 +267,8 @@ async def update_member(
     Only institution admins can do this.
     Primary admin cannot be modified.
     """
+    _require_institution_admin(claims)
+
     # Load member — ensure it exists in caller's institution (RLS via tenant_conn)
     row = conn.execute(
         text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
@@ -306,6 +321,8 @@ async def deactivate_member(
     Sets active = false in institution.member and is_active = false in auth_portal.auth_users.
     Cannot deactivate primary admin.
     """
+    _require_institution_admin(claims)
+
     row = conn.execute(
         text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
         {"mid": member_id},
@@ -331,9 +348,12 @@ async def deactivate_member(
 @router.post("/{member_id}/reactivate")
 async def reactivate_member(
     member_id: str,
+    claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """Reactivate a previously deactivated member."""
+    _require_institution_admin(claims)
+
     row = conn.execute(
         text("SELECT id, auth_user_id FROM institution.member WHERE id = :mid"),
         {"mid": member_id},
@@ -365,6 +385,8 @@ async def reset_member_password(
     Returns the temp password in plaintext — admin must share it with the user.
     Uses service_session for the auth_users UPDATE (outside institution RLS scope).
     """
+    _require_institution_admin(claims)
+
     # 1. Resolve member via tenant_conn (institution-scoped, RLS enforced)
     row = conn.execute(
         text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
