@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -187,6 +188,90 @@ async def end_committee_membership(
         SET valid_to = current_date
         WHERE id = :mid AND committee_id = :cid
     """), {"mid": member_row_id, "cid": committee_id})
+    conn.commit()
+    return {"ok": True}
+
+
+# ── Delegations ────────────────────────────────────────────────────────────────
+# Lets one person ("to_member") act on another's ("from_member") behalf for a
+# scoped, time-bounded window — checked live in approvals_cast() via p_acting_as
+# whenever a vote is cast on someone else's behalf.
+
+@router.get("/delegations")
+async def list_delegations(
+    conn: Session = Depends(tenant_conn), claims: dict = Depends(get_claims)
+) -> list[dict]:
+    _require_module(claims)
+    rows = conn.execute(text("""
+        SELECT id, from_member, to_member, scope, reason,
+               valid_from, valid_to, approved_by, created_at
+        FROM institution.approval_delegation
+        ORDER BY valid_from DESC
+    """)).fetchall()
+    return [_row(r) for r in rows]
+
+
+@router.post("/delegations")
+async def create_delegation(
+    body: dict = Body(...),
+    conn: Session = Depends(tenant_conn),
+    claims: dict = Depends(get_claims),
+) -> dict:
+    _require_admin(claims)
+
+    from_member = body.get("from_member")
+    to_member   = body.get("to_member")
+    reason      = (body.get("reason") or "").strip()
+    valid_from  = body.get("valid_from")
+    valid_to    = body.get("valid_to")
+
+    if not from_member or not to_member:
+        raise HTTPException(status_code=422, detail="from_member and to_member are required.")
+    if from_member == to_member:
+        raise HTTPException(status_code=422, detail="A person cannot delegate to themselves.")
+    if not reason:
+        raise HTTPException(status_code=422, detail="A reason is required.")
+    if not valid_from or not valid_to:
+        raise HTTPException(status_code=422, detail="valid_from and valid_to are required.")
+    try:
+        vf = datetime.fromisoformat(str(valid_from).replace("Z", "+00:00"))
+        vt = datetime.fromisoformat(str(valid_to).replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="valid_from/valid_to must be valid ISO datetimes.")
+    if vt <= vf:
+        raise HTTPException(status_code=422, detail="valid_to must be after valid_from.")
+
+    row = conn.execute(text("""
+        INSERT INTO institution.approval_delegation
+          (institution_id, from_member, to_member, scope, reason,
+           valid_from, valid_to, approved_by)
+        VALUES
+          (:iid, :from_member, :to_member, COALESCE(:scope, 'all'), :reason,
+           :valid_from, :valid_to, :uid)
+        RETURNING id
+    """), {
+        "iid": _institution_id(claims), "uid": claims["sub"],
+        "from_member": from_member, "to_member": to_member,
+        "scope": body.get("scope"), "reason": reason,
+        "valid_from": valid_from, "valid_to": valid_to,
+    }).fetchone()
+    conn.commit()
+    return {"id": str(_row_or_500(row).id)}
+
+
+@router.delete("/delegations/{delegation_id}")
+async def revoke_delegation(
+    delegation_id: str,
+    conn: Session = Depends(tenant_conn),
+    claims: dict = Depends(get_claims),
+) -> dict:
+    """Ends a delegation immediately by pulling valid_to back to now."""
+    _require_admin(claims)
+    conn.execute(text("""
+        UPDATE institution.approval_delegation
+        SET valid_to = LEAST(valid_to, now())
+        WHERE id = :did
+    """), {"did": delegation_id})
     conn.commit()
     return {"ok": True}
 
