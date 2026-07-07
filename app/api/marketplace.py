@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..core.webhooks import dispatch_event
 from ..deps import current_claims, tenant_conn
 
@@ -66,7 +67,7 @@ async def list_my_bids(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> list[dict]:
-    if claims.get("user_role") in ("admin", "super_admin"):
+    if claims.get("user_role") in INSTITUTION_ADMIN_ROLES:
         return []
     sql = "SELECT * FROM marketplace.my_bids"
     params: dict = {}

@@ -11,6 +11,9 @@ from ..deps import current_claims
 
 router = APIRouter(prefix="/institutions", tags=["institutions"])
 
+# Platform-only: Ficium's own internal staff, who have no institution_id.
+# Deliberately excludes "institution_admin" — institution-side admins (e.g.
+# MCB) must fall through to the real institution lookup below, not this stub.
 _ADMIN_ROLES = ("admin", "super_admin")
 
 

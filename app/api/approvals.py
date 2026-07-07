@@ -17,6 +17,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
@@ -45,7 +46,7 @@ CATEGORY_MODULE: dict[str, str] = {
 
 def _caller_permitted(category: str, claims: dict) -> bool:
     """Return True if the caller's module_permissions cover this action category."""
-    is_super = claims.get("user_role", "") in ("admin", "super_admin")
+    is_super = claims.get("user_role", "") in INSTITUTION_ADMIN_ROLES
     if is_super:
         return True
     prefix  = category.split(".")[0]
@@ -99,7 +100,7 @@ async def list_pending_actions(
 
     perms: list[str] = claims.get("module_permissions", [])
     # super_admin bypass — if role is super_admin see everything
-    is_super = claims.get("user_role", "") in ("admin", "super_admin")
+    is_super = claims.get("user_role", "") in INSTITUTION_ADMIN_ROLES
 
     # Build the set of permitted category prefixes
     allowed_prefixes: list[str] = []

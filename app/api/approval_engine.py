@@ -26,6 +26,7 @@ from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
 from ..core import doa
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
@@ -80,7 +81,7 @@ def _institution_id(claims: dict) -> str:
 
 def _require_module(claims: dict) -> None:
     role = claims.get("user_role", "")
-    if role in ("admin", "super_admin"):
+    if role in INSTITUTION_ADMIN_ROLES:
         return
     if MODULE_KEY not in claims.get("module_permissions", []):
         raise HTTPException(
@@ -89,11 +90,11 @@ def _require_module(claims: dict) -> None:
 
 
 def _require_admin(claims: dict) -> None:
-    # NOTE: must match the ("admin", "super_admin") convention used everywhere
-    # else in this codebase (see documents.py:_ADMINS, institutions.py:_ADMIN_ROLES,
-    # marketplace.py, members.py). "institution_super_admin" is not a role this
-    # system ever issues, so the previous check could never pass for any user.
-    if claims.get("user_role", "") not in ("admin", "super_admin"):
+    # Shared with documents.py, institutions.py, marketplace.py — see
+    # app/core/roles.py for the live set of role strings ficium-auth
+    # actually issues. "institution_admin" (bank-side admins, e.g. MCB)
+    # was previously missing from this check entirely.
+    if claims.get("user_role", "") not in INSTITUTION_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Requires institution admin.")
 
 
