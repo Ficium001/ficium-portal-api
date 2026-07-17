@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 import os
 import shutil
 import tempfile
@@ -392,25 +393,84 @@ async def decide_version(
 # Generation
 # ---------------------------------------------------------------------------
 
+# Canonical merge fields exposed to template authors ({{ field }} in Word).
+# Kept flat and stable — extend, never rename.
+MERGE_FIELDS: list[dict] = [
+    {"key": "borrower_full_name",       "label": "Borrower full name",        "example": "Jane R. Doe"},
+    {"key": "borrower_email",           "label": "Borrower email",            "example": "jane@email.com"},
+    {"key": "borrower_phone",           "label": "Borrower phone",            "example": "+230 5xxx xxxx"},
+    {"key": "borrower_address",         "label": "Borrower address",          "example": "12 Royal Rd, Rose Hill"},
+    {"key": "borrower_date_of_birth",   "label": "Borrower date of birth",    "example": "1990-04-12"},
+    {"key": "borrower_document_number", "label": "Borrower ID / passport no.", "example": "A123456"},
+    {"key": "consumer_ref",             "label": "Ficium borrower reference", "example": "8f2a1c3d"},
+    {"key": "deal_amount",              "label": "Deal amount (number)",      "example": "1500000"},
+    {"key": "deal_amount_formatted",    "label": "Deal amount (formatted)",   "example": "MUR 1,500,000"},
+    {"key": "deal_rate",                "label": "Interest rate % p.a.",      "example": "8.75"},
+    {"key": "deal_term_months",         "label": "Term (months)",             "example": "60"},
+    {"key": "currency",                 "label": "Currency",                  "example": "MUR"},
+    {"key": "product_label",            "label": "Product",                   "example": "Home Loan"},
+    {"key": "institution_name",         "label": "Institution name",          "example": "Mauritius Commercial Bank"},
+    {"key": "today",                    "label": "Generation date",           "example": "17 July 2026"},
+]
+
+
+@router.get("/merge-fields")
+async def list_merge_fields(claims: dict = Depends(current_claims)):
+    """Canonical merge fields available to template authors, for the designer UI."""
+    return MERGE_FIELDS
+
+
 def _resolve_entity_snapshot(conn: Session, entity_type: str, entity_id: UUID, institution_id: str) -> dict:
     """Pull the merge-field data snapshot for the given deal/entity.
 
-    loan_pipeline is the primary case: borrower, facility terms, schedule.
-    Extend this map as new entity_type values are supported.
+    loan_pipeline is the primary case. Joins the deal, the originating
+    request, and the post-acceptance identity reveal (bid_acceptance) so
+    agreements can carry the borrower's real name/address. Returns a FLAT
+    dict matching MERGE_FIELDS — template-friendly, stable keys.
     """
     if entity_type == "loan_pipeline":
         row = _one(conn.execute(
             text("""
-                SELECT lp.*, r.borrower_display_name, r.requested_amount, r.currency
+                SELECT lp.deal_amount, lp.deal_rate, lp.deal_term_months,
+                       r.consumer_ref, r.currency, r.amount AS request_amount,
+                       r.term_months AS request_term_months,
+                       cp.label AS product_label,
+                       ba.full_name, ba.email, ba.phone, ba.address,
+                       ba.date_of_birth, ba.document_number,
+                       ii.name AS institution_name
                 FROM marketplace.loan_pipeline lp
                 JOIN marketplace.request r ON r.id = lp.request_id
+                LEFT JOIN catalog.product cp ON cp.id = r.product_id
+                LEFT JOIN marketplace.bid_acceptance ba
+                       ON ba.request_id = lp.request_id
+                      AND ba.institution_id = lp.institution_id
+                LEFT JOIN institution.institution ii ON ii.id = lp.institution_id
                 WHERE lp.id = :id AND lp.institution_id = :iid
             """),
             {"id": str(entity_id), "iid": institution_id},
         ))
         if not row:
             raise HTTPException(status_code=404, detail="loan_pipeline entity not found.")
-        return row
+
+        currency = row.get("currency") or "MUR"
+        amount = row.get("deal_amount") or row.get("request_amount") or 0
+        return {
+            "borrower_full_name":       row.get("full_name") or "",
+            "borrower_email":           row.get("email") or "",
+            "borrower_phone":           row.get("phone") or "",
+            "borrower_address":         row.get("address") or "",
+            "borrower_date_of_birth":   str(row.get("date_of_birth") or ""),
+            "borrower_document_number": row.get("document_number") or "",
+            "consumer_ref":             row.get("consumer_ref") or "",
+            "deal_amount":              amount,
+            "deal_amount_formatted":    f"{currency} {float(amount):,.0f}" if amount else "",
+            "deal_rate":                row.get("deal_rate") or "",
+            "deal_term_months":         row.get("deal_term_months") or row.get("request_term_months") or "",
+            "currency":                 currency,
+            "product_label":            row.get("product_label") or "",
+            "institution_name":         row.get("institution_name") or "",
+            "today":                    date.today().strftime("%d %B %Y"),
+        }
     raise HTTPException(status_code=400, detail=f"Unsupported entity_type: {entity_type}")
 
 
