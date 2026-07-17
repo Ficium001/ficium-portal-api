@@ -461,7 +461,7 @@ _INGEST_SQL = """
     )
 """
 
-@router.post("/sync-requests")
+@router.post("/sync-requests", response_model=None)
 async def sync_requests(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
     limit: int = Query(default=200, le=1000),
@@ -561,7 +561,7 @@ async def sync_requests(
 # (GH Action, uptime checker, etc.) can alert without needing DB creds. The
 # pg_cron sweep calling sync-requests can return 200 at the transport level
 # while doing nothing useful at the row level — this checks the row level.
-@router.get("/sync-health")
+@router.get("/sync-health", response_model=None)
 async def sync_health(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
 ) -> dict | JSONResponse:
