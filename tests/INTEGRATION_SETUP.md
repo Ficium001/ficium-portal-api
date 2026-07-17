@@ -62,6 +62,7 @@ The workflow runs automatically on:
 | `test_maker_cannot_approve_own_action` | Four-eyes control regression |
 | `test_product_resolver_covers_all_app_types` | Catalog sync failing silently for unknown product types |
 | `test_ingest_is_idempotent` | Duplicate marketplace requests from retried syncs |
+| `test_sync_requests_actually_ingests_via_real_endpoint` | The real `sync-requests` endpoint silently failing every row (invalid SQL, cascading transaction abort) while still returning HTTP 200 — the Jun 28 - Jul 17 outage |
 | `test_client_sees_only_own_rows` | Cross-client PII leakage |
 | `test_kyc_settings_locked_to_admin` | The KYC config world-read/write vulnerability (was live before fix) |
 | `test_kyc_settings_visible_to_admin` | Admin being locked out of their own config |

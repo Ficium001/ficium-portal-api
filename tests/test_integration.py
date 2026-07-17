@@ -36,6 +36,9 @@ import json
 import os
 import uuid
 from contextlib import contextmanager
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import psycopg2
 import pytest
@@ -688,6 +691,88 @@ class TestMarketplaceSync:
             final_amount = scalar(cur,
                 "SELECT amount FROM marketplace.request WHERE id = %s", (app_req,))
             assert int(final_amount) == 200000
+
+    def _fixture_enriched_row(self, req_id: str, consumer_id: str) -> SimpleNamespace:
+        """
+        Shaped like a row from _ENRICH_SQL — every attribute _build_phase1 and
+        _parse_purpose touch, defaulted to None/neutral so the function runs
+        without KeyErrors regardless of which fields it reads.
+        """
+        return SimpleNamespace(
+            id=req_id, client_id=consumer_id, product_type="personal_loan",
+            amount=250000, preferred_term_months=36, max_rate=None,
+            decision_deadline=None, status="open",
+            created_at=datetime.now(UTC), purpose=None,
+            monthly_income=None, snap_income=None, snap_net_worth=None,
+            total_net_worth=None, monthly_loan_payments=None,
+            mortgage_balance=None, personal_loan_balance=None,
+            credit_card_balance=None, vehicle_loan_balance=None,
+            emp_employer_name=None, dossier_employer=None, kyc_status=None,
+            employment_status=None, employment_type=None,
+            years_of_employment=None, has_existing_loans=None,
+            loan_breakdown=None, health_score=None, risk_score=None,
+            affordability_score=None, client_age=None,
+        )
+
+    async def test_sync_requests_actually_ingests_via_real_endpoint(self):
+        """
+        Regression test for the Jun 28 - Jul 17 outage: `sync-requests` used
+        `SELECT ... RETURNING is_new`, invalid SQL that aborted the Portal DB
+        transaction on the very first row and cascaded that failure to every
+        other row in the batch — while the endpoint kept returning HTTP 200,
+        because Postgres silently downgrades COMMIT-during-abort to a
+        rollback rather than raising.
+
+        This calls the REAL `sync_requests` endpoint function (not a
+        reimplementation of its logic) against the real Portal DB, with only
+        the App DB read faked via a fixture row. Any future change that
+        reintroduces invalid SQL in the ingest path, or removes the per-row
+        SAVEPOINT isolation, fails this test immediately — instead of
+        silently failing in production for three weeks.
+        """
+        os.environ.setdefault("DATABASE_URL", PORTAL_DSN)
+        os.environ.setdefault("APP_SERVICE_SECRET", "integration-test-secret")
+        from app.api import marketplace as mp
+        from app.core import db as dbcore
+
+        # Bind the app's real DB session machinery to the real Portal DB,
+        # regardless of what any other test module's env/import order set.
+        mp.settings.database_url = PORTAL_DSN
+        mp.settings.app_service_secret = "integration-test-secret"
+        dbcore.close_pool()
+        dbcore.init_pool()
+
+        req_id, consumer_id = str(uuid.uuid4()), str(uuid.uuid4())
+        fixture_row = self._fixture_enriched_row(req_id, consumer_id)
+
+        @contextmanager
+        def fake_app_service_session():
+            yield SimpleNamespace(
+                execute=lambda *a, **k: SimpleNamespace(fetchall=lambda: [fixture_row])
+            )
+
+        try:
+            with patch.object(mp, "app_service_session", fake_app_service_session):
+                response = await mp.sync_requests(
+                    x_service_secret="integration-test-secret"
+                )
+            body = json.loads(response.body) if hasattr(response, "body") else response
+
+            assert body["failed"] == 0, f"sync-requests reported failures: {body['errors']}"
+            assert body["synced"] == 1
+
+            with psycopg2.connect(PORTAL_DSN) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM marketplace.request WHERE id = %s", (req_id,)
+                )
+                row = cur.fetchone()
+            assert row is not None, "ingested row is not actually in marketplace.request"
+            assert row[0] == "bidding"
+        finally:
+            with psycopg2.connect(PORTAL_DSN) as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM marketplace.request WHERE id = %s", (req_id,))
+                conn.commit()
+            dbcore.close_pool()
 
 
 # ===========================================================================
