@@ -1,0 +1,23 @@
+name: Marketplace sync health check
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:            # manual trigger for testing
+
+jobs:
+  check-sync-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check marketplace sync health
+        run: |
+          RESPONSE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            -X GET "https://ficium-portal-api-production.up.railway.app/marketplace/sync-health" \
+            -H "X-Service-Secret: ${{ secrets.APP_SERVICE_SECRET }}" \
+            -H "Content-Type: application/json")
+          cat /tmp/resp.json
+          if [ "$RESPONSE" != "200" ]; then
+            echo "::error::marketplace sync is unhealthy (HTTP $RESPONSE) — see body above. This is the check that would have caught the Jun 28 - Jul 17 silent sync failure within 15 minutes instead of 3 weeks."
+            exit 1
+          fi
