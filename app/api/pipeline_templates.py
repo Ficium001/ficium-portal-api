@@ -22,9 +22,16 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
-from ..deps import current_claims, tenant_conn
+from ..deps import current_claims, require_module, tenant_conn
 
-router = APIRouter(prefix="/pipelines/templates", tags=["pipeline-templates"])
+# Every route below requires the institution to be licensed for the
+# "pipeline" module (institution.institution.modules) — a pricing/
+# entitlement gate, separate from per-user group RBAC.
+router = APIRouter(
+    prefix="/pipelines/templates",
+    tags=["pipeline-templates"],
+    dependencies=[Depends(require_module("pipeline"))],
+)
 
 def _rows(result) -> list[dict]: return [dict(r._mapping) for r in result.fetchall()]
 def _one(result)  -> dict | None:
