@@ -28,6 +28,7 @@ from .api.members import router as members_router
 from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
+from .api.doc_templates.router import router as doc_templates_router
 from .api.public import router as public_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
@@ -92,6 +93,7 @@ app.include_router(benefits_router)
 app.include_router(documents_router)
 app.include_router(esign_router)        # e-signature envelopes + public ceremony
 app.include_router(pipeline_templates_router)
+app.include_router(doc_templates_router)  # document template designer (inst:doctemplates)
 app.include_router(pipeline_router)
 app.include_router(notifications_router)
 app.include_router(public_router)       # server-to-server, no JWT
