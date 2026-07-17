@@ -479,7 +479,7 @@ async def sync_requests(
             try:
                 parsed = _parse_purpose(r.purpose)
                 phase1 = _build_phase1(r, parsed)
-                result = conn.execute(text(_INGEST_SQL + " RETURNING is_new"), {
+                params = {
                     "id":           r.id,
                     "consumer_id":  r.client_id,
                     "product_type": r.product_type,
@@ -490,10 +490,23 @@ async def sync_requests(
                     "status":       r.status,
                     "created_at":   r.created_at,
                     "phase1":       json.dumps(phase1),
-                }).fetchone()
+                }
+                # SAVEPOINT per row: ingest_app_request returns a plain uuid
+                # (not a row with an `is_new` column, so RETURNING doesn't
+                # apply here — it isn't DML). Isolating each row behind its
+                # own nested transaction means a single bad/unexpected row
+                # gets rolled back to the savepoint and recorded as failed,
+                # instead of aborting the whole outer transaction and
+                # silently failing every other row in the batch too.
+                with conn.begin_nested():
+                    existed = conn.execute(
+                        text("SELECT 1 FROM marketplace.request WHERE id = :id"),
+                        {"id": r.id},
+                    ).fetchone() is not None
+                    conn.execute(text(_INGEST_SQL), params)
                 synced += 1
                 # Only fire webhook for genuinely new requests (not re-syncs)
-                if result and getattr(result, "is_new", False):
+                if not existed:
                     new_requests.append({
                         "request_id": r.id,
                         "product_type": r.product_type,
@@ -501,26 +514,9 @@ async def sync_requests(
                         "term_months": r.preferred_term_months,
                     })
             except Exception as e:
-                # RETURNING is_new may fail if ingest function doesn't expose it —
-                # fall back gracefully without breaking the sync
-                if "is_new" in str(e):
-                    try:
-                        conn.execute(text(_INGEST_SQL), {
-                            "id": r.id, "consumer_id": r.client_id,
-                            "product_type": r.product_type, "amount": r.amount,
-                            "term": r.preferred_term_months, "max_rate": r.max_rate,
-                            "deadline": r.decision_deadline, "status": r.status,
-                            "created_at": r.created_at, "phase1": json.dumps(phase1),
-                        })
-                        synced += 1
-                    except Exception as e2:
-                        failed += 1
-                        if len(errors) < 10:
-                            errors.append(f"{r.id}: {e2}")
-                else:
-                    failed += 1
-                    if len(errors) < 10:
-                        errors.append(f"{r.id}: {e}")
+                failed += 1
+                if len(errors) < 10:
+                    errors.append(f"{r.id}: {e}")
 
     # Dispatch request.new webhook to all institutions with matching product config
     # Fire-and-forget per new request — don't block the sync response
