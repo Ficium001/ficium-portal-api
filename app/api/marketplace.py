@@ -6,6 +6,8 @@ import json
 from datetime import UTC
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -463,7 +465,7 @@ _INGEST_SQL = """
 async def sync_requests(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
     limit: int = Query(default=200, le=1000),
-) -> dict:
+) -> dict | JSONResponse:
     _verify_service_secret(x_service_secret)
     try:
         with app_service_session() as app_conn:
@@ -542,4 +544,43 @@ async def sync_requests(
                     {**req, "source": "marketplace_sync"},
                 ))
 
-    return {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
+    result = {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
+    # A 200 here previously meant "the HTTP call succeeded," not "the sync
+    # succeeded" — which is exactly how a fully-broken ingest (failed == pulled,
+    # every single run) went unnoticed for three weeks behind a cron job that
+    # only checks the status code. Surface partial/total failure as a real
+    # error status so monitoring (and the close-bid-windows-style GH Action)
+    # actually sees it.
+    if failed > 0:
+        status_code = 500 if synced == 0 and len(app_rows) > 0 else 207
+        return JSONResponse(status_code=status_code, content=jsonable_encoder(result))
+    return result
+
+# ── GET /marketplace/sync-health ──────────────────────────────────────────────
+# Surfaces marketplace_sync.health() (App DB) over HTTP so external monitoring
+# (GH Action, uptime checker, etc.) can alert without needing DB creds. The
+# pg_cron sweep calling sync-requests can return 200 at the transport level
+# while doing nothing useful at the row level — this checks the row level.
+@router.get("/sync-health")
+async def sync_health(
+    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
+) -> dict | JSONResponse:
+    _verify_service_secret(x_service_secret)
+    try:
+        with app_service_session() as app_conn:
+            row = app_conn.execute(text("SELECT * FROM marketplace_sync.health()")).fetchone()
+    except AppDatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if row is None:
+        return JSONResponse(status_code=500, content={"detail": "marketplace_sync.health() returned no row"})
+
+    health = jsonable_encoder(_row(row))
+    unhealthy = (
+        not health.get("vault_configured")
+        or (health.get("failed_last_hour") or 0) > 0
+        or health.get("last_status") not in (200, None)
+    )
+    if unhealthy:
+        return JSONResponse(status_code=503, content=health)
+    return health
