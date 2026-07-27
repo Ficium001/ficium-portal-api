@@ -32,13 +32,23 @@ async def list_requests(
                p.label   AS product_label,
                pf.label  AS product_family_label,
                r.country, r.currency, r.amount, r.term_months,
-               r.params, r.metadata, r.status,
+               r.params, r.metadata, r.status, r.allocation_mode,
                r.bid_window_opens_at, r.bid_window_closes_at,
                r.source, r.created_at,
                r.ficium_risk_tier, r.ficium_score,
                (SELECT COUNT(*) FROM marketplace.bid b
                 WHERE b.request_id = r.id
-                  AND b.status NOT IN ('withdrawn','rejected')) AS bid_count
+                  AND b.status NOT IN ('withdrawn','rejected')) AS bid_count,
+               (
+                 SELECT json_agg(json_build_object(
+                   'product_type',   cp.code,
+                   'product_label',  cp.label,
+                   'amount',         ra.amount
+                 ) ORDER BY ra.sort_order)
+                 FROM marketplace.request_allocation ra
+                 JOIN catalog.product cp ON cp.id = ra.product_id
+                 WHERE ra.request_id = r.id
+               ) AS allocations
         FROM marketplace.request r
         JOIN catalog.product        p  ON p.id  = r.product_id
         JOIN catalog.product_family pf ON pf.id = p.family_id
@@ -395,6 +405,16 @@ _ENRICH_SQL = """
         r.decision_deadline,
         r.status::text              AS status,
         r.created_at,
+        r.allocation_mode,
+        (
+            SELECT json_agg(json_build_object(
+                'product_type', ra.product_type::text,
+                'amount',       ra.amount,
+                'sort_order',   ra.sort_order
+            ) ORDER BY ra.sort_order)
+            FROM public.request_allocations ra
+            WHERE ra.request_id = r.id
+        ) AS allocations,
         c.kyc_status,
         EXTRACT(YEAR FROM AGE(c.date_of_birth))::int AS client_age,
         cd.employment_status,
@@ -440,7 +460,8 @@ _INGEST_SQL = """
     SELECT marketplace.ingest_app_request(
         :id, :consumer_id, :product_type, :amount, :term,
         :max_rate, :deadline, :status, :created_at,
-        CAST(:phase1 AS jsonb)
+        CAST(:phase1 AS jsonb),
+        :allocation_mode, CAST(:allocations AS jsonb)
     )
 """
 
@@ -475,6 +496,8 @@ async def sync_requests(
                     "status":       r.status,
                     "created_at":   r.created_at,
                     "phase1":       json.dumps(phase1),
+                    "allocation_mode": r.allocation_mode,
+                    "allocations":     json.dumps(r.allocations) if r.allocations is not None else None,
                 }
                 # SAVEPOINT per row: ingest_app_request returns a plain uuid
                 # (not a row with an `is_new` column, so RETURNING doesn't
