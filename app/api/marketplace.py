@@ -29,6 +29,7 @@ async def list_requests(
 ) -> list[dict]:
     sql = """
         SELECT r.id, r.consumer_ref, r.product_id,
+               p.code    AS product_code,
                p.label   AS product_label,
                pf.label  AS product_family_label,
                r.country, r.currency, r.amount, r.term_months,
