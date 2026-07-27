@@ -17,8 +17,10 @@ from .api.api_keys import router as api_keys_router
 from .api.approval_engine import router as approval_engine_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
+from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
 from .api.catalog import router as catalog_router
+from .api.doc_templates.router import router as doc_templates_router
 from .api.documents import router as documents_router
 from .api.entitlements import router as entitlements_router
 from .api.esign import router as esign_router
@@ -29,7 +31,6 @@ from .api.members import router as members_router
 from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
-from .api.doc_templates.router import router as doc_templates_router
 from .api.public import router as public_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
@@ -98,6 +99,7 @@ app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
 app.include_router(entitlements_router)  # module packaging (plat:billing)
+app.include_router(autobid_router)  # auto-bid rules engine (inst:autobid)
 app.include_router(catalog_router)
 app.include_router(benefits_router)
 app.include_router(documents_router)
