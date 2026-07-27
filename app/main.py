@@ -20,6 +20,7 @@ from .api.auth_provision import router as auth_provision_router
 from .api.benefits import router as benefits_router
 from .api.catalog import router as catalog_router
 from .api.documents import router as documents_router
+from .api.entitlements import router as entitlements_router
 from .api.esign import router as esign_router
 from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
@@ -88,6 +89,7 @@ app.include_router(approval_engine_router)  # configurable chains (inst:approval
 app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
+app.include_router(entitlements_router)  # module packaging (plat:billing)
 app.include_router(catalog_router)
 app.include_router(benefits_router)
 app.include_router(documents_router)
