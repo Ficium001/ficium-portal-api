@@ -17,13 +17,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from ...core.bidding import BidInput, BidPlacementError, place_bid
 from ...core.db import service_session as _svc
 from ...core.ratelimit import limiter
 from ...core.webhooks import dispatch_event
@@ -182,7 +182,7 @@ def list_bids(
 class BidSubmitRequest(BaseModel):
     request_id: str
     rate: float = Field(..., gt=0, lt=100)
-    rate_type: str = Field(..., pattern="^(fixed|variable|base_plus)$")
+    rate_type: str = Field(..., pattern="^(fixed|variable)$")
     amount_offered: float = Field(..., gt=0)
     term_months: int = Field(..., gt=0)
     rate_valid_days: int = Field(default=30, ge=1, le=365)
@@ -199,100 +199,51 @@ def submit_bid(
 ) -> dict:
     """
     Submit a bid on a marketplace request from an institution system.
-    Validates the request is open, bid window is active, and no duplicate bid exists.
+    Validates the request is open, bid window is active, no duplicate bid
+    exists, and the institution is configured to bid on this product —
+    all via app.core.bidding.place_bid, the single canonical bid-placement
+    path shared with the portal UI and the auto-bid worker.
     """
     iid = _institution_id_from_claims(claims)
 
+    bid = BidInput(
+        request_id=body.request_id,
+        institution_id=iid,
+        rate=body.rate,
+        rate_type=body.rate_type,
+        amount_offered=body.amount_offered,
+        term_months=body.term_months,
+        rate_valid_days=body.rate_valid_days,
+        conditions=body.conditions,
+        fee_structure=body.fee_structure,
+        submitted_via="api",
+    )
+
     with _svc() as conn:
-        # Validate request is open and biddable
-        req = conn.execute(
-            text("""
-                SELECT id, status, bid_window_closes_at, product_type
-                FROM marketplace.request
-                WHERE id = CAST(:rid AS uuid)
-            """),
-            {"rid": body.request_id},
-        ).fetchone()
-
-        if req is None:
-            raise HTTPException(status_code=404, detail="Request not found.")
-        if req.status != "open":
-            raise HTTPException(status_code=409, detail=f"Request is {req.status}, not open.")
-        
-        from datetime import datetime
-        if req.bid_window_closes_at and req.bid_window_closes_at < datetime.now(UTC):
-            raise HTTPException(status_code=409, detail="Bid window has closed.")
-
-        # Check for duplicate active bid
-        dup = conn.execute(
-            text("""
-                SELECT id FROM marketplace.bid
-                WHERE request_id     = CAST(:rid AS uuid)
-                  AND institution_id = CAST(:iid AS uuid)
-                  AND status NOT IN ('withdrawn', 'rejected')
-            """),
-            {"rid": body.request_id, "iid": iid},
-        ).fetchone()
-        if dup is not None:
-            raise HTTPException(status_code=409, detail="A bid already exists for this request.")
-
-        # Check compliance gate — institution must have active product_config
-        config = conn.execute(
-            text("""
-                SELECT id FROM institution.product_config
-                WHERE institution_id = CAST(:iid AS uuid)
-                  AND product_type   = :pt
-                  AND is_active      = true
-            """),
-            {"iid": iid, "pt": req.product_type},
-        ).fetchone()
-        if config is None:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Institution not configured to bid on {req.product_type} products.",
-            )
-
-        import json as _json
-        row = conn.execute(
-            text("""
-                INSERT INTO marketplace.bid
-                    (request_id, institution_id, rate, rate_type,
-                     amount_offered, term_months, rate_valid_days,
-                     conditions, fee_structure, status)
-                VALUES
-                    (CAST(:rid AS uuid), CAST(:iid AS uuid), :rate, :rate_type,
-                     :amount, :term, :valid_days,
-                     :conditions, CAST(:fee AS jsonb), 'submitted')
-                RETURNING id, request_id, status, submitted_at, expires_at
-            """),
-            {
-                "rid": body.request_id,
-                "iid": iid,
-                "rate": body.rate,
-                "rate_type": body.rate_type,
-                "amount": body.amount_offered,
-                "term": body.term_months,
-                "valid_days": body.rate_valid_days,
-                "conditions": body.conditions,
-                "fee": _json.dumps(body.fee_structure) if body.fee_structure else "null",
-            },
-        ).fetchone()
+        try:
+            result = place_bid(conn, bid)
+        except BidPlacementError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
         conn.commit()
-        if row is None:
-            raise HTTPException(status_code=500, detail="Bid insert returned no row.")
-        result = dict(row._mapping)
+
+    response = {
+        "id": result.id,
+        "request_id": body.request_id,
+        "status": result.status,
+        "submitted_at": result.submitted_at,
+    }
 
     # Fire webhook to the institution (confirmation their system bid was received)
     asyncio.create_task(
         dispatch_event(iid, "bid.accepted", {
-            "bid_id": str(result["id"]),
+            "bid_id": result.id,
             "request_id": body.request_id,
-            "status": "submitted",
+            "status": result.status,
             "source": "api",
         })
     )
 
-    return result
+    return response
 
 
 # ---------------------------------------------------------------------------
