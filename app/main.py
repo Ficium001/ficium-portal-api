@@ -17,9 +17,12 @@ from .api.api_keys import router as api_keys_router
 from .api.approval_engine import router as approval_engine_router
 from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
+from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
 from .api.catalog import router as catalog_router
+from .api.doc_templates.router import router as doc_templates_router
 from .api.documents import router as documents_router
+from .api.entitlements import router as entitlements_router
 from .api.esign import router as esign_router
 from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
@@ -28,15 +31,20 @@ from .api.members import router as members_router
 from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
-from .api.doc_templates.router import router as doc_templates_router
 from .api.public import router as public_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
 from .core.config import settings
 from .core.db import close_pool, init_pool
+from .core.observability import (
+    RequestObservabilityMiddleware,
+    configure_logging,
+    metrics_endpoint,
+)
 from .core.ratelimit import limiter
 from .core.response_headers import DefaultResponseHeadersMiddleware
 
+configure_logging(env=settings.env, level=settings.log_level)
 log = structlog.get_logger()
 
 
@@ -64,6 +72,7 @@ app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(DefaultResponseHeadersMiddleware)
 
 _origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+app.add_middleware(RequestObservabilityMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -79,6 +88,7 @@ async def health() -> dict:
     return {"status": "ok", "service": "ficium-portal-api", "version": settings.version}
 
 
+app.add_route("/metrics", metrics_endpoint, methods=["GET"], include_in_schema=False)
 app.include_router(admin_router)
 app.include_router(admin_public_router)
 app.include_router(institutions_router)
@@ -88,6 +98,8 @@ app.include_router(approval_engine_router)  # configurable chains (inst:approval
 app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
+app.include_router(entitlements_router)  # module packaging (plat:billing)
+app.include_router(autobid_router)  # auto-bid rules engine (inst:autobid)
 app.include_router(catalog_router)
 app.include_router(benefits_router)
 app.include_router(documents_router)

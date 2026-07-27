@@ -236,8 +236,8 @@ async def create_delegation(
     try:
         vf = datetime.fromisoformat(str(valid_from).replace("Z", "+00:00"))
         vt = datetime.fromisoformat(str(valid_to).replace("Z", "+00:00"))
-    except ValueError:
-        raise HTTPException(status_code=422, detail="valid_from/valid_to must be valid ISO datetimes.")
+    except ValueError as err:
+        raise HTTPException(status_code=422, detail="valid_from/valid_to must be valid ISO datetimes.") from err
     if vt <= vf:
         raise HTTPException(status_code=422, detail="valid_to must be after valid_from.")
 
