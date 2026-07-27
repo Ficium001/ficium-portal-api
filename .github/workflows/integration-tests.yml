@@ -29,10 +29,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install pytest psycopg2-binary
+        run: pip install -r requirements-dev.txt
 
       - name: Run integration suite
         env:
           PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_SERVICE_SECRET: integration-test-secret
           APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
         run: pytest tests/test_integration.py -v --tb=short

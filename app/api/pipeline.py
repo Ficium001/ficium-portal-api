@@ -27,12 +27,19 @@ from sqlalchemy.orm import Session
 
 from ..core.config import settings
 from ..core.db import service_session
-from ..deps import current_claims, tenant_conn
+from ..deps import current_claims, require_module, tenant_conn
 from .notifications import _write_notification
 
 log = structlog.get_logger()
 
-router = APIRouter(prefix="/pipelines", tags=["pipeline"])
+# Every route below requires the institution to be licensed for the
+# "pipeline" module (institution.institution.modules) — a pricing/
+# entitlement gate, separate from per-user group RBAC.
+router = APIRouter(
+    prefix="/pipelines",
+    tags=["pipeline"],
+    dependencies=[Depends(require_module("pipeline"))],
+)
 
 
 def _notify_borrower_stage_advanced(

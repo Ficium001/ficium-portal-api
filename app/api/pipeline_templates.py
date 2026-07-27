@@ -22,9 +22,16 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
-from ..deps import current_claims, tenant_conn
+from ..deps import current_claims, require_module, tenant_conn
 
-router = APIRouter(prefix="/pipelines/templates", tags=["pipeline-templates"])
+# Every route below requires the institution to be licensed for the
+# "pipeline" module (institution.institution.modules) — a pricing/
+# entitlement gate, separate from per-user group RBAC.
+router = APIRouter(
+    prefix="/pipelines/templates",
+    tags=["pipeline-templates"],
+    dependencies=[Depends(require_module("pipeline"))],
+)
 
 def _rows(result) -> list[dict]: return [dict(r._mapping) for r in result.fetchall()]
 def _one(result)  -> dict | None:
@@ -234,6 +241,19 @@ async def update_template(
         """), {"tid": template_id, "iid": institution_id}))
         if not existing:
             raise HTTPException(status_code=404, detail="Template not found.")
+
+        # Guard: a template cannot be activated with zero stages — it would
+        # match a bid acceptance and produce a pipeline with nothing to run.
+        if body.get("is_active") is True:
+            stage_count = sconn.execute(text("""
+                SELECT COUNT(*) FROM institution.pipeline_stage_def
+                WHERE template_id = :tid AND is_active = true
+            """), {"tid": template_id}).scalar()
+            if not stage_count:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Cannot activate a template with no stages. Add at least one stage first.",
+                )
 
         # If promoting to default, demote the current default first
         if body.get("is_default") is True and not existing["is_default"]:

@@ -22,12 +22,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 _MODULE  = "inst:documents"
-_ADMINS  = ("admin", "super_admin")
+_ADMINS  = INSTITUTION_ADMIN_ROLES
 
 
 def _rows(result) -> list[dict]:

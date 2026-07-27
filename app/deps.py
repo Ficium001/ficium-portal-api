@@ -25,6 +25,7 @@ from collections.abc import Generator
 from typing import Any
 
 from fastapi import Depends, Header, HTTPException, Request
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .core.api_keys import ApiKeyError, verify_api_key
@@ -128,6 +129,34 @@ async def api_or_jwt_claims(
         return claims
     except TokenError as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
+
+
+def require_module(module_key: str):
+    """
+    Dependency factory — 403s unless the caller's institution is entitled
+    to `module_key` in institution.institution.modules (pricing/licensing
+    gate, distinct from the per-user group module_permissions RBAC check).
+
+    Usage:
+        @router.get("", dependencies=[Depends(require_module("pipeline"))])
+    """
+    def _check(claims: dict[str, Any] = Depends(current_claims)) -> dict[str, Any]:
+        institution_id = claims.get("institution_id")
+        if not institution_id:
+            raise HTTPException(status_code=403, detail="Not associated with an institution.")
+        with service_session() as conn:
+            row = conn.execute(
+                text("SELECT modules FROM institution.institution WHERE id = :iid"),
+                {"iid": institution_id},
+            ).fetchone()
+        modules = list(row.modules) if row and row.modules else []
+        if module_key not in modules:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Your institution is not licensed for the '{module_key}' module.",
+            )
+        return claims
+    return _check
 
 
 def require_scope(scope: str):

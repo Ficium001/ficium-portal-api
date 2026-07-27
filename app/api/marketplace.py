@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
-from datetime import UTC
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..core.bidding import BidInput, BidPlacementError, place_bid
 from ..core.config import settings
 from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..core.webhooks import dispatch_event
 from ..deps import current_claims, tenant_conn
 
@@ -66,7 +69,7 @@ async def list_my_bids(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> list[dict]:
-    if claims.get("user_role") in ("admin", "super_admin"):
+    if claims.get("user_role") in INSTITUTION_ADMIN_ROLES:
         return []
     sql = "SELECT * FROM marketplace.my_bids"
     params: dict = {}
@@ -92,49 +95,32 @@ async def submit_bid(
     if not inst_id:
         raise HTTPException(status_code=403, detail="No institution context.")
 
-    # Window guard — check before hitting the DB trigger
-    req_row = conn.execute(
-        text("SELECT status, bid_window_closes_at FROM marketplace.request WHERE id = :rid"),
-        {"rid": body["request_id"]},
-    ).fetchone()
-    if req_row is None:
-        raise HTTPException(status_code=404, detail="Request not found.")
-    if req_row.status != "bidding":
-        raise HTTPException(status_code=409, detail=f"Request is not open for bidding (status: {req_row.status}).")
-    from datetime import datetime
-    if req_row.bid_window_closes_at and req_row.bid_window_closes_at < datetime.now(UTC):
-        raise HTTPException(status_code=409, detail="Bid window has closed for this request.")
-
+    bid = BidInput(
+        request_id=body["request_id"],
+        institution_id=str(inst_id),
+        rate=body["rate"],
+        rate_type=body.get("rate_type", "fixed"),
+        amount_offered=body["amount_offered"],
+        term_months=body["term_months"],
+        rate_valid_days=body.get("rate_valid_days"),
+        conditions=body.get("conditions", {}),
+        fee_structure=body.get("fee_structure", {}),
+        idempotency_key=body.get("idempotency_key"),
+        submitted_via="portal",
+    )
     try:
-        result = conn.execute(text("""
-            INSERT INTO marketplace.bid
-                (request_id, institution_id, rate, rate_type, rate_valid_days,
-                 amount_offered, term_months, conditions, fee_structure,
-                 submitted_via, idempotency_key)
-            VALUES
-                (:request_id, :institution_id, :rate, :rate_type, :rate_valid_days,
-                 :amount_offered, :term_months, CAST(:conditions AS jsonb),
-                 CAST(:fee_structure AS jsonb), 'portal', :idempotency_key)
-            ON CONFLICT (institution_id, request_id, idempotency_key) DO NOTHING
-            RETURNING id, status, submitted_at
-        """), {
-            "request_id":      body["request_id"],
-            "institution_id":  inst_id,
-            "rate":            body["rate"],
-            "rate_type":       body.get("rate_type", "fixed"),
-            "rate_valid_days": body.get("rate_valid_days"),
-            "amount_offered":  body["amount_offered"],
-            "term_months":     body["term_months"],
-            "conditions":      json.dumps(body.get("conditions", {})),
-            "fee_structure":   json.dumps(body.get("fee_structure", {})),
-            "idempotency_key": body.get("idempotency_key"),
-        }).fetchone()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        result = place_bid(conn, bid)
+    except BidPlacementError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    conn.commit()
 
-    if result is None:
+    if result.duplicate:
         return {"status": "duplicate", "message": "Bid already submitted."}
-    return {"id": str(result.id), "status": result.status, "submitted_at": result.submitted_at.isoformat()}
+    return {
+        "id": result.id,
+        "status": result.status,
+        "submitted_at": result.submitted_at.isoformat() if result.submitted_at else None,
+    }
 
 # ── GET /marketplace/bids/{bid_id} ───────────────────────────────────────────
 @router.get("/bids/{bid_id}")
@@ -458,11 +444,11 @@ _INGEST_SQL = """
     )
 """
 
-@router.post("/sync-requests")
+@router.post("/sync-requests", response_model=None)
 async def sync_requests(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
     limit: int = Query(default=200, le=1000),
-) -> dict:
+) -> dict | JSONResponse:
     _verify_service_secret(x_service_secret)
     try:
         with app_service_session() as app_conn:
@@ -478,7 +464,7 @@ async def sync_requests(
             try:
                 parsed = _parse_purpose(r.purpose)
                 phase1 = _build_phase1(r, parsed)
-                result = conn.execute(text(_INGEST_SQL + " RETURNING is_new"), {
+                params = {
                     "id":           r.id,
                     "consumer_id":  r.client_id,
                     "product_type": r.product_type,
@@ -489,10 +475,23 @@ async def sync_requests(
                     "status":       r.status,
                     "created_at":   r.created_at,
                     "phase1":       json.dumps(phase1),
-                }).fetchone()
+                }
+                # SAVEPOINT per row: ingest_app_request returns a plain uuid
+                # (not a row with an `is_new` column, so RETURNING doesn't
+                # apply here — it isn't DML). Isolating each row behind its
+                # own nested transaction means a single bad/unexpected row
+                # gets rolled back to the savepoint and recorded as failed,
+                # instead of aborting the whole outer transaction and
+                # silently failing every other row in the batch too.
+                with conn.begin_nested():
+                    existed = conn.execute(
+                        text("SELECT 1 FROM marketplace.request WHERE id = :id"),
+                        {"id": r.id},
+                    ).fetchone() is not None
+                    conn.execute(text(_INGEST_SQL), params)
                 synced += 1
                 # Only fire webhook for genuinely new requests (not re-syncs)
-                if result and getattr(result, "is_new", False):
+                if not existed:
                     new_requests.append({
                         "request_id": r.id,
                         "product_type": r.product_type,
@@ -500,26 +499,9 @@ async def sync_requests(
                         "term_months": r.preferred_term_months,
                     })
             except Exception as e:
-                # RETURNING is_new may fail if ingest function doesn't expose it —
-                # fall back gracefully without breaking the sync
-                if "is_new" in str(e):
-                    try:
-                        conn.execute(text(_INGEST_SQL), {
-                            "id": r.id, "consumer_id": r.client_id,
-                            "product_type": r.product_type, "amount": r.amount,
-                            "term": r.preferred_term_months, "max_rate": r.max_rate,
-                            "deadline": r.decision_deadline, "status": r.status,
-                            "created_at": r.created_at, "phase1": json.dumps(phase1),
-                        })
-                        synced += 1
-                    except Exception as e2:
-                        failed += 1
-                        if len(errors) < 10:
-                            errors.append(f"{r.id}: {e2}")
-                else:
-                    failed += 1
-                    if len(errors) < 10:
-                        errors.append(f"{r.id}: {e}")
+                failed += 1
+                if len(errors) < 10:
+                    errors.append(f"{r.id}: {e}")
 
     # Dispatch request.new webhook to all institutions with matching product config
     # Fire-and-forget per new request — don't block the sync response
@@ -545,4 +527,43 @@ async def sync_requests(
                     {**req, "source": "marketplace_sync"},
                 ))
 
-    return {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
+    result = {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
+    # A 200 here previously meant "the HTTP call succeeded," not "the sync
+    # succeeded" — which is exactly how a fully-broken ingest (failed == pulled,
+    # every single run) went unnoticed for three weeks behind a cron job that
+    # only checks the status code. Surface partial/total failure as a real
+    # error status so monitoring (and the close-bid-windows-style GH Action)
+    # actually sees it.
+    if failed > 0:
+        status_code = 500 if synced == 0 and len(app_rows) > 0 else 207
+        return JSONResponse(status_code=status_code, content=jsonable_encoder(result))
+    return result
+
+# ── GET /marketplace/sync-health ──────────────────────────────────────────────
+# Surfaces marketplace_sync.health() (App DB) over HTTP so external monitoring
+# (GH Action, uptime checker, etc.) can alert without needing DB creds. The
+# pg_cron sweep calling sync-requests can return 200 at the transport level
+# while doing nothing useful at the row level — this checks the row level.
+@router.get("/sync-health", response_model=None)
+async def sync_health(
+    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
+) -> dict | JSONResponse:
+    _verify_service_secret(x_service_secret)
+    try:
+        with app_service_session() as app_conn:
+            row = app_conn.execute(text("SELECT * FROM marketplace_sync.health()")).fetchone()
+    except AppDatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if row is None:
+        return JSONResponse(status_code=500, content={"detail": "marketplace_sync.health() returned no row"})
+
+    health = jsonable_encoder(_row(row))
+    unhealthy = (
+        not health.get("vault_configured")
+        or (health.get("failed_last_hour") or 0) > 0
+        or health.get("last_status") not in (200, None)
+    )
+    if unhealthy:
+        return JSONResponse(status_code=503, content=health)
+    return health

@@ -12,3 +12,5 @@ argon2-cffi==25.1.0
 slowapi==0.1.10
 reportlab==4.2.5
 pypdf==5.1.0
+docxtpl==0.19.1
+python-multipart==0.0.20

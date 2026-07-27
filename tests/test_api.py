@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import uuid
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -624,6 +625,102 @@ class TestRequestValidation:
             },
         )
         assert r.status_code == 422
+
+
+# ===========================================================================
+# Approval Engine — Delegations
+# ===========================================================================
+class TestDelegationEndpoints:
+    _FROM = str(uuid.uuid4())
+    _TO   = str(uuid.uuid4())
+
+    def _create_client(self, claims):
+        app.dependency_overrides[current_claims] = _claims_override(claims)
+        app.dependency_overrides[tenant_conn]    = _conn_override()
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_list_delegations_returns_200_list(self, auth_client):
+        r = auth_client.get("/approval-engine/delegations")
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+
+    def test_non_admin_cannot_create_delegation(self):
+        """institution_member (non-admin) is blocked from creating delegations."""
+        client = self._create_client(institution_claims(user_role="institution_member"))
+        try:
+            r = client.post("/approval-engine/delegations", json={
+                "from_member": self._FROM, "to_member": self._TO,
+                "reason": "Annual leave", "valid_from": "2026-07-01T00:00:00Z",
+                "valid_to": "2026-07-10T00:00:00Z",
+            })
+            assert r.status_code == 403
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_institution_admin_can_create_delegation(self):
+        """institution_admin (not just super_admin) must pass — this was the
+        exact class of bug fixed across the API: institution_admin missing
+        from every admin-bypass check."""
+        app.dependency_overrides[current_claims] = _claims_override(institution_claims())
+        app.dependency_overrides[tenant_conn]    = _conn_override(
+            fetchone=SimpleNamespace(id=uuid.uuid4())
+        )
+        try:
+            r = TestClient(app, raise_server_exceptions=False).post(
+                "/approval-engine/delegations", json={
+                    "from_member": self._FROM, "to_member": self._TO,
+                    "reason": "Annual leave", "valid_from": "2026-07-01T00:00:00Z",
+                    "valid_to": "2026-07-10T00:00:00Z",
+                })
+            assert r.status_code == 200
+            assert "id" in r.json()
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_self_delegation_rejected(self, auth_client):
+        r = auth_client.post("/approval-engine/delegations", json={
+            "from_member": self._FROM, "to_member": self._FROM,
+            "reason": "Annual leave", "valid_from": "2026-07-01T00:00:00Z",
+            "valid_to": "2026-07-10T00:00:00Z",
+        })
+        assert r.status_code == 422
+
+    def test_missing_reason_rejected(self, auth_client):
+        r = auth_client.post("/approval-engine/delegations", json={
+            "from_member": self._FROM, "to_member": self._TO,
+            "reason": "", "valid_from": "2026-07-01T00:00:00Z",
+            "valid_to": "2026-07-10T00:00:00Z",
+        })
+        assert r.status_code == 422
+
+    def test_valid_to_before_valid_from_rejected(self, auth_client):
+        r = auth_client.post("/approval-engine/delegations", json={
+            "from_member": self._FROM, "to_member": self._TO,
+            "reason": "Annual leave", "valid_from": "2026-07-10T00:00:00Z",
+            "valid_to": "2026-07-01T00:00:00Z",
+        })
+        assert r.status_code == 422
+
+    def test_malformed_datetime_rejected(self, auth_client):
+        r = auth_client.post("/approval-engine/delegations", json={
+            "from_member": self._FROM, "to_member": self._TO,
+            "reason": "Annual leave", "valid_from": "not-a-date",
+            "valid_to": "2026-07-10T00:00:00Z",
+        })
+        assert r.status_code == 422
+
+    def test_revoke_delegation_non_admin_forbidden(self):
+        client = self._create_client(institution_claims(user_role="institution_member"))
+        try:
+            r = client.delete(f"/approval-engine/delegations/{uuid.uuid4()}")
+            assert r.status_code == 403
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_revoke_delegation_admin_ok(self, auth_client):
+        r = auth_client.delete(f"/approval-engine/delegations/{uuid.uuid4()}")
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
 
 
 if __name__ == "__main__":
