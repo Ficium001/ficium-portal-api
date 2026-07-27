@@ -20,6 +20,7 @@ from .api.auth_provision import router as auth_provision_router
 from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
 from .api.catalog import router as catalog_router
+from .api.doc_templates.router import router as doc_templates_router
 from .api.documents import router as documents_router
 from .api.entitlements import router as entitlements_router
 from .api.esign import router as esign_router
@@ -30,7 +31,6 @@ from .api.members import router as members_router
 from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
-from .api.doc_templates.router import router as doc_templates_router
 from .api.public import router as public_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
