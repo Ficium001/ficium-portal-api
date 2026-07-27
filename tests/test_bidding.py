@@ -20,7 +20,12 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.bidding import BidInput, BidPlacementError, place_bid
 
-NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+# Anchored to the real clock, not a fixed date: place_bid() compares
+# bid_window_closes_at against datetime.now(UTC), so a hardcoded NOW makes
+# every "open window" fixture silently expire once wall-clock time passes it
+# (which is exactly what happened — these tests began failing on 2026-07-07).
+# Offsets below stay relative to this anchor, so they hold at any run date.
+NOW = datetime.now(UTC)
 
 
 class _FakeResult:
