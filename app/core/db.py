@@ -125,7 +125,7 @@ def _session_or_raise() -> sessionmaker:
 
 
 @contextmanager
-def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
+def tenant_session(claims: dict[str, Any]) -> Generator[Session]:
     """
     Yield a DB session scoped to ONE request's identity, with RLS ENFORCED.
 
@@ -178,7 +178,7 @@ def tenant_session(claims: dict[str, Any]) -> Generator[Session, None, None]:
 
 
 @contextmanager
-def service_session() -> Generator[Session, None, None]:
+def service_session() -> Generator[Session]:
     """Privileged session for admin operations outside tenant RLS scope."""
     SessionLocal = _session_or_raise()
     session = SessionLocal()
@@ -197,7 +197,7 @@ class AppDatabaseUnavailable(RuntimeError):
 
 
 @contextmanager
-def app_service_session() -> Generator[Session, None, None]:
+def app_service_session() -> Generator[Session]:
     """
     Read-only session against the Ficium App database (cross-project).
     Used by the marketplace, which reads public.requests and
