@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import tempfile
+from datetime import date
 from pathlib import Path
 from uuid import UUID
 
@@ -39,7 +40,6 @@ from .schemas import (
     TemplateCreate,
     TemplateOut,
     TemplateUpdate,
-    VersionCreate,
     VersionDecision,
     VersionOut,
 )
@@ -75,6 +75,35 @@ def _row(r) -> dict:
 def _one(result) -> dict | None:
     row = result.fetchone()
     return dict(row._mapping) if row else None
+
+
+def _one_required(result, *, what: str = "row") -> dict:
+    """
+    For INSERT/UPDATE ... RETURNING *, which always yield exactly one row when
+    they succeed. Makes that invariant explicit rather than leaving an
+    unchecked Optional to be indexed downstream.
+    """
+    row = _one(result)
+    if row is None:
+        raise HTTPException(status_code=500, detail=f"Expected a {what} to be returned, got none.")
+    return row
+
+
+def _safe_filename(name: str | None, *, default: str = "upload.docx") -> str:
+    """
+    Reduce a client-supplied filename to a bare, safe basename.
+
+    UploadFile.filename is attacker-controlled and Optional. Interpolating it
+    raw into a path is a traversal vector: Path(tmp) / "../../x" escapes the
+    temp directory, and Path(tmp) / "/etc/passwd" discards the base entirely.
+    The same value is also interpolated into the object storage key, where the
+    per-institution prefix is what keeps tenants separated -- so traversal
+    there crosses a tenant boundary, not just a directory.
+    """
+    candidate = Path((name or "").replace("\\", "/")).name.strip()
+    if not candidate or candidate in {".", ".."}:
+        return default
+    return candidate
 
 
 def _rows(result) -> list[dict]:
@@ -172,7 +201,7 @@ async def create_template(
     _require_admin(claims)
     institution_id = _institution_id(claims)
     with service_session() as conn:
-        row = _one(conn.execute(
+        row = _one_required(conn.execute(
             text("""
                 INSERT INTO institution.doc_template
                     (institution_id, product_id, product_code, code, name, description, doc_category, created_by)
@@ -217,7 +246,7 @@ async def update_template(
             return existing
 
         set_clause = ", ".join(f"{k} = :{k}" for k in fields) + ", updated_at = now()"
-        row = _one(conn.execute(
+        row = _one_required(conn.execute(
             text(f"UPDATE institution.doc_template SET {set_clause} WHERE id = :id RETURNING *"),
             {**fields, "id": str(template_id)},
         ))
@@ -235,7 +264,7 @@ async def retire_template(
     _require_admin(claims)
     institution_id = _institution_id(claims)
     with service_session() as conn:
-        row = _one(conn.execute(
+        row = _one_required(conn.execute(
             text("""
                 UPDATE institution.doc_template SET status = 'retired', updated_at = now()
                 WHERE id = :id AND institution_id = :iid
@@ -294,18 +323,19 @@ async def upload_version(
             raise HTTPException(status_code=404, detail="Template not found.")
 
         next_version = template["current_version"] + 1
+        safe_name = _safe_filename(file.filename)
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp) / file.filename
+            tmp_path = Path(tmp) / safe_name
             with open(tmp_path, "wb") as f:
                 shutil.copyfileobj(file.file, f)
 
             checksum = merge_engine.sha256_of(tmp_path)
             size_bytes = tmp_path.stat().st_size
-            storage_path = f"{_PREFIX}/{institution_id}/{template_id}/v{next_version}/{file.filename}"
+            storage_path = f"{_PREFIX}/{institution_id}/{template_id}/v{next_version}/{safe_name}"
             await _storage_upload(storage_path, tmp_path.read_bytes(), ALLOWED_DOCX_MIME)
 
-        row = _one(conn.execute(
+        row = _one_required(conn.execute(
             text("""
                 INSERT INTO institution.doc_template_version
                     (institution_id, template_id, version_no, file_name, storage_path,
@@ -316,7 +346,7 @@ async def upload_version(
             """),
             {
                 "iid": institution_id, "tid": str(template_id), "vno": next_version,
-                "fname": file.filename, "spath": storage_path, "size": size_bytes,
+                "fname": safe_name, "spath": storage_path, "size": size_bytes,
                 "checksum": checksum, "note": change_note, "creator": claims.get("sub"),
             },
         ))
@@ -354,7 +384,7 @@ async def decide_version(
             raise HTTPException(status_code=403, detail="Maker and checker must be different members.")
 
         if body.action == "approve":
-            row = _one(conn.execute(
+            row = _one_required(conn.execute(
                 text("""
                     UPDATE institution.doc_template_version
                     SET status = 'published', approved_by = :approver, approved_at = now()
@@ -372,7 +402,7 @@ async def decide_version(
             )
             event_type = "doc_template_version.approved"
         else:
-            row = _one(conn.execute(
+            row = _one_required(conn.execute(
                 text("""
                     UPDATE institution.doc_template_version
                     SET status = 'rejected', approved_by = :approver, approved_at = now(), rejection_note = :note
@@ -392,25 +422,84 @@ async def decide_version(
 # Generation
 # ---------------------------------------------------------------------------
 
+# Canonical merge fields exposed to template authors ({{ field }} in Word).
+# Kept flat and stable — extend, never rename.
+MERGE_FIELDS: list[dict] = [
+    {"key": "borrower_full_name",       "label": "Borrower full name",        "example": "Jane R. Doe"},
+    {"key": "borrower_email",           "label": "Borrower email",            "example": "jane@email.com"},
+    {"key": "borrower_phone",           "label": "Borrower phone",            "example": "+230 5xxx xxxx"},
+    {"key": "borrower_address",         "label": "Borrower address",          "example": "12 Royal Rd, Rose Hill"},
+    {"key": "borrower_date_of_birth",   "label": "Borrower date of birth",    "example": "1990-04-12"},
+    {"key": "borrower_document_number", "label": "Borrower ID / passport no.", "example": "A123456"},
+    {"key": "consumer_ref",             "label": "Ficium borrower reference", "example": "8f2a1c3d"},
+    {"key": "deal_amount",              "label": "Deal amount (number)",      "example": "1500000"},
+    {"key": "deal_amount_formatted",    "label": "Deal amount (formatted)",   "example": "MUR 1,500,000"},
+    {"key": "deal_rate",                "label": "Interest rate % p.a.",      "example": "8.75"},
+    {"key": "deal_term_months",         "label": "Term (months)",             "example": "60"},
+    {"key": "currency",                 "label": "Currency",                  "example": "MUR"},
+    {"key": "product_label",            "label": "Product",                   "example": "Home Loan"},
+    {"key": "institution_name",         "label": "Institution name",          "example": "Mauritius Commercial Bank"},
+    {"key": "today",                    "label": "Generation date",           "example": "17 July 2026"},
+]
+
+
+@router.get("/merge-fields")
+async def list_merge_fields(claims: dict = Depends(current_claims)):
+    """Canonical merge fields available to template authors, for the designer UI."""
+    return MERGE_FIELDS
+
+
 def _resolve_entity_snapshot(conn: Session, entity_type: str, entity_id: UUID, institution_id: str) -> dict:
     """Pull the merge-field data snapshot for the given deal/entity.
 
-    loan_pipeline is the primary case: borrower, facility terms, schedule.
-    Extend this map as new entity_type values are supported.
+    loan_pipeline is the primary case. Joins the deal, the originating
+    request, and the post-acceptance identity reveal (bid_acceptance) so
+    agreements can carry the borrower's real name/address. Returns a FLAT
+    dict matching MERGE_FIELDS — template-friendly, stable keys.
     """
     if entity_type == "loan_pipeline":
         row = _one(conn.execute(
             text("""
-                SELECT lp.*, r.borrower_display_name, r.requested_amount, r.currency
+                SELECT lp.deal_amount, lp.deal_rate, lp.deal_term_months,
+                       r.consumer_ref, r.currency, r.amount AS request_amount,
+                       r.term_months AS request_term_months,
+                       cp.label AS product_label,
+                       ba.full_name, ba.email, ba.phone, ba.address,
+                       ba.date_of_birth, ba.document_number,
+                       ii.name AS institution_name
                 FROM marketplace.loan_pipeline lp
                 JOIN marketplace.request r ON r.id = lp.request_id
+                LEFT JOIN catalog.product cp ON cp.id = r.product_id
+                LEFT JOIN marketplace.bid_acceptance ba
+                       ON ba.request_id = lp.request_id
+                      AND ba.institution_id = lp.institution_id
+                LEFT JOIN institution.institution ii ON ii.id = lp.institution_id
                 WHERE lp.id = :id AND lp.institution_id = :iid
             """),
             {"id": str(entity_id), "iid": institution_id},
         ))
         if not row:
             raise HTTPException(status_code=404, detail="loan_pipeline entity not found.")
-        return row
+
+        currency = row.get("currency") or "MUR"
+        amount = row.get("deal_amount") or row.get("request_amount") or 0
+        return {
+            "borrower_full_name":       row.get("full_name") or "",
+            "borrower_email":           row.get("email") or "",
+            "borrower_phone":           row.get("phone") or "",
+            "borrower_address":         row.get("address") or "",
+            "borrower_date_of_birth":   str(row.get("date_of_birth") or ""),
+            "borrower_document_number": row.get("document_number") or "",
+            "consumer_ref":             row.get("consumer_ref") or "",
+            "deal_amount":              amount,
+            "deal_amount_formatted":    f"{currency} {float(amount):,.0f}" if amount else "",
+            "deal_rate":                row.get("deal_rate") or "",
+            "deal_term_months":         row.get("deal_term_months") or row.get("request_term_months") or "",
+            "currency":                 currency,
+            "product_label":            row.get("product_label") or "",
+            "institution_name":         row.get("institution_name") or "",
+            "today":                    date.today().strftime("%d %B %Y"),
+        }
     raise HTTPException(status_code=400, detail=f"Unsupported entity_type: {entity_type}")
 
 
@@ -446,7 +535,7 @@ async def generate_document(
         entity_snapshot = _resolve_entity_snapshot(conn, body.entity_type, body.entity_id, institution_id)
         context = merge_engine.resolve_context(entity_snapshot, body.data_overrides)
 
-        gen_row = _one(conn.execute(
+        gen_row = _one_required(conn.execute(
             text("""
                 INSERT INTO institution.doc_generation
                     (institution_id, template_id, template_version_id, entity_type, entity_id,
@@ -484,7 +573,7 @@ async def generate_document(
                     pdf_storage_path = f"{_PREFIX}/{institution_id}/generated/{gen_row['id']}/{pdf_path.name}"
                     await _storage_upload(pdf_storage_path, pdf_path.read_bytes(), "application/pdf")
 
-            row = _one(conn.execute(
+            row = _one_required(conn.execute(
                 text("""
                     UPDATE institution.doc_generation
                     SET status = 'generated', output_docx_path = :docx, output_pdf_path = :pdf,
@@ -498,7 +587,7 @@ async def generate_document(
                    metadata={"template_version_id": str(version["id"])})
             conn.commit()
         except merge_engine.MergeError as exc:
-            row = _one(conn.execute(
+            row = _one_required(conn.execute(
                 text("""
                     UPDATE institution.doc_generation SET status = 'failed', error = :err
                     WHERE id = :id RETURNING *
