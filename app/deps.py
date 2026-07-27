@@ -48,7 +48,7 @@ async def current_claims(authorization: str = Header(default="")) -> dict[str, A
 
 def tenant_conn(
     claims: dict[str, Any] = Depends(current_claims),
-) -> Generator[Session, None, None]:
+) -> Generator[Session]:
     """
     Yield a DB session scoped to the caller via RLS.
     Synchronous generator — FastAPI handles sync dependencies correctly.
@@ -86,7 +86,7 @@ async def api_key_claims(
 
 def api_key_conn(
     claims: dict[str, Any] = Depends(api_key_claims),
-) -> Generator[Session, None, None]:
+) -> Generator[Session]:
     """
     Yield a privileged service session for API key authenticated requests.
     Row filtering is done explicitly by institution_id from claims (not RLS).
