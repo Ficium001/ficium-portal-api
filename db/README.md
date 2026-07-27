@@ -12,6 +12,7 @@ These SQL files are applied to the **Portal (Institution) DB** (`egwobcajdlragub
 | `001_workflow.sql` | Workflow/maker-checker helper definitions | Yes |
 | `003_expiry_notify.sql` | Updates `marketplace.close_expired_windows()` to fire `request-expired` pg_net call on expiry | Yes |
 | `004_accept_bid_reveal.sql` | Updates `marketplace.accept_bid()` to include `rate`, `rate_type`, `amount_offered`, `term_months` in return payload | Yes |
+| `009_entitlements.sql` | Module entitlement & metered-usage layer (`entitlements` schema): catalog, per-institution entitlements, partitioned usage ledger, RLS | Yes |
 
 ---
 
