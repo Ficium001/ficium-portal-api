@@ -77,7 +77,19 @@ async def get_bids_for_request(
                             ) ORDER BY bb.is_guaranteed DESC
                           ) FILTER (WHERE bb.id IS NOT NULL),
                           '[]'::jsonb
-                        ) AS benefits
+                        ) AS benefits,
+                        (
+                          SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                            'product_type',   cp.code,
+                            'product_label',  cp.label,
+                            'amount_offered', ba.amount_offered,
+                            'rate',           ba.rate,
+                            'term_months',    ba.term_months
+                          )), '[]'::jsonb)
+                          FROM marketplace.bid_allocation ba
+                          JOIN catalog.product cp ON cp.id = ba.product_id
+                          WHERE ba.bid_id = b.id
+                        ) AS allocations
                     FROM  marketplace.bid         b
                     JOIN  institution.institution i ON i.id = b.institution_id
                     LEFT JOIN marketplace.bid_benefit bb ON bb.bid_id = b.id
@@ -150,7 +162,19 @@ async def get_bids_bulk(
                             ) ORDER BY bb.is_guaranteed DESC
                           ) FILTER (WHERE bb.id IS NOT NULL),
                           '[]'::jsonb
-                        ) AS benefits
+                        ) AS benefits,
+                        (
+                          SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                            'product_type',   cp.code,
+                            'product_label',  cp.label,
+                            'amount_offered', ba.amount_offered,
+                            'rate',           ba.rate,
+                            'term_months',    ba.term_months
+                          )), '[]'::jsonb)
+                          FROM marketplace.bid_allocation ba
+                          JOIN catalog.product cp ON cp.id = ba.product_id
+                          WHERE ba.bid_id = b.id
+                        ) AS allocations
                     FROM  marketplace.bid         b
                     JOIN  institution.institution i ON i.id = b.institution_id
                     LEFT JOIN marketplace.bid_benefit bb ON bb.bid_id = b.id
