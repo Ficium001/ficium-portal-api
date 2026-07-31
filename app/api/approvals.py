@@ -77,6 +77,7 @@ def _check_action_permission(
 
 @router.get("/pending")
 async def list_pending_actions(
+    scope:  str | None = None,
     conn:   Session = Depends(tenant_conn),
     claims: dict    = Depends(get_claims),
 ) -> list[dict]:
@@ -84,6 +85,16 @@ async def list_pending_actions(
     Pending maker-checker actions scoped to the caller's module permissions.
     Only actions whose category maps to a module the caller holds are returned.
     e.g. bid.* requires inst:bid_approval; benefit.* requires inst:products.
+
+    `scope` optionally narrows to one queue:
+      bids     — bid.* only        (Marketplace > Approvals screen)
+      internal — everything but bid.* (Dual Control screen)
+
+    The two portal screens partition this list between them. They used to each
+    fetch the full set and discard the other's half client-side, which meant two
+    over-fetching polls and a split rule duplicated in UI code where the halves
+    could drift apart. Filtering here keeps the partition authoritative in one
+    place and cuts each response to what its caller actually renders.
     """
     # Map action-category prefix → required module permission
     CATEGORY_MODULE: dict[str, str] = {
@@ -110,6 +121,9 @@ async def list_pending_actions(
 
     if not allowed_prefixes and not is_super:
         return []
+
+    if scope is not None and scope not in ("bids", "internal"):
+        raise HTTPException(status_code=422, detail="scope must be 'bids' or 'internal'.")
 
     # Filter by split_part(category, '.', 1) IN (allowed_prefixes)
     rows = conn.execute(
@@ -146,11 +160,17 @@ async def list_pending_actions(
                 :is_super
                 OR split_part(category, '.', 1) = ANY(:prefixes)
               )
+              AND (
+                :scope IS NULL
+                OR (:scope = 'bids'     AND split_part(category, '.', 1) =  'bid')
+                OR (:scope = 'internal' AND split_part(category, '.', 1) <> 'bid')
+              )
             ORDER BY expires_at ASC NULLS LAST
         """),
         {
             "is_super": is_super,
             "prefixes": allowed_prefixes,
+            "scope":    scope,
         }
     ).fetchall()
     result = []
