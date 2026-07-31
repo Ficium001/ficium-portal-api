@@ -37,6 +37,7 @@ from . import merge_engine
 from .schemas import (
     GenerateRequest,
     GenerationOut,
+    GenerationStatus,
     TemplateCreate,
     TemplateOut,
     TemplateUpdate,
@@ -601,6 +602,49 @@ async def generate_document(
             return row
 
     return row
+
+
+@router.get("/generations", response_model=list[GenerationOut])
+async def list_generations(
+    entity_type: str | None = None,
+    entity_id: UUID | None = None,
+    status: GenerationStatus | None = None,
+    limit: int = 50,
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+):
+    """List generated documents for this institution, optionally scoped to one entity.
+
+    Exists so callers can discover documents already produced for a deal without
+    knowing a generation id up front: the pipeline UI lists a deal's documents,
+    and the e-sign envelope flow picks one to send for signature instead of
+    requiring an operator to paste a storage path by hand.
+    """
+    clauses = ["institution_id = :iid"]
+    params: dict[str, object] = {"iid": _institution_id(claims), "limit": min(max(limit, 1), 200)}
+
+    if entity_type is not None:
+        clauses.append("entity_type = :etype")
+        params["etype"] = entity_type
+    if entity_id is not None:
+        clauses.append("entity_id = :eid")
+        params["eid"] = str(entity_id)
+    if status is not None:
+        clauses.append("status = :status")
+        params["status"] = status
+
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT * FROM institution.doc_generation
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 @router.get("/generations/{generation_id}/download")
