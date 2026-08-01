@@ -32,6 +32,7 @@ from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
 from .api.public import router as public_router
+from .api.request_chat import router as request_chat_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
 from .core.config import settings
@@ -98,6 +99,7 @@ app.include_router(approval_engine_router)  # configurable chains (inst:approval
 app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
+app.include_router(request_chat_router)  # per-lender request chat (proxies App DB)
 app.include_router(entitlements_router)  # module packaging (plat:billing)
 app.include_router(autobid_router)  # auto-bid rules engine (inst:autobid)
 app.include_router(catalog_router)
