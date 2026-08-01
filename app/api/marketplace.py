@@ -374,13 +374,27 @@ def _build_investment_profile(product_type: str, product_answers: dict | None) -
     if product_type in _CREDIT_PRODUCT_TYPES or not product_answers:
         return {}
     pa = product_answers
+
+    def _num(key: str) -> float | None:
+        # These arrive as strings — the borrower app's question flow stores
+        # every answer as a string, including `type: "number"` ones. The
+        # portal types them as `number | null`, so coerce here rather than
+        # letting a string through and relying on JS coercion at render.
+        raw = pa.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
     profile = {
         "risk_appetite":        pa.get("risk_appetite"),
         "investment_horizon":   pa.get("investment_horizon"),
         "liquidity_pref":       pa.get("liquidity") or pa.get("withdrawal") or pa.get("flexibility"),
         "investment_style":     pa.get("investment_style"),
-        "target_amount":        pa.get("target_amount"),
-        "monthly_contribution": pa.get("monthly_contribution"),
+        "target_amount":        _num("target_amount"),
+        "monthly_contribution": _num("monthly_contribution"),
         "investment_objective": pa.get("objective"),
         # Full raw answer bag as a fallback so product-specific questions
         # that don't map to a named field above (fund_type, maturity,
