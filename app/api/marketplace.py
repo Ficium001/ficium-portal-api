@@ -357,6 +357,41 @@ def _risk_tier(risk_score: int | None) -> str | None:
         return "C"
     return "D"
 
+# Repayment-capacity fields (DSR, employment, existing loans, collateral)
+# only make sense for credit products. investment_account/equities/
+# unit_trust/etc. never carry those — instead they carry a risk/horizon/
+# liquidity profile collected in the borrower app's product question flow
+# (NewRequest.tsx PRODUCT_QUESTIONS) and stored as-is in
+# requests.product_answers. Mirrors CREDIT_PRODUCT_CODES in
+# ficium-portal/RequestDetailDrawer.tsx — keep both in sync if either changes.
+_CREDIT_PRODUCT_TYPES = {
+    "sme_loan", "personal_loan", "mortgage", "credit_card",
+    "business_loan", "leasing", "overdraft",
+}
+
+
+def _build_investment_profile(product_type: str, product_answers: dict | None) -> dict:
+    if product_type in _CREDIT_PRODUCT_TYPES or not product_answers:
+        return {}
+    pa = product_answers
+    profile = {
+        "risk_appetite":        pa.get("risk_appetite"),
+        "investment_horizon":   pa.get("investment_horizon"),
+        "liquidity_pref":       pa.get("liquidity") or pa.get("withdrawal") or pa.get("flexibility"),
+        "investment_style":     pa.get("investment_style"),
+        "target_amount":        pa.get("target_amount"),
+        "monthly_contribution": pa.get("monthly_contribution"),
+        "investment_objective": pa.get("objective"),
+        # Full raw answer bag as a fallback so product-specific questions
+        # that don't map to a named field above (fund_type, maturity,
+        # geography, asset_class, market_focus, ...) aren't lost — the
+        # named fields above cover the common cross-product ones the
+        # portal UI renders directly.
+        "investment_product_answers": pa,
+    }
+    return {k: v for k, v in profile.items() if v is not None}
+
+
 def _collateral(product_type: str, parsed: dict) -> tuple[str | None, str | None]:
     pt = (product_type or "").lower()
     if pt in ("mortgage", "home_loan"):
@@ -434,6 +469,7 @@ def _build_phase1(r, parsed: dict) -> dict:
         "risk_tier":                  _risk_tier(r.risk_score),
         "age":                        int(r.client_age) if r.client_age else None,
     }
+    phase1.update(_build_investment_profile(r.product_type, r.product_answers))
     return {k: v for k, v in phase1.items() if v is not None}
 
 _ENRICH_SQL = """
@@ -444,6 +480,7 @@ _ENRICH_SQL = """
         r.amount,
         r.preferred_term_months,
         r.purpose,
+        r.product_answers,
         r.max_rate,
         r.decision_deadline,
         r.status::text              AS status,
