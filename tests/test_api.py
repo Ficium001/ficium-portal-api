@@ -178,6 +178,7 @@ class TestAuthBoundary:
         ("GET",  "/marketplace/requests"),
         ("GET",  "/marketplace/my-bids"),
         ("POST", "/marketplace/bids"),
+        ("GET",  "/marketplace/bids/00000000-0000-0000-0000-000000000000/reveal"),
         ("GET",  "/approvals/pending"),
         ("GET",  "/admin/me"),
         ("GET",  "/admin/metrics"),
