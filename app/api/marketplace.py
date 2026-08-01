@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+from datetime import UTC, datetime
+from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -499,6 +501,7 @@ _ENRICH_SQL = """
         r.decision_deadline,
         r.status::text              AS status,
         r.created_at,
+        r.updated_at,
         r.allocation_mode,
         (
             SELECT json_agg(json_build_object(
@@ -545,8 +548,8 @@ _ENRICH_SQL = """
     LEFT JOIN public.client_dossier            cd ON cd.client_id = r.client_id
     LEFT JOIN public.employment_details        ed ON ed.user_id   = r.client_id
     LEFT JOIN public.client_financial_snapshot s  ON s.client_id  = r.client_id
-    WHERE r.status = 'open'
-    ORDER BY r.created_at DESC
+    WHERE (r.updated_at, r.id) > (:watermark, :watermark_id)
+    ORDER BY r.updated_at ASC, r.id ASC
     LIMIT :lim
 """
 
@@ -563,17 +566,55 @@ _INGEST_SQL = """
 async def sync_requests(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
     limit: int = Query(default=200, le=1000),
+    full_resync: bool = Query(
+        default=False,
+        description="Ignore the watermark and re-pull from the beginning. "
+                    "For recovery/backfill only — normal runs are incremental.",
+    ),
 ) -> dict | JSONResponse:
     _verify_service_secret(x_service_secret)
+
+    # Incremental pull. Previously this pulled `status='open' ORDER BY
+    # created_at DESC LIMIT 200`, which had two failure modes:
+    #   1. Past 200 concurrent open requests the OLDEST silently stopped
+    #      syncing forever — DESC+LIMIT drops the tail permanently.
+    #   2. Rows leaving 'open' (accepted/expired) were never re-pulled, so
+    #      the Portal DB kept showing them as still biddable.
+    # A keyset cursor + ASC fixes both: every changed row is eventually
+    # pulled regardless of status, and a batch cap defers the remainder to
+    # the next run instead of dropping it. The cursor is the COMPOSITE
+    # (updated_at, id), not updated_at alone — a bulk UPDATE stamps many
+    # rows with an identical now(), and a bare timestamp cursor would skip
+    # the rest of a tie group if a batch boundary landed inside it.
+    with service_session() as conn:
+        row = conn.execute(
+            text("SELECT last_updated_at, last_id FROM marketplace.sync_state WHERE id = 1")
+        ).fetchone()
+    if full_resync or row is None:
+        watermark, watermark_id = datetime(1970, 1, 1, tzinfo=UTC), UUID(int=0)
+    else:
+        watermark, watermark_id = row.last_updated_at, row.last_id
+
     try:
         with app_service_session() as app_conn:
-            app_rows = app_conn.execute(text(_ENRICH_SQL), {"lim": limit}).fetchall()
+            app_rows = app_conn.execute(
+                text(_ENRICH_SQL),
+                {"lim": limit, "watermark": watermark, "watermark_id": watermark_id},
+            ).fetchall()
     except AppDatabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     synced, failed = 0, 0
     errors: list[str] = []
     new_requests: list[dict] = []  # collect for webhook dispatch
+    # Advance the watermark only across a CONTIGUOUS run of successes from the
+    # start of the batch. Jumping to max(updated_at) of the whole batch would
+    # skip a failed row permanently on the next run — exactly the silent-drop
+    # bug this change exists to remove. Stopping at the first failure means
+    # the bad row is retried next run (and blocks the queue visibly) rather
+    # than being lost.
+    new_watermark, new_watermark_id = watermark, watermark_id
+    watermark_open = True
     with service_session() as conn:
         for r in app_rows:
             try:
@@ -607,6 +648,8 @@ async def sync_requests(
                     ).fetchone() is not None
                     conn.execute(text(_INGEST_SQL), params)
                 synced += 1
+                if watermark_open:
+                    new_watermark, new_watermark_id = r.updated_at, r.id
                 # Only fire webhook for genuinely new requests (not re-syncs)
                 if not existed:
                     new_requests.append({
@@ -617,8 +660,28 @@ async def sync_requests(
                     })
             except Exception as e:
                 failed += 1
+                watermark_open = False  # don't advance past an unprocessed row
                 if len(errors) < 10:
                     errors.append(f"{r.id}: {e}")
+
+        if (new_watermark, new_watermark_id) != (watermark, watermark_id):
+            conn.execute(
+                text("""UPDATE marketplace.sync_state
+                        SET last_updated_at = :wm, last_id = :wm_id, last_run_at = now(),
+                            last_run_pulled = :pulled, last_run_synced = :synced,
+                            last_run_failed = :failed
+                        WHERE id = 1"""),
+                {"wm": new_watermark, "wm_id": new_watermark_id, "pulled": len(app_rows),
+                 "synced": synced, "failed": failed},
+            )
+        else:
+            conn.execute(
+                text("""UPDATE marketplace.sync_state
+                        SET last_run_at = now(), last_run_pulled = :pulled,
+                            last_run_synced = :synced, last_run_failed = :failed
+                        WHERE id = 1"""),
+                {"pulled": len(app_rows), "synced": synced, "failed": failed},
+            )
 
     # Dispatch request.new webhook to all institutions with matching product config
     # Fire-and-forget per new request — don't block the sync response
@@ -644,7 +707,18 @@ async def sync_requests(
                     {**req, "source": "marketplace_sync"},
                 ))
 
-    result = {"pulled": len(app_rows), "synced": synced, "failed": failed, "errors": errors}
+    result = {
+        "pulled": len(app_rows),
+        "synced": synced,
+        "failed": failed,
+        "errors": errors,
+        "watermark": new_watermark,
+        "watermark_id": str(new_watermark_id),
+        # A full batch means there is almost certainly more waiting. The
+        # caller (or an operator) should re-invoke until this is false rather
+        # than assuming one run drains the queue.
+        "more_pending": len(app_rows) == limit,
+    }
     # A 200 here previously meant "the HTTP call succeeded," not "the sync
     # succeeded" — which is exactly how a fully-broken ingest (failed == pulled,
     # every single run) went unnoticed for three weeks behind a cron job that
