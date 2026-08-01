@@ -141,6 +141,48 @@ async def get_bid(bid_id: str, conn: Session = Depends(tenant_conn)) -> dict:
         raise HTTPException(status_code=404, detail="Bid not found.")
     return _row(row)
 
+@router.get("/bids/{bid_id}/reveal")
+async def get_bid_reveal(
+    bid_id: str,
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    Phase 2 borrower identity for an accepted bid.
+
+    This is the endpoint InstitutionBids.tsx's BorrowerRevealPanel has always
+    called — it never existed, so the panel's query 404'd and, since the
+    component treats "no data" as "nothing to show" (`if (!reveal) return
+    null`), every accepted bid silently rendered without its reveal section.
+    No error was visible anywhere; this is the fix.
+
+    marketplace.bid_acceptance is written once, at acceptance time, by
+    accept_bid() (see db/004_accept_bid_reveal.sql) — the same row
+    pipeline.py already reads for a pipeline's Phase 2 reveal. This is the
+    per-bid equivalent for a caller who only has a bid id, not a pipeline id.
+    """
+    institution_id = claims.get("institution_id")
+    if not institution_id:
+        raise HTTPException(status_code=403, detail="No institution context.")
+
+    row = conn.execute(
+        text("""
+            SELECT full_name, email, phone, address, date_of_birth,
+                   document_number, revealed_at
+            FROM marketplace.bid_acceptance
+            WHERE bid_id = :bid_id AND institution_id = :iid
+        """),
+        {"bid_id": bid_id, "iid": institution_id},
+    ).fetchone()
+
+    if row is None:
+        # Distinguish "not accepted yet" from "not your bid" no further than the
+        # existing get_bid() above does — same 404 shape either way.
+        raise HTTPException(status_code=404, detail="No reveal available for this bid.")
+
+    return _row(row)
+
+
 # ── POST /marketplace/requests/{request_id}/reject ──────────────────────────
 @router.post("/requests/{request_id}/reject")
 async def reject_request(
