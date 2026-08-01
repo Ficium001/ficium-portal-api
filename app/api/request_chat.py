@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import re
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -84,6 +85,63 @@ def _thread_state(app_conn, request_id: str, institution_id: str) -> dict:
         # marketplace is still anonymous and both sides are template-bound.
         "can_send_free_text": bool(row.is_winner),
     }
+
+
+def _validate_params(schema: dict, params: dict) -> dict:
+    """Check supplied params against the template's declared params_schema.
+
+    The schema is authored alongside the template and carries real bounds
+    (`min`/`max` on numerics, `values` on enums, `max_items`/`max_len` on
+    lists). Enforcing it here rather than trusting the caller keeps a bank
+    from putting an implausible figure in front of a borrower via a direct
+    API call. Unknown keys are dropped rather than substituted, so a caller
+    cannot inject placeholders the template never declared.
+    """
+    if not schema:
+        return {}
+
+    cleaned: dict = {}
+    for key, spec in schema.items():
+        if key not in params:
+            continue  # missing keys are caught by the leftover-placeholder check
+        value = params[key]
+        kind = (spec or {}).get("type")
+
+        if kind in ("int", "decimal"):
+            try:
+                num = int(value) if kind == "int" else float(value)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail=f"'{key}' must be a number.") from None
+            lo, hi = spec.get("min"), spec.get("max")
+            if lo is not None and num < lo:
+                raise HTTPException(status_code=422, detail=f"'{key}' must be at least {lo}.")
+            if hi is not None and num > hi:
+                raise HTTPException(status_code=422, detail=f"'{key}' must be at most {hi}.")
+            cleaned[key] = num
+
+        elif kind == "enum":
+            allowed = spec.get("values") or []
+            if str(value) not in allowed:
+                raise HTTPException(status_code=422, detail=f"'{key}' must be one of: {', '.join(allowed)}.")
+            cleaned[key] = str(value)
+
+        elif kind in ("string_list", "label_amount_list"):
+            items = value if isinstance(value, list) else [value]
+            items = [str(v).strip() for v in items if str(v).strip()]
+            if not items:
+                raise HTTPException(status_code=422, detail=f"'{key}' needs at least one entry.")
+            max_items = spec.get("max_items")
+            if max_items is not None and len(items) > max_items:
+                raise HTTPException(status_code=422, detail=f"'{key}' allows at most {max_items} entries.")
+            max_len = spec.get("max_len")
+            if max_len is not None and any(len(v) > max_len for v in items):
+                raise HTTPException(status_code=422, detail=f"Each '{key}' entry must be {max_len} characters or fewer.")
+            cleaned[key] = items
+
+        else:
+            cleaned[key] = str(value)
+
+    return cleaned
 
 
 @router.get("/message-templates")
@@ -180,17 +238,36 @@ async def send_message(
                 # match the template it claims, not whatever text a caller sends.
                 tpl = app_conn.execute(
                     text("""
-                        SELECT code, body_template FROM public.request_message_template
+                        SELECT code, body_template, params_schema
+                          FROM public.request_message_template
                          WHERE code = :code AND sender_type = 'institution' AND is_active
                     """),
                     {"code": template_code},
                 ).fetchone()
                 if tpl is None:
                     raise HTTPException(status_code=422, detail="Unknown or unavailable template.")
+
+                # params_schema declares min/max/max_items/max_len per
+                # placeholder. Nothing used to enforce them — the portal UI
+                # validated client-side, but a direct POST bypassed that, so a
+                # bank could send a borrower "a fee of 99999% of the
+                # outstanding balance". Validate before substituting.
+                params = _validate_params(tpl.params_schema or {}, params)
+
                 text_body = tpl.body_template
                 for key, value in params.items():
                     rendered = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
                     text_body = text_body.replace("{" + str(key) + "}", rendered)
+
+                # A placeholder with no supplied param is left verbatim by the
+                # substitution above, which would send the borrower a literal
+                # "{days}". Reject rather than deliver a broken message.
+                leftover = re.findall(r"\{(\w+)\}", text_body)
+                if leftover:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Missing template parameter(s): {', '.join(sorted(set(leftover)))}.",
+                    )
 
             row = app_conn.execute(
                 text("""
