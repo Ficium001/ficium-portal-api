@@ -309,6 +309,18 @@ tests/
 
 ---
 
+## Documentation
+
+| Doc | Scope |
+|---|---|
+| `ARCHITECTURE.md` | This service's architecture — thin shell over the Portal DB's RLS |
+| `DESIGN.md` | Why this service exists (ADR-001), endpoint design philosophy |
+| `SECURITY.md` | Auth paths, tenant isolation mechanics, incident notes |
+| `DATABASE.md` | This service owns no schema — points at `ficium-portal/supabase/migrations/` |
+| `docs/platform/` | **Cross-repo platform docs** — full data dictionary (both DBs), full API reference, functional spec, security model. Kept identical across all three repos. |
+
+---
+
 ## Deployment (Railway)
 
 1. Deploy from GitHub — Railway uses the `Dockerfile`.

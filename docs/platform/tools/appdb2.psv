@@ -1,0 +1,87 @@
+admin|admin_users|id|uuid|N|uuid_generate_v4()|PK
+admin|admin_users|user_id|uuid|N||FK auth.users
+admin|admin_users|name|text|N||
+admin|admin_users|email|text|N||
+admin|admin_users|role|text|N|'staff'|
+admin|admin_users|active|boolean|N|true|
+admin|admin_users|last_login|timestamptz|Y||
+admin|admin_users|created_at|timestamptz|N|now()|
+admin|admin_users|updated_at|timestamptz|N|now()|
+admin|audit_events|id|uuid|N|gen_random_uuid()|PK
+admin|audit_events|admin_id|uuid|Y||
+admin|audit_events|institution_id|uuid|Y||
+admin|audit_events|actor_id|uuid|N||
+admin|audit_events|actor_type|text|N|'ficium_admin'|
+admin|audit_events|actor_ip|inet|Y||
+admin|audit_events|actor_device|text|Y||
+admin|audit_events|action_category|text|N||
+admin|audit_events|event_label|text|N||
+admin|audit_events|resource_type|text|Y||
+admin|audit_events|resource_id|uuid|Y||
+admin|audit_events|state_before|jsonb|Y||
+admin|audit_events|state_after|jsonb|Y||
+admin|audit_events|outcome|text|N|'success'|
+admin|audit_events|outcome_note|text|Y||
+admin|audit_events|created_at|timestamptz|N|now()|
+admin|platform_config|id|uuid|N|uuid_generate_v4()|PK
+admin|platform_config|key|text|N||
+admin|platform_config|value|jsonb|N||
+admin|platform_config|description|text|Y||
+admin|platform_config|updated_by|uuid|Y||
+admin|platform_config|created_at|timestamptz|N|now()|
+admin|platform_config|updated_at|timestamptz|N|now()|
+fico|conversation|id|uuid|N|gen_random_uuid()|PK
+fico|conversation|user_id|uuid|N||
+fico|conversation|started_at|timestamptz|N|now()|
+fico|conversation|ended_at|timestamptz|Y||
+fico|conversation|summarized|boolean|N|false|rolled into profile.rolling_summary
+fico|message|id|uuid|N|gen_random_uuid()|PK
+fico|message|conversation_id|uuid|N||FK fico.conversation
+fico|message|user_id|uuid|N||
+fico|message|role|text|N||user / assistant
+fico|message|content|text|N||
+fico|message|created_at|timestamptz|N|now()|
+fico|message_meter|user_id|uuid|N||PK (user_id, period)
+fico|message_meter|period|date|N||monthly quota bucket
+fico|message_meter|messages_used|integer|N|0|
+fico|profile|user_id|uuid|N||PK
+fico|profile|rolling_summary|text|N|''|Haiku-generated
+fico|profile|tone_notes|text|N|''|
+fico|profile|created_at|timestamptz|N|now()|
+fico|profile|updated_at|timestamptz|N|now()|
+finance|accounts|id|uuid|N|gen_random_uuid()|PK
+finance|accounts|user_id|uuid|N||
+finance|accounts|institution_name|text|N||
+finance|accounts|account_type|text|N||
+finance|accounts|currency|text|N|'MUR'|
+finance|accounts|balance|numeric|N|0|
+finance|accounts|notes|text|Y||
+finance|accounts|created_at|timestamptz|N|now()|
+finance|accounts|updated_at|timestamptz|N|now()|
+finance|holdings|id|uuid|N|gen_random_uuid()|PK
+finance|holdings|user_id|uuid|N||
+finance|holdings|asset_type|text|N||equity / crypto / fund
+finance|holdings|symbol|text|N||
+finance|holdings|exchange|text|Y||
+finance|holdings|quantity|numeric|N|0|
+finance|holdings|cost_basis|numeric|Y||
+finance|holdings|currency|text|N|'USD'|
+finance|holdings|notes|text|Y||
+finance|holdings|created_at|timestamptz|N|now()|
+finance|holdings|updated_at|timestamptz|N|now()|
+finance|holding_prices|symbol|text|N||PK (symbol, exchange)
+finance|holding_prices|exchange|text|N|''|
+finance|holding_prices|asset_type|text|N||
+finance|holding_prices|price|numeric|N||Finnhub / CoinGecko
+finance|holding_prices|currency|text|N||
+finance|holding_prices|fetched_at|timestamptz|N|now()|
+finance|net_worth_history|user_id|uuid|N||PK (user_id, snapshot_date)
+finance|net_worth_history|snapshot_date|date|N|CURRENT_DATE|
+finance|net_worth_history|cash_savings|numeric|N|0|
+finance|net_worth_history|fixed_deposits|numeric|N|0|
+finance|net_worth_history|investments_value|numeric|N|0|
+finance|net_worth_history|total_assets|numeric|N|0|
+finance|net_worth_history|total_liabilities|numeric|N|0|
+finance|net_worth_history|net_worth|numeric|N|0|
+finance|net_worth_history|currency|text|N|'MUR'|
+finance|net_worth_history|captured_at|timestamptz|N|now()|

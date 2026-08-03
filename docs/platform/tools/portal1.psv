@@ -1,0 +1,461 @@
+catalog|country|code|char(2)|N||PK
+catalog|country|name|text|N||
+catalog|country|currency|char(3)|N||
+catalog|country|active|boolean|N|true|
+catalog|currency|code|char(3)|N||PK
+catalog|currency|name|text|N||
+catalog|currency|symbol|text|N||
+catalog|currency|decimal_places|integer|N|2|
+catalog|module|key|text|N||PK
+catalog|module|label|text|N||
+catalog|module|description|text|N|''|
+catalog|module|side|text|N|'institution'|
+catalog|module|icon|text|Y||
+catalog|module|path|text|Y||
+catalog|module|sort_order|integer|N|0|
+catalog|module|active|boolean|N|true|
+catalog|product|id|uuid|N|gen_random_uuid()|PK
+catalog|product|family_id|uuid|N||FK catalog.product_family
+catalog|product|code|text|N||
+catalog|product|label|text|N||
+catalog|product|description|text|N|''|
+catalog|product|currency|char(3)|N|'MUR'|FK catalog.currency
+catalog|product|min_amount|numeric(20,6)|Y||
+catalog|product|max_amount|numeric(20,6)|Y||
+catalog|product|min_term_months|integer|Y||
+catalog|product|max_term_months|integer|Y||
+catalog|product|active|boolean|N|true|
+catalog|product|sort_order|integer|N|0|
+catalog|product|metadata|jsonb|N|'{}'|
+catalog|product|created_at|timestamptz|N|now()|
+catalog|product|updated_at|timestamptz|N|now()|
+catalog|product_document|id|uuid|N|gen_random_uuid()|PK
+catalog|product_document|product_id|uuid|N||FK catalog.product
+catalog|product_document|doc_key|text|N||
+catalog|product_document|label|text|N||
+catalog|product_document|description|text|N|''|
+catalog|product_document|required|boolean|N|true|
+catalog|product_document|allowed_mime_types|text[]|N|'{}'|
+catalog|product_document|max_size_bytes|integer|Y||
+catalog|product_document|sort_order|integer|N|0|
+catalog|product_eligibility|id|uuid|N|gen_random_uuid()|PK
+catalog|product_eligibility|product_id|uuid|N||FK catalog.product
+catalog|product_eligibility|country|char(2)|Y||FK catalog.country
+catalog|product_eligibility|rules|jsonb|N|'{}'|
+catalog|product_eligibility|description|text|N|''|
+catalog|product_eligibility|active|boolean|N|true|
+catalog|product_family|id|uuid|N|gen_random_uuid()|PK
+catalog|product_family|code|text|N||
+catalog|product_family|label|text|N||
+catalog|product_family|description|text|N|''|
+catalog|product_family|icon|text|Y||
+catalog|product_family|sort_order|integer|N|0|
+catalog|product_family|active|boolean|N|true|
+catalog|product_family|created_at|timestamptz|N|now()|
+catalog|product_family|updated_at|timestamptz|N|now()|
+catalog|product_parameter|id|uuid|N|gen_random_uuid()|PK
+catalog|product_parameter|product_id|uuid|N||FK catalog.product
+catalog|product_parameter|key|text|N||
+catalog|product_parameter|label|text|N||
+catalog|product_parameter|data_type|text|N|'text'|
+catalog|product_parameter|required|boolean|N|false|
+catalog|product_parameter|options|jsonb|Y||
+catalog|product_parameter|validation|jsonb|Y||
+catalog|product_parameter|sort_order|integer|N|0|
+catalog|product_rate_model|id|uuid|N|gen_random_uuid()|PK
+catalog|product_rate_model|product_id|uuid|N||FK catalog.product
+catalog|product_rate_model|rate_type|text|N|'fixed'|
+catalog|product_rate_model|min_rate|numeric(8,4)|Y||
+catalog|product_rate_model|max_rate|numeric(8,4)|Y||
+catalog|product_rate_model|rate_unit|text|N|'percent_per_annum'|
+catalog|product_rate_model|compounding|text|N|'monthly'|
+catalog|product_rate_model|config|jsonb|N|'{}'|
+catalog|product_sla|id|uuid|N|gen_random_uuid()|PK
+catalog|product_sla|product_id|uuid|N||FK catalog.product
+catalog|product_sla|bid_window_minutes|integer|N|240|
+catalog|product_sla|auto_withdraw_minutes|integer|N|300|
+catalog|product_sla|min_bids_required|integer|N|1|
+catalog|product_sla|max_bids_allowed|integer|Y||
+catalog|regulator|code|text|N||PK
+catalog|regulator|name|text|N||
+catalog|regulator|country|text|N||
+catalog|regulator|website|text|Y||
+catalog|regulator|created_at|timestamptz|N|now()|
+institution|api_key|id|uuid|N|gen_random_uuid()|PK
+institution|api_key|institution_id|uuid|N||FK institution.institution
+institution|api_key|label|text|N||
+institution|api_key|key_hmac|text|N||
+institution|api_key|key_prefix|text|N|''|
+institution|api_key|key_hash|text|N|''|
+institution|api_key|scopes|text[]|N|'{}'|
+institution|api_key|active|boolean|N|false|
+institution|api_key|mc_status|text|N|'pending_approval'|
+institution|api_key|created_by|uuid|Y||
+institution|api_key|requested_by|uuid|Y||
+institution|api_key|approved_by|uuid|Y||
+institution|api_key|approved_at|timestamptz|Y||
+institution|api_key|rejection_note|text|Y||
+institution|api_key|last_used_at|timestamptz|Y||
+institution|api_key|last_used_ip|inet|Y||
+institution|api_key|expires_at|timestamptz|Y||
+institution|api_key|revoked_at|timestamptz|Y||
+institution|api_key|revoked_by|uuid|Y||FK institution.member
+institution|api_key|created_at|timestamptz|N|now()|
+institution|approval_action|id|uuid|N|gen_random_uuid()|PK
+institution|approval_action|stage_instance_id|uuid|N||FK institution.approval_stage_instance
+institution|approval_action|actor_id|uuid|N||
+institution|approval_action|acting_as|uuid|Y||delegation source
+institution|approval_action|action|text|N||approve/reject/abstain
+institution|approval_action|comment|text|Y||
+institution|approval_action|checklist_state|jsonb|Y||
+institution|approval_action|created_at|timestamptz|N|now()|
+institution|approval_committee|id|uuid|N|gen_random_uuid()|PK
+institution|approval_committee|institution_id|uuid|N||
+institution|approval_committee|name|text|N||
+institution|approval_committee|description|text|Y||
+institution|approval_committee|quorum_type|text|N||
+institution|approval_committee|quorum_value|numeric|Y||
+institution|approval_committee|tie_break|text|N|'chair'|
+institution|approval_committee|allow_abstain|boolean|N|true|
+institution|approval_committee|status|text|N|'active'|
+institution|approval_committee|created_by|uuid|N||
+institution|approval_committee|created_at|timestamptz|N|now()|
+institution|approval_delegation|id|uuid|N|gen_random_uuid()|PK
+institution|approval_delegation|institution_id|uuid|N||
+institution|approval_delegation|from_member|uuid|N||
+institution|approval_delegation|to_member|uuid|N||
+institution|approval_delegation|scope|text|N|'all'|
+institution|approval_delegation|reason|text|N||
+institution|approval_delegation|valid_from|timestamptz|N||
+institution|approval_delegation|valid_to|timestamptz|N||
+institution|approval_delegation|approved_by|uuid|N||
+institution|approval_delegation|created_at|timestamptz|N|now()|
+institution|approval_instance|id|uuid|N|gen_random_uuid()|PK
+institution|approval_instance|institution_id|uuid|N||
+institution|approval_instance|template_id|uuid|N||FK institution.approval_template
+institution|approval_instance|template_version|integer|N||frozen at route time
+institution|approval_instance|doa_rule_id|uuid|N||FK institution.doa_rule
+institution|approval_instance|entity_type|text|N||
+institution|approval_instance|entity_id|uuid|N||
+institution|approval_instance|entity_maker_id|uuid|N||maker-checker exclusion
+institution|approval_instance|entity_snapshot|jsonb|N||
+institution|approval_instance|current_seq|integer|N|1|
+institution|approval_instance|status|text|N|'in_progress'|
+institution|approval_instance|withdraw_reason|text|Y||
+institution|approval_instance|started_at|timestamptz|N|now()|
+institution|approval_instance|resolved_at|timestamptz|Y||
+institution|approval_outbox|id|bigint|N|nextval|PK
+institution|approval_outbox|institution_id|uuid|N||
+institution|approval_outbox|event|text|N||
+institution|approval_outbox|payload|jsonb|N||
+institution|approval_outbox|created_at|timestamptz|N|now()|
+institution|approval_outbox|processed_at|timestamptz|Y||
+institution|approval_stage_def|id|uuid|N|gen_random_uuid()|PK
+institution|approval_stage_def|template_id|uuid|N||FK institution.approval_template
+institution|approval_stage_def|seq|integer|N||
+institution|approval_stage_def|name|text|N||
+institution|approval_stage_def|stage_type|text|N||role / committee
+institution|approval_stage_def|committee_id|uuid|Y||FK institution.approval_committee
+institution|approval_stage_def|approver_role|text|Y||
+institution|approval_stage_def|checklist|jsonb|Y||
+institution|approval_stage_def|sla_hours|integer|Y||
+institution|approval_stage_def|on_sla_breach|text|N|'notify'|notify / escalate
+institution|approval_stage_def|escalate_to_template_id|uuid|Y||FK institution.approval_template
+institution|approval_stage_def|config|jsonb|N|'{}'|
+institution|approval_stage_instance|id|uuid|N|gen_random_uuid()|PK
+institution|approval_stage_instance|instance_id|uuid|N||FK institution.approval_instance
+institution|approval_stage_instance|seq|integer|N||
+institution|approval_stage_instance|stage_def_id|uuid|N||FK institution.approval_stage_def
+institution|approval_stage_instance|status|text|N|'pending'|
+institution|approval_stage_instance|started_at|timestamptz|Y||
+institution|approval_stage_instance|due_at|timestamptz|Y||
+institution|approval_stage_instance|resolved_at|timestamptz|Y||
+institution|approval_template|id|uuid|N|gen_random_uuid()|PK
+institution|approval_template|institution_id|uuid|N||
+institution|approval_template|name|text|N||
+institution|approval_template|entity_type|text|N||
+institution|approval_template|version|integer|N|1|
+institution|approval_template|status|text|N|'draft'|draft / active
+institution|approval_template|created_by|uuid|N||
+institution|approval_template|approved_by|uuid|Y||
+institution|approval_template|created_at|timestamptz|N|now()|
+institution|benefit|id|uuid|N|gen_random_uuid()|PK
+institution|benefit|institution_id|uuid|N||FK institution.institution
+institution|benefit|product_id|uuid|Y||FK catalog.product
+institution|benefit|cat_id|uuid|N||FK institution.benefit_cat
+institution|benefit|title|text|N||
+institution|benefit|description|text|Y||
+institution|benefit|value_display|text|Y||
+institution|benefit|is_guaranteed|boolean|N|false|
+institution|benefit|conditions|text|Y||
+institution|benefit|valid_from|date|Y||
+institution|benefit|valid_until|date|Y||
+institution|benefit|is_active|boolean|N|true|
+institution|benefit|created_by|uuid|Y||FK institution.member
+institution|benefit|created_at|timestamptz|N|now()|
+institution|benefit|updated_at|timestamptz|N|now()|
+institution|benefit_cat|id|uuid|N|gen_random_uuid()|PK
+institution|benefit_cat|code|text|N||
+institution|benefit_cat|label|text|N||
+institution|benefit_cat|icon_key|text|Y||
+institution|benefit_cat|sort_order|integer|N|0|
+institution|benefit_cat|created_at|timestamptz|N|now()|
+institution|committee_member|id|uuid|N|gen_random_uuid()|PK
+institution|committee_member|committee_id|uuid|N||FK institution.approval_committee
+institution|committee_member|member_id|uuid|N||
+institution|committee_member|role|text|N|'member'|chair / member
+institution|committee_member|is_voting|boolean|N|true|
+institution|committee_member|valid_from|date|N|CURRENT_DATE|
+institution|committee_member|valid_to|date|Y||
+institution|committee_member|created_by|uuid|N||
+institution|committee_member|created_at|timestamptz|N|now()|
+institution|doa_rule|id|uuid|N|gen_random_uuid()|PK
+institution|doa_rule|institution_id|uuid|N||
+institution|doa_rule|entity_type|text|N||
+institution|doa_rule|priority|integer|N||lowest wins
+institution|doa_rule|conditions|jsonb|N|'{}'|
+institution|doa_rule|template_id|uuid|N||FK institution.approval_template
+institution|doa_rule|status|text|N|'active'|
+institution|doa_rule|created_by|uuid|N||
+institution|doa_rule|created_at|timestamptz|N|now()|
+institution|doc|id|uuid|N|gen_random_uuid()|PK
+institution|doc|institution_id|uuid|N||FK institution.institution
+institution|doc|doc_type_id|uuid|N||FK institution.doc_type
+institution|doc|storage_path|text|N||
+institution|doc|file_name|text|N||
+institution|doc|mime_type|text|Y||
+institution|doc|status|text|N|'pending'|
+institution|doc|expiry_date|date|Y||
+institution|doc|rejection_reason|text|Y||
+institution|doc|reviewed_by|uuid|Y||FK portal_admin.admin_users
+institution|doc|reviewed_at|timestamptz|Y||
+institution|doc|uploaded_by|uuid|Y||FK institution.member
+institution|doc|uploaded_at|timestamptz|N|now()|
+institution|doc_generation|id|uuid|N|gen_random_uuid()|PK
+institution|doc_generation|institution_id|uuid|N||FK institution.institution
+institution|doc_generation|template_id|uuid|N||FK institution.doc_template
+institution|doc_generation|template_version_id|uuid|N||FK institution.doc_template_version
+institution|doc_generation|entity_type|text|N|'loan_pipeline'|
+institution|doc_generation|entity_id|uuid|N||
+institution|doc_generation|stage_instance_id|uuid|Y||FK marketplace.pipeline_stage_instance
+institution|doc_generation|data_snapshot|jsonb|N|'{}'|merge data frozen at generation
+institution|doc_generation|output_docx_path|text|Y||
+institution|doc_generation|output_pdf_path|text|Y||
+institution|doc_generation|status|text|N|'pending'|
+institution|doc_generation|error|text|Y||
+institution|doc_generation|esign_envelope_id|uuid|Y||
+institution|doc_generation|generated_by|uuid|Y||FK institution.member
+institution|doc_generation|generated_at|timestamptz|Y||
+institution|doc_generation|created_at|timestamptz|N|now()|
+institution|doc_template|id|uuid|N|gen_random_uuid()|PK
+institution|doc_template|institution_id|uuid|N||FK institution.institution
+institution|doc_template|product_id|uuid|Y||FK catalog.product
+institution|doc_template|product_code|text|Y||
+institution|doc_template|code|text|N||
+institution|doc_template|name|text|N||
+institution|doc_template|description|text|Y||
+institution|doc_template|doc_category|text|N|'other'|
+institution|doc_template|status|text|N|'draft'|
+institution|doc_template|current_version|integer|N|0|
+institution|doc_template|created_by|uuid|Y||FK institution.member
+institution|doc_template|created_at|timestamptz|N|now()|
+institution|doc_template|updated_at|timestamptz|N|now()|
+institution|doc_template_version|id|uuid|N|gen_random_uuid()|PK
+institution|doc_template_version|template_id|uuid|N||FK institution.doc_template
+institution|doc_template_version|institution_id|uuid|N||FK institution.institution
+institution|doc_template_version|version_no|integer|N||
+institution|doc_template_version|storage_path|text|N||
+institution|doc_template_version|file_name|text|N||
+institution|doc_template_version|mime_type|text|N|docx|
+institution|doc_template_version|file_size_bytes|integer|Y||
+institution|doc_template_version|checksum_sha256|text|Y||
+institution|doc_template_version|merge_field_map|jsonb|N|'{}'|
+institution|doc_template_version|change_note|text|Y||
+institution|doc_template_version|status|text|N|'draft'|draft/pending/active/rejected
+institution|doc_template_version|created_by|uuid|Y||FK institution.member
+institution|doc_template_version|approved_by|uuid|Y||FK institution.member
+institution|doc_template_version|approved_at|timestamptz|Y||
+institution|doc_template_version|rejection_note|text|Y||
+institution|doc_template_version|created_at|timestamptz|N|now()|
+institution|doc_type|id|uuid|N|gen_random_uuid()|PK
+institution|doc_type|code|text|N||
+institution|doc_type|label|text|N||
+institution|doc_type|description|text|Y||
+institution|doc_type|is_mandatory|boolean|N|true|
+institution|doc_type|applies_to|text[]|Y||
+institution|doc_type|sort_order|integer|N|0|
+institution|doc_type|created_at|timestamptz|N|now()|
+institution|group|id|uuid|N|gen_random_uuid()|PK
+institution|group|institution_id|uuid|N||FK institution.institution
+institution|group|slug|text|N||
+institution|group|label|text|N||
+institution|group|description|text|N|''|
+institution|group|module_permissions|text[]|N|'{}'|inst:* module keys
+institution|group|product_scope|uuid[]|Y||null = all products
+institution|group|is_system|boolean|N|false|
+institution|group|created_by|uuid|Y||FK institution.member
+institution|group|created_at|timestamptz|N|now()|
+institution|group|updated_at|timestamptz|N|now()|
+institution|institution|id|uuid|N|gen_random_uuid()|PK
+institution|institution|name|varchar|N||
+institution|institution|legal_name|varchar|N||
+institution|institution|institution_type|varchar|N||
+institution|institution|reg_number|varchar|Y||
+institution|institution|regulator|varchar|Y||
+institution|institution|country|varchar|N||
+institution|institution|website|varchar|Y||
+institution|institution|deployment_model|varchar|N|'saas'|saas/paas/on_prem
+institution|institution|modules|jsonb|N|'{}'|licensed module entitlements
+institution|institution|onboarding_stage|varchar|N|'registered'|
+institution|institution|compliance_status|varchar|N|'not_submitted'|
+institution|institution|compliance_notes|text|Y||
+institution|institution|compliance_reviewed_at|timestamptz|Y||
+institution|institution|compliance_reviewed_by|uuid|Y||
+institution|institution|approved|boolean|N|false|
+institution|institution|approved_at|timestamptz|Y||
+institution|institution|approved_by|uuid|Y||
+institution|institution|suspended_at|timestamptz|Y||
+institution|institution|suspended_by|uuid|Y||
+institution|institution|suspension_reason|text|Y||
+institution|institution|offboarded_at|timestamptz|Y||
+institution|institution|primary_contact_name|varchar|Y||
+institution|institution|primary_contact_email|varchar|Y||
+institution|institution|primary_contact_phone|varchar|Y||
+institution|institution|tax_id|text|Y||
+institution|institution|incorporation_date|date|Y||
+institution|institution|logo_url|text|Y||
+institution|institution|timezone|text|N|'Indian/Mauritius'|
+institution|institution|notes|text|Y||
+institution|institution|metadata|jsonb|N|'{}'|
+institution|institution|created_at|timestamptz|N|now()|
+institution|institution|updated_at|timestamptz|N|now()|
+institution|institution_sla_config|id|uuid|N|gen_random_uuid()|PK
+institution|institution_sla_config|institution_id|uuid|N||FK institution.institution
+institution|institution_sla_config|product_id|uuid|Y||FK catalog.product
+institution|institution_sla_config|product_code|text|Y||
+institution|institution_sla_config|bid_window_minutes|integer|Y||overrides catalog.product_sla
+institution|institution_sla_config|auto_withdraw_minutes|integer|Y||
+institution|institution_sla_config|integration_mode|text|Y||portal/webhook/api_pull/core_banking
+institution|institution_sla_config|created_at|timestamptz|N|now()|
+institution|institution_sla_config|updated_at|timestamptz|N|now()|
+institution|kyb_document|id|uuid|N|gen_random_uuid()|PK
+institution|kyb_document|institution_id|uuid|N||FK institution.institution
+institution|kyb_document|doc_type|text|N||
+institution|kyb_document|label|text|N||
+institution|kyb_document|storage_path|text|N||
+institution|kyb_document|mime_type|text|N||
+institution|kyb_document|file_size_bytes|integer|Y||
+institution|kyb_document|status|text|N|'pending'|
+institution|kyb_document|rejection_reason|text|Y||
+institution|kyb_document|reviewed_by|uuid|Y||
+institution|kyb_document|reviewed_at|timestamptz|Y||
+institution|kyb_document|expires_at|timestamptz|Y||
+institution|kyb_document|uploaded_by|uuid|Y||FK institution.member
+institution|kyb_document|created_at|timestamptz|N|now()|
+institution|member|id|uuid|N|gen_random_uuid()|PK
+institution|member|institution_id|uuid|N||FK institution.institution
+institution|member|auth_user_id|uuid|N||ficium-auth subject
+institution|member|email|varchar|N||
+institution|member|full_name|varchar|Y||
+institution|member|role|varchar|N|'analyst'|
+institution|member|member_role|text|Y||
+institution|member|is_primary_admin|boolean|N|false|
+institution|member|active|boolean|N|true|
+institution|member|group_id|uuid|Y||FK portal_admin.user_groups
+institution|member|custom_group_id|uuid|Y||FK institution.group
+institution|member|system_group_id|uuid|Y||
+institution|member|invited_by|uuid|Y||
+institution|member|invited_at|timestamptz|Y||
+institution|member|activated_at|timestamptz|Y||
+institution|member|deactivated_at|timestamptz|Y||
+institution|member|created_at|timestamptz|N|now()|
+institution|member|updated_at|timestamptz|N|now()|
+institution|pending_actions|id|uuid|N|gen_random_uuid()|PK
+institution|pending_actions|action_category|text|N||bid.* or internal
+institution|pending_actions|action_status|text|N|'pending'|
+institution|pending_actions|maker_id|uuid|N||FK institution.member
+institution|pending_actions|maker_role|text|N|''|
+institution|pending_actions|institution_id|uuid|N||FK institution.institution
+institution|pending_actions|resource_type|text|N||
+institution|pending_actions|resource_id|uuid|Y||
+institution|pending_actions|payload|jsonb|N|'{}'|
+institution|pending_actions|payload_before|jsonb|Y||
+institution|pending_actions|checker_id|uuid|Y||FK institution.member
+institution|pending_actions|checker_role|text|Y||
+institution|pending_actions|checker_note|text|Y||
+institution|pending_actions|checked_at|timestamptz|Y||
+institution|pending_actions|initiated_at|timestamptz|N|now()|
+institution|pending_actions|expires_at|timestamptz|N|now()+7d|
+institution|pending_actions|execution_status|text|Y|'pending'|
+institution|pending_actions|executed_at|timestamptz|Y||
+institution|pending_actions|execution_error|text|Y||
+institution|pending_actions|created_at|timestamptz|N|now()|
+institution|pipeline_stage_def|id|uuid|N|gen_random_uuid()|PK
+institution|pipeline_stage_def|template_id|uuid|N||FK institution.pipeline_template
+institution|pipeline_stage_def|institution_id|uuid|N||
+institution|pipeline_stage_def|stage_key|stage_key_enum|N|'custom'|
+institution|pipeline_stage_def|custom_key|text|Y||
+institution|pipeline_stage_def|label|text|N||
+institution|pipeline_stage_def|description|text|Y||
+institution|pipeline_stage_def|position|smallint|N||
+institution|pipeline_stage_def|sla_hours|integer|N|48|
+institution|pipeline_stage_def|requires_maker_checker|boolean|N|false|
+institution|pipeline_stage_def|requires_documents|boolean|N|false|
+institution|pipeline_stage_def|borrower_label|text|Y||shown to borrower
+institution|pipeline_stage_def|borrower_visible|boolean|N|true|
+institution|pipeline_stage_def|is_active|boolean|N|true|
+institution|pipeline_stage_def|created_at|timestamptz|N|now()|
+institution|pipeline_template|id|uuid|N|gen_random_uuid()|PK
+institution|pipeline_template|institution_id|uuid|N||FK institution.institution
+institution|pipeline_template|name|text|N||
+institution|pipeline_template|description|text|Y||
+institution|pipeline_template|product_code|text|Y||
+institution|pipeline_template|is_default|boolean|N|false|
+institution|pipeline_template|is_active|boolean|N|true|
+institution|pipeline_template|created_by|uuid|Y||
+institution|pipeline_template|created_at|timestamptz|N|now()|
+institution|pipeline_template|updated_at|timestamptz|N|now()|
+institution|product_config|id|uuid|N|gen_random_uuid()|PK
+institution|product_config|institution_id|uuid|N||FK institution.institution
+institution|product_config|product_id|uuid|N||FK catalog.product
+institution|product_config|enabled|boolean|N|true|
+institution|product_config|min_rate|numeric|Y||
+institution|product_config|max_rate|numeric|Y||
+institution|product_config|min_amount|numeric|Y||
+institution|product_config|max_amount|numeric|Y||
+institution|product_config|min_term_months|integer|Y||
+institution|product_config|max_term_months|integer|Y||
+institution|product_config|bid_window_minutes|integer|Y||
+institution|product_config|auto_withdraw_minutes|integer|Y||
+institution|product_config|conditions|jsonb|N|'{}'|
+institution|product_config|created_at|timestamptz|N|now()|
+institution|product_config|updated_at|timestamptz|N|now()|
+institution|webhook|id|uuid|N|gen_random_uuid()|PK
+institution|webhook|institution_id|uuid|N||FK institution.institution
+institution|webhook|label|text|N||
+institution|webhook|endpoint_url|text|N||SSRF-validated
+institution|webhook|secret_hash|text|N||
+institution|webhook|signing_secret|text|N|''|HMAC-SHA256 key
+institution|webhook|event_types|jsonb|N|'[]'|
+institution|webhook|active|boolean|N|true|
+institution|webhook|retry_max|integer|N|3|
+institution|webhook|timeout_ms|integer|N|30000|
+institution|webhook|failure_count|integer|N|0|circuit breaker
+institution|webhook|last_fired_at|timestamptz|Y||
+institution|webhook|last_status|text|Y||
+institution|webhook|created_at|timestamptz|N|now()|
+institution|webhook|updated_at|timestamptz|N|now()|
+institution|webhook_delivery|id|uuid|N|gen_random_uuid()|PK
+institution|webhook_delivery|webhook_id|uuid|N||FK institution.webhook
+institution|webhook_delivery|institution_id|uuid|N||FK institution.institution
+institution|webhook_delivery|event_type|text|N||
+institution|webhook_delivery|event_id|uuid|N||
+institution|webhook_delivery|payload|jsonb|N|'{}'|
+institution|webhook_delivery|status|text|N|'pending'|
+institution|webhook_delivery|attempts|integer|N|0|
+institution|webhook_delivery|last_attempt_at|timestamptz|Y||
+institution|webhook_delivery|response_status|integer|Y||
+institution|webhook_delivery|response_body|text|Y||
+institution|webhook_delivery|next_retry_at|timestamptz|Y||exponential backoff
+institution|webhook_delivery|delivered_at|timestamptz|Y||
+institution|webhook_delivery|created_at|timestamptz|N|now()|
