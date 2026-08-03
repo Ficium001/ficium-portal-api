@@ -64,6 +64,31 @@ def _institution_id(claims: dict) -> str:
     return iid
 
 
+def _member_id(conn: Session, claims: dict) -> str:
+    """
+    Resolve the caller to their institution.member.id.
+
+    claims["sub"] is the ficium-auth subject -- institution.member.auth_user_id,
+    NOT institution.member.id (see institution.current_member_ctx_v2(), which
+    resolves the same way: `m.auth_user_id = auth.uid()`). doc_template.created_by,
+    doc_template_version.created_by/approved_by, and doc_generation.generated_by
+    all carry a hard FOREIGN KEY to institution.member(id), so inserting the raw
+    auth_user_id there raised an unhandled IntegrityError (not an HTTPException)
+    on every create/upload/approve/generate call -- a 500 that, before the
+    exception-handler fix, the browser showed only as a CORS failure.
+    """
+    row = conn.execute(
+        text("""
+            SELECT id FROM institution.member
+            WHERE auth_user_id = :sub AND institution_id = :iid AND active = true
+        """),
+        {"sub": claims.get("sub"), "iid": claims.get("institution_id")},
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=403, detail="No active membership found for this account.")
+    return str(row.id)
+
+
 def _require_admin(claims: dict) -> None:
     if claims.get("user_role") not in INSTITUTION_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Requires institution admin.")
@@ -202,6 +227,7 @@ async def create_template(
     _require_admin(claims)
     institution_id = _institution_id(claims)
     with service_session() as conn:
+        creator_id = _member_id(conn, claims)
         row = _one_required(conn.execute(
             text("""
                 INSERT INTO institution.doc_template
@@ -218,7 +244,7 @@ async def create_template(
                 "name": body.name,
                 "description": body.description,
                 "doc_category": body.doc_category,
-                "created_by": claims.get("sub"),
+                "created_by": creator_id,
             },
         ))
         _audit(conn, claims=claims, action="doc_template.created",
@@ -316,6 +342,7 @@ async def upload_version(
         raise HTTPException(status_code=400, detail="File must be a .docx (Word) document.")
 
     with service_session() as conn:
+        creator_id = _member_id(conn, claims)
         template = _one(conn.execute(
             text("SELECT * FROM institution.doc_template WHERE id = :id AND institution_id = :iid"),
             {"id": str(template_id), "iid": institution_id},
@@ -348,7 +375,7 @@ async def upload_version(
             {
                 "iid": institution_id, "tid": str(template_id), "vno": next_version,
                 "fname": safe_name, "spath": storage_path, "size": size_bytes,
-                "checksum": checksum, "note": change_note, "creator": claims.get("sub"),
+                "checksum": checksum, "note": change_note, "creator": creator_id,
             },
         ))
         _audit(conn, claims=claims, action="doc_template_version.uploaded",
@@ -370,6 +397,7 @@ async def decide_version(
     institution_id = _institution_id(claims)
 
     with service_session() as conn:
+        checker_id = _member_id(conn, claims)
         version = _one(conn.execute(
             text("""
                 SELECT * FROM institution.doc_template_version
@@ -381,7 +409,7 @@ async def decide_version(
             raise HTTPException(status_code=404, detail="Version not found.")
         if version["status"] not in ("draft", "pending_approval"):
             raise HTTPException(status_code=409, detail=f"Version is already {version['status']}.")
-        if str(version["created_by"]) == str(claims.get("sub")):
+        if str(version["created_by"]) == checker_id:
             raise HTTPException(status_code=403, detail="Maker and checker must be different members.")
 
         if body.action == "approve":
@@ -391,7 +419,7 @@ async def decide_version(
                     SET status = 'published', approved_by = :approver, approved_at = now()
                     WHERE id = :vid RETURNING *
                 """),
-                {"approver": claims.get("sub"), "vid": str(version_id)},
+                {"approver": checker_id, "vid": str(version_id)},
             ))
             conn.execute(
                 text("""
@@ -409,7 +437,7 @@ async def decide_version(
                     SET status = 'rejected', approved_by = :approver, approved_at = now(), rejection_note = :note
                     WHERE id = :vid RETURNING *
                 """),
-                {"approver": claims.get("sub"), "vid": str(version_id), "note": body.note},
+                {"approver": checker_id, "vid": str(version_id), "note": body.note},
             ))
             event_type = "doc_template_version.rejected"
 
@@ -514,6 +542,7 @@ async def generate_document(
     institution_id = _institution_id(claims)
 
     with service_session() as conn:
+        generator_id = _member_id(conn, claims)
         template = _one(conn.execute(
             text("SELECT * FROM institution.doc_template WHERE id = :id AND institution_id = :iid"),
             {"id": str(template_id), "iid": institution_id},
@@ -550,7 +579,7 @@ async def generate_document(
                 "etype": body.entity_type, "eid": str(body.entity_id),
                 "sid": str(body.stage_instance_id) if body.stage_instance_id else None,
                 "snap": json.dumps(context, default=str),
-                "generator": claims.get("sub"),
+                "generator": generator_id,
             },
         ))
         conn.commit()
