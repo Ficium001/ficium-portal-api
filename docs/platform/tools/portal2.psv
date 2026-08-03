@@ -1,0 +1,141 @@
+marketplace|acceptance|id|uuid|N|gen_random_uuid()|PK
+marketplace|acceptance|request_id|uuid|N||FK marketplace.request
+marketplace|acceptance|bid_id|uuid|N||FK marketplace.bid
+marketplace|acceptance|accepted_by_consumer|uuid|N||
+marketplace|acceptance|acceptance_method|text|N|'app'|
+marketplace|acceptance|terms_version|text|Y||
+marketplace|acceptance|ip|inet|Y||
+marketplace|acceptance|metadata|jsonb|N|'{}'|
+marketplace|acceptance|accepted_at|timestamptz|N|now()|
+marketplace|bid|id|uuid|N|gen_random_uuid()|PK
+marketplace|bid|request_id|uuid|N||FK marketplace.request
+marketplace|bid|institution_id|uuid|N||FK institution.institution
+marketplace|bid|submitted_by|uuid|Y||FK institution.member
+marketplace|bid|rate|numeric(8,4)|N||
+marketplace|bid|rate_type|text|N|'fixed'|
+marketplace|bid|rate_valid_days|integer|Y||
+marketplace|bid|amount_offered|numeric(20,6)|N||
+marketplace|bid|term_months|integer|N||
+marketplace|bid|conditions|jsonb|N|'{}'|
+marketplace|bid|fee_structure|jsonb|N|'{}'|
+marketplace|bid|status|text|N|'submitted'|
+marketplace|bid|submitted_via|text|N|'portal'|portal / api / autobid
+marketplace|bid|submitted_at|timestamptz|N|now()|
+marketplace|bid|expires_at|timestamptz|Y||
+marketplace|bid|withdrawn_at|timestamptz|Y||
+marketplace|bid|withdraw_reason|text|Y||
+marketplace|bid|rejected_at|timestamptz|Y||
+marketplace|bid|rejection_reason|text|Y||
+marketplace|bid|response_time_ms|integer|Y||
+marketplace|bid|idempotency_key|text|Y||
+marketplace|bid|metadata|jsonb|N|'{}'|
+marketplace|bid|created_at|timestamptz|N|now()|
+marketplace|bid|updated_at|timestamptz|N|now()|
+marketplace|bid_acceptance|id|uuid|N|gen_random_uuid()|PK
+marketplace|bid_acceptance|request_id|uuid|N||FK marketplace.request
+marketplace|bid_acceptance|bid_id|uuid|N||FK marketplace.bid
+marketplace|bid_acceptance|institution_id|uuid|N||
+marketplace|bid_acceptance|full_name|text|N||PHASE 2 identity reveal
+marketplace|bid_acceptance|email|text|N||PHASE 2
+marketplace|bid_acceptance|phone|text|Y||PHASE 2
+marketplace|bid_acceptance|address|text|Y||PHASE 2
+marketplace|bid_acceptance|date_of_birth|date|Y||PHASE 2
+marketplace|bid_acceptance|document_number|text|Y||PHASE 2
+marketplace|bid_acceptance|revealed_at|timestamptz|N|now()|
+marketplace|bid_allocation|id|uuid|N|gen_random_uuid()|PK
+marketplace|bid_allocation|bid_id|uuid|N||FK marketplace.bid
+marketplace|bid_allocation|product_id|uuid|N||FK catalog.product
+marketplace|bid_allocation|amount_offered|numeric|N||
+marketplace|bid_allocation|rate|numeric|Y||
+marketplace|bid_allocation|term_months|integer|Y||
+marketplace|bid_allocation|created_at|timestamptz|N|now()|
+marketplace|bid_benefit|id|uuid|N|gen_random_uuid()|PK
+marketplace|bid_benefit|bid_id|uuid|N||FK marketplace.bid
+marketplace|bid_benefit|benefit_id|uuid|N||FK institution.benefit
+marketplace|bid_benefit|title|text|N||snapshot at bid time
+marketplace|bid_benefit|description|text|Y||
+marketplace|bid_benefit|value_display|text|Y||
+marketplace|bid_benefit|is_guaranteed|boolean|N||
+marketplace|bid_benefit|cat_code|text|N||
+marketplace|bid_event|id|uuid|N|gen_random_uuid()|PK
+marketplace|bid_event|bid_id|uuid|N||FK marketplace.bid
+marketplace|bid_event|from_status|text|Y||
+marketplace|bid_event|to_status|text|N||
+marketplace|bid_event|actor_id|uuid|Y||
+marketplace|bid_event|actor_type|text|N|'system'|
+marketplace|bid_event|reason|text|Y||
+marketplace|bid_event|metadata|jsonb|N|'{}'|
+marketplace|bid_event|occurred_at|timestamptz|N|now()|append-only
+marketplace|loan_pipeline|id|uuid|N|gen_random_uuid()|PK
+marketplace|loan_pipeline|request_id|uuid|N||FK marketplace.request
+marketplace|loan_pipeline|bid_id|uuid|N||FK marketplace.bid
+marketplace|loan_pipeline|institution_id|uuid|N||
+marketplace|loan_pipeline|consumer_id|uuid|N||
+marketplace|loan_pipeline|template_id|uuid|N||FK institution.pipeline_template
+marketplace|loan_pipeline|current_stage_id|uuid|Y||FK marketplace.pipeline_stage_instance
+marketplace|loan_pipeline|status|pipeline_status_enum|N|'active'|
+marketplace|loan_pipeline|deal_amount|numeric(15,2)|N||
+marketplace|loan_pipeline|deal_rate|numeric(6,4)|N||
+marketplace|loan_pipeline|deal_term_months|integer|N||
+marketplace|loan_pipeline|started_at|timestamptz|N|now()|
+marketplace|loan_pipeline|completed_at|timestamptz|Y||
+marketplace|loan_pipeline|created_at|timestamptz|N|now()|
+marketplace|loan_pipeline|updated_at|timestamptz|N|now()|
+marketplace|pipeline_stage_instance|id|uuid|N|gen_random_uuid()|PK
+marketplace|pipeline_stage_instance|pipeline_id|uuid|N||FK marketplace.loan_pipeline
+marketplace|pipeline_stage_instance|stage_def_id|uuid|N||FK institution.pipeline_stage_def
+marketplace|pipeline_stage_instance|position|smallint|N||
+marketplace|pipeline_stage_instance|status|stage_status_enum|N|'pending'|
+marketplace|pipeline_stage_instance|submitted_by|uuid|Y||maker
+marketplace|pipeline_stage_instance|submitted_at|timestamptz|Y||
+marketplace|pipeline_stage_instance|approved_by|uuid|Y||checker
+marketplace|pipeline_stage_instance|approved_at|timestamptz|Y||
+marketplace|pipeline_stage_instance|rejection_reason|text|Y||
+marketplace|pipeline_stage_instance|notes|text|Y||
+marketplace|pipeline_stage_instance|documents|jsonb|Y|'[]'|
+marketplace|pipeline_stage_instance|started_at|timestamptz|Y||
+marketplace|pipeline_stage_instance|sla_due_at|timestamptz|Y||
+marketplace|pipeline_stage_instance|completed_at|timestamptz|Y||
+marketplace|pipeline_stage_instance|created_at|timestamptz|N|now()|
+marketplace|pipeline_stage_instance|updated_at|timestamptz|N|now()|
+marketplace|request|id|uuid|N|gen_random_uuid()|PK
+marketplace|request|consumer_id|uuid|N||opaque; App DB client id
+marketplace|request|consumer_ref|text|Y||anonymised display ref
+marketplace|request|product_id|uuid|N||FK catalog.product
+marketplace|request|country|char(2)|N|'MU'|FK catalog.country
+marketplace|request|currency|char(3)|N|'MUR'|FK catalog.currency
+marketplace|request|amount|numeric(20,6)|N||
+marketplace|request|term_months|integer|N||
+marketplace|request|params|jsonb|N|'{}'|
+marketplace|request|metadata|jsonb|N|'{}'|phase1 payload incl. investment_profile
+marketplace|request|status|text|N|'open'|
+marketplace|request|bid_window_opens_at|timestamptz|N|now()|
+marketplace|request|bid_window_closes_at|timestamptz|N|now()+4h|
+marketplace|request|auto_close_at|timestamptz|Y||
+marketplace|request|winning_bid_id|uuid|Y||FK marketplace.bid
+marketplace|request|accepted_at|timestamptz|Y||
+marketplace|request|cancelled_at|timestamptz|Y||
+marketplace|request|cancellation_reason|text|Y||
+marketplace|request|idempotency_key|text|N||dedupes App DB ingest
+marketplace|request|source|text|N|'app'|
+marketplace|request|relist_count|smallint|N|0|
+marketplace|request|relisted_from|uuid|Y||FK marketplace.request
+marketplace|request|notified_at|timestamptz|Y||
+marketplace|request|ficium_risk_tier|text|Y||from rating engine
+marketplace|request|ficium_score|numeric(6,2)|Y||from rating engine
+marketplace|request|allocation_mode|text|Y||single / basket
+marketplace|request|created_at|timestamptz|N|now()|
+marketplace|request|updated_at|timestamptz|N|now()|
+marketplace|request_allocation|id|uuid|N|gen_random_uuid()|PK
+marketplace|request_allocation|request_id|uuid|N||FK marketplace.request
+marketplace|request_allocation|product_id|uuid|N||FK catalog.product
+marketplace|request_allocation|amount|numeric|Y||
+marketplace|request_allocation|sort_order|integer|N|0|
+marketplace|request_allocation|created_at|timestamptz|N|now()|
+marketplace|sync_state|id|smallint|N|1|PK singleton row
+marketplace|sync_state|last_updated_at|timestamptz|N|epoch|keyset cursor part 1
+marketplace|sync_state|last_id|uuid|N|uuid-zero|keyset cursor part 2 (tie-break)
+marketplace|sync_state|last_run_at|timestamptz|Y||
+marketplace|sync_state|last_run_pulled|integer|N|0|
+marketplace|sync_state|last_run_synced|integer|N|0|
+marketplace|sync_state|last_run_failed|integer|N|0|
