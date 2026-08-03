@@ -17,14 +17,12 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 from datetime import date
 from pathlib import Path
 from uuid import UUID
 
-import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import text
@@ -32,6 +30,8 @@ from sqlalchemy.orm import Session
 
 from ...core.db import service_session
 from ...core.roles import INSTITUTION_ADMIN_ROLES
+from ...core.storage import storage_download as _storage_download
+from ...core.storage import storage_upload as _storage_upload
 from ...deps import current_claims, require_module, tenant_conn
 from . import merge_engine
 from .schemas import (
@@ -46,7 +46,6 @@ from .schemas import (
 )
 
 MODULE_KEY = "inst:doctemplates"
-_BUCKET = "institution-docs"
 _PREFIX = "doc-templates"
 ALLOWED_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -166,38 +165,6 @@ def _audit(
         )
     except Exception:
         pass  # audit is best-effort; core action already committed
-
-
-# ── Supabase Storage helpers (same pattern as esign.py) ─────────────────────
-
-async def _storage_upload(path: str, data: bytes, content_type: str) -> None:
-    url = os.environ["PORTAL_SUPABASE_URL"]
-    key = os.environ["PORTAL_SUPABASE_SERVICE_KEY"]
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{url}/storage/v1/object/{_BUCKET}/{path}",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": content_type,
-                "x-upsert": "true",
-            },
-            content=data,
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail="Could not store document.")
-
-
-async def _storage_download(path: str) -> bytes:
-    url = os.environ["PORTAL_SUPABASE_URL"]
-    key = os.environ["PORTAL_SUPABASE_SERVICE_KEY"]
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{url}/storage/v1/object/{_BUCKET}/{path}",
-            headers={"Authorization": f"Bearer {key}"},
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Could not fetch document.")
-    return resp.content
 
 
 # ---------------------------------------------------------------------------

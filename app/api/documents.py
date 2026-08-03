@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from ..core.db import service_session
 from ..core.roles import INSTITUTION_ADMIN_ROLES
+from ..core.storage import storage_signed_upload_url
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -259,26 +260,10 @@ async def get_upload_url(
     _require_module(claims)
     institution_id = _institution_id(claims)
 
-    import os
     import uuid as _uuid
 
-    import httpx
     file_name   = body.get("file_name", "file")
     ext         = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "bin"
     object_name = f"{institution_id}/{body.get('doc_type_id', 'misc')}/{_uuid.uuid4()}.{ext}"
 
-    supabase_url = os.environ["PORTAL_SUPABASE_URL"]
-    service_key  = os.environ["PORTAL_SUPABASE_SERVICE_KEY"]
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{supabase_url}/storage/v1/object/upload/sign/institution-docs/{object_name}",
-            headers={"Authorization": f"Bearer {service_key}", "Content-Type": "application/json"},
-            json={"upsert": True},
-        )
-        if resp.status_code not in (200, 201):
-            raise HTTPException(status_code=502, detail="Could not generate upload URL.")
-        data = resp.json()
-
-    signed_url = f"{supabase_url}/storage/v1{data['url']}"
-    return {"upload_url": signed_url, "storage_path": object_name}
+    return await storage_signed_upload_url(object_name)

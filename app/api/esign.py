@@ -36,6 +36,9 @@ from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
+from ..core.storage import storage_download as _storage_download
+from ..core.storage import storage_signed_url as _storage_signed_url
+from ..core.storage import storage_upload as _storage_upload
 from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
 
@@ -64,7 +67,6 @@ log = structlog.get_logger()
 router = APIRouter(prefix="/esign", tags=["esign"])
 
 MODULE_KEY = "inst:esign"
-_BUCKET = "institution-docs"
 OTP_TTL_MIN = 10
 OTP_MAX_ATTEMPTS = 5
 
@@ -97,50 +99,6 @@ def _otp_hash(otp: str) -> str:
 def _new_token() -> tuple[str, str]:
     raw = f"fic_sign_{secrets.token_hex(32)}"
     return raw, hashlib.sha256(raw.encode()).hexdigest()
-
-
-async def _storage_download(path: str) -> bytes:
-    url = os.environ["PORTAL_SUPABASE_URL"]
-    key = os.environ["PORTAL_SUPABASE_SERVICE_KEY"]
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{url}/storage/v1/object/{_BUCKET}/{path}",
-            headers={"Authorization": f"Bearer {key}"},
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Could not fetch document.")
-    return resp.content
-
-
-async def _storage_upload(path: str, data: bytes, content_type: str) -> None:
-    url = os.environ["PORTAL_SUPABASE_URL"]
-    key = os.environ["PORTAL_SUPABASE_SERVICE_KEY"]
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{url}/storage/v1/object/{_BUCKET}/{path}",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": content_type,
-                "x-upsert": "true",
-            },
-            content=data,
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail="Could not store sealed document.")
-
-
-async def _storage_signed_url(path: str, expires_in: int = 600) -> str:
-    url = os.environ["PORTAL_SUPABASE_URL"]
-    key = os.environ["PORTAL_SUPABASE_SERVICE_KEY"]
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{url}/storage/v1/object/sign/{_BUCKET}/{path}",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"expiresIn": expires_in},
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Could not sign document URL.")
-    return f"{url}/storage/v1{resp.json()['signedURL']}"
 
 
 async def _send_email(to: str, subject: str, html: str) -> None:
