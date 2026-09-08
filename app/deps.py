@@ -29,6 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .core.api_keys import ApiKeyError, verify_api_key
+from .core.app_auth import AppAuthError, verify_app_user
 from .core.db import service_session, tenant_session
 from .core.security import TokenError, verify_token
 
@@ -93,6 +94,23 @@ def api_key_conn(
     """
     with service_session() as session:
         yield session
+
+
+# ---------------------------------------------------------------------------
+# Ficium App (borrower) authentication
+# Third auth path, distinct from ficium-auth JWT and API keys above — see
+# core/app_auth.py for why this can't reuse current_claims().
+# ---------------------------------------------------------------------------
+
+async def current_app_user(authorization: str = Header(default="")) -> dict[str, Any]:
+    """Verify a Ficium App borrower session token; return the GoTrue user record or 401."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    token = authorization[7:].strip()
+    try:
+        return await verify_app_user(token)
+    except AppAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
 
 
 # ---------------------------------------------------------------------------

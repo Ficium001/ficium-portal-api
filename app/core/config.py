@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # Optional: if empty, marketplace endpoints return 503 rather than 500.
     app_database_url:    str = Field(default="", description="Ficium App Postgres DSN")
 
+    # Ficium App's Supabase project (for verifying borrower session tokens via
+    # GoTrue introspection — see core/app_auth.py). Different signer than
+    # ficium-auth, so this is a separate trust path, not an extension of
+    # auth_jwks_url above. anon key only — never the service_role key.
+    app_supabase_url:      str = Field(default="", description="Ficium App Supabase project URL")
+    app_supabase_anon_key: str = Field(default="", description="Ficium App Supabase anon key")
+
     @field_validator("database_url", "app_database_url", mode="before")
     @classmethod
     def normalize_db_url(cls, v: str) -> str:
@@ -52,8 +59,8 @@ class Settings(BaseSettings):
     app_service_secret: str = Field(default="", description="X-Service-Secret for s2s calls")
 
     # ── CORS ──────────────────────────────────────────────────
-    allowed_origins:      str = "https://ficium-portal.vercel.app,https://portal.ficium.net"
-    allowed_origin_regex: str = r"^https://(ficium-portal[a-z0-9.\-]*\.vercel\.app|[a-z0-9.\-]*\.ficium\.net)$"
+    allowed_origins:      str = "https://ficium-portal.vercel.app,https://portal.ficium.net,https://ficium.vercel.app"
+    allowed_origin_regex: str = r"^https://(ficium-portal[a-z0-9.\-]*\.vercel\.app|ficium[a-z0-9.\-]*\.vercel\.app|[a-z0-9.\-]*\.ficium\.net)$"
 
     # ── Deployment ────────────────────────────────────────────
     deployment_model: str = "saas"

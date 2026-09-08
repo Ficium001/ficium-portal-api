@@ -20,6 +20,7 @@ from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
 from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
+from .api.borrower_portfolio import router as borrower_portfolio_router
 from .api.catalog import router as catalog_router
 from .api.doc_templates.router import router as doc_templates_router
 from .api.documents import router as documents_router
@@ -136,6 +137,7 @@ app.include_router(approval_engine_router)  # configurable chains (inst:approval
 app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
+app.include_router(borrower_portfolio_router)  # borrower-facing facilities (App-authenticated)
 app.include_router(request_chat_router)  # per-lender request chat (proxies App DB)
 app.include_router(entitlements_router)  # module packaging (plat:billing)
 app.include_router(autobid_router)  # auto-bid rules engine (inst:autobid)
