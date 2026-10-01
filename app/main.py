@@ -2,6 +2,7 @@
 # ficium-portal-api — Application entrypoint
 # =============================================================================
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import structlog
@@ -28,6 +29,7 @@ from .api.entitlements import router as entitlements_router
 from .api.esign import router as esign_router
 from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
+from .api.integration import router as integration_router
 from .api.marketplace import router as marketplace_router
 from .api.members import router as members_router
 from .api.notifications import router as notifications_router
@@ -46,6 +48,7 @@ from .core.observability import (
 )
 from .core.ratelimit import limiter
 from .core.response_headers import DefaultResponseHeadersMiddleware
+from .integration import dispatcher as integration_dispatcher
 
 configure_logging(env=settings.env, level=settings.log_level)
 log = structlog.get_logger()
@@ -55,8 +58,16 @@ log = structlog.get_logger()
 async def lifespan(app: FastAPI):
     log.info("portal_api_starting", env=settings.env, model=settings.deployment_model)
     init_pool()
-    log.info("portal_api_ready")
+    stop = asyncio.Event()
+    dispatcher: asyncio.Task[None] | None = None
+    if settings.integration_outbound_enabled:
+        dispatcher = asyncio.create_task(integration_dispatcher.run_forever(stop))
+    log.info("portal_api_ready", integration_outbound=settings.integration_outbound_enabled,
+             integration_inbound=bool(settings.integration_inbound_keys))
     yield
+    stop.set()
+    if dispatcher is not None:
+        await dispatcher
     close_pool()
     log.info("portal_api_stopped")
 
@@ -153,3 +164,4 @@ app.include_router(public_router)       # server-to-server, no JWT
 app.include_router(api_keys_router)     # institution API key management
 app.include_router(webhooks_router)     # webhook CRUD + delivery log
 app.include_router(v1_marketplace_router)  # /v1/ versioned public API
+app.include_router(integration_router)     # contract v1 inbound events (signed, B2I)

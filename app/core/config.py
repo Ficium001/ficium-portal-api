@@ -58,6 +58,27 @@ class Settings(BaseSettings):
     # Set APP_SERVICE_SECRET to the same value in both services.
     app_service_secret: str = Field(default="", description="X-Service-Secret for s2s calls")
 
+    # ── Integration contract v1 (ficium-contract) ─────────────
+    # Inbound: borrower -> institution events, verified with B2I keys.
+    # Comma-separated so a rotation can accept old and new keys at once.
+    integration_b2i_verify_keys: str = Field(
+        default="", description="B2I_SIGNING_KEY(s), comma-separated"
+    )
+    # Outbound: institution -> borrower events, signed with the I2B key and
+    # POSTed to the borrower side's inbound endpoint.
+    integration_i2b_signing_key: str = Field(default="", description="I2B_SIGNING_KEY")
+    integration_peer_url: str = Field(default="", description="Borrower side inbound events URL")
+    integration_dispatch_interval_s: float = 10.0
+
+    @property
+    def integration_inbound_keys(self) -> list[bytes]:
+        raw = self.integration_b2i_verify_keys.split(",")
+        return [k.strip().encode() for k in raw if k.strip()]
+
+    @property
+    def integration_outbound_enabled(self) -> bool:
+        return bool(self.integration_i2b_signing_key and self.integration_peer_url)
+
     # ── CORS ──────────────────────────────────────────────────
     allowed_origins:      str = "https://ficium-portal.vercel.app,https://portal.ficium.net,https://ficium.vercel.app"
     allowed_origin_regex: str = r"^https://(ficium-portal[a-z0-9.\-]*\.vercel\.app|ficium[a-z0-9.\-]*\.vercel\.app|[a-z0-9.\-]*\.ficium\.net)$"
