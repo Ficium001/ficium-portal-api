@@ -40,6 +40,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `009_doc_templates.sql` | Document template designer: templates, versions, generations | Yes | ✅ (tables existed; the `authenticated` GRANTs were missing — fixed separately Aug 3 2026) |
 | `009_entitlements.sql` | Module entitlement & metered-usage layer (`entitlements` schema) | Yes | ✅ (applied Aug 3 2026 — was missing) |
 | `010_autobid.sql` | Auto-bid rules engine (`autobid` schema) | Yes | ✅ (applied Aug 3 2026 — was missing) |
+| `011_integration.sql` | Integration contract v1: `integration` schema — outbox, inbox, delivery state. No client-role access; portal-api (as `postgres`) only | Yes | ✅ (applied Oct 1 2026 with smoke test; anon/authenticated/service_role verified to have no access) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
