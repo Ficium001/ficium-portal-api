@@ -104,10 +104,55 @@ def test_events_from_institution_side_rejected(client):
 
 
 def test_unhandled_type_not_recorded_so_sender_retries(client):
-    env = json.load(open("tests/fixtures/request-published.json"))
-    r = post(client, env)
+    # a borrower-side type with no handler yet: 501 and NOT recorded, so the sender retries
+    r = post(client, json.load(open("tests/fixtures/chat-from-borrower.json")))
     assert r.status_code == 501
     assert client.recorded == []
+
+
+def test_institution_side_events_are_refused(client):
+    r = post(client, json.load(open("tests/fixtures/bid-placed.json")))
+    assert r.status_code == 403
+    assert client.recorded == []
+
+
+def test_request_published_is_accepted_and_recorded(client):
+    r = post(client, json.load(open("tests/fixtures/request-published.json")))
+    assert r.status_code == 200, r.text
+    assert len(client.recorded) == 1 and client.recorded[0]["type"] == "request.published"
+
+
+def test_request_with_an_employer_name_is_rejected_by_the_contract(client):
+    env = json.load(open("tests/fixtures/request-published.json"))
+    env["data"]["phase1"]["employer"] = "Example Ltd"
+    r = post(client, env)
+    assert r.status_code == 422
+    assert client.recorded == []
+
+
+class _Rec:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def execute(self, stmt, params=None):
+        self.calls.append((" ".join(str(stmt).split()), params or {}))
+
+
+@pytest.mark.parametrize(
+    ("etype", "fn"),
+    [
+        ("request.published", "apply_request_published"),
+        ("request.status_changed", "apply_request_status_changed"),
+    ],
+)
+def test_request_handlers_call_the_matching_sql_function(etype, fn):
+    from app.api import integration as api
+
+    rec = _Rec()
+    env = {"id": "evt_0123456789abcdef", "type": etype, "sequence": 3, "data": {"request_id": "r"}}
+    api.HANDLERS[etype](rec, env)
+    assert len(rec.calls) == 1 and f"integration.{fn}(" in rec.calls[0][0]
+    assert json.loads(rec.calls[0][1]["e"]) == env
 
 
 def test_disabled_without_keys(client, monkeypatch):

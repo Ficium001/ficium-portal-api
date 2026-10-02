@@ -36,8 +36,26 @@ def _handle_ping(session: Session, envelope: dict[str, Any]) -> None:
     log.info("integration_ping_received", event_id=envelope["id"], sequence=envelope["sequence"])
 
 
+def _handle_request_published(session: Session, envelope: dict[str, Any]) -> None:
+    """Step 3 (shadow mode): store what the borrower side published. Nothing live reads this yet;
+    integration.v_request_parity compares it with marketplace.request."""
+    session.execute(
+        text("SELECT integration.apply_request_published(CAST(:e AS jsonb))"),
+        {"e": json.dumps(envelope)},
+    )
+
+
+def _handle_request_status_changed(session: Session, envelope: dict[str, Any]) -> None:
+    session.execute(
+        text("SELECT integration.apply_request_status_changed(CAST(:e AS jsonb))"),
+        {"e": json.dumps(envelope)},
+    )
+
+
 HANDLERS: dict[str, Handler] = {
     "ping": _handle_ping,
+    "request.published": _handle_request_published,
+    "request.status_changed": _handle_request_status_changed,
 }
 
 

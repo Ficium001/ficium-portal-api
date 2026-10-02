@@ -1,0 +1,36 @@
+{
+  "id": "evt_01J9FIXTURE0001",
+  "type": "bid.placed",
+  "version": 1,
+  "source": "institution",
+  "occurred_at": "2026-10-01T09:14:03Z",
+  "aggregate_id": "00000000-0000-4000-8000-000000000010",
+  "sequence": 1,
+  "data": {
+    "bid_id": "00000000-0000-4000-8000-000000000010",
+    "request_id": "00000000-0000-4000-8000-000000000001",
+    "institution_id": "00000000-0000-4000-8000-000000000020",
+    "institution_name": "MCB",
+    "institution_logo_url": null,
+    "status": "submitted",
+    "rate": 0.0425,
+    "rate_type": "fixed",
+    "rate_valid_days": 30,
+    "amount_offered": 3000000,
+    "currency": "MUR",
+    "term_months": 240,
+    "conditions": {},
+    "fee_structure": {},
+    "benefits": [
+      {
+        "title": "No processing fee",
+        "value_display": null,
+        "is_guaranteed": true,
+        "cat_code": null
+      }
+    ],
+    "allocations": [],
+    "submitted_at": "2026-10-02T10:00:00Z",
+    "expires_at": null
+  }
+}
