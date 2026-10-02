@@ -1,0 +1,19 @@
+{
+  "id": "evt_01J9FIXTURE0001",
+  "type": "chat.message",
+  "version": 1,
+  "source": "borrower",
+  "occurred_at": "2026-10-01T09:14:03Z",
+  "aggregate_id": "00000000-0000-4000-8000-000000000001",
+  "sequence": 1,
+  "data": {
+    "message_id": "00000000-0000-4000-8000-000000000030",
+    "request_id": "00000000-0000-4000-8000-000000000001",
+    "institution_id": "00000000-0000-4000-8000-000000000020",
+    "sender_side": "borrower",
+    "template_code": "ask_fees",
+    "params": {},
+    "body": "What fees apply?",
+    "sent_at": "2026-10-02T11:00:00Z"
+  }
+}

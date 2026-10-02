@@ -46,6 +46,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `014_member_login_sync_email.sql` | Trigger also mirrors member.email → auth_users.email (unique-violation → HTTP 409); lets portal-api stop writing auth_portal from tenant sessions | Yes | ✅ (applied Oct 2 2026; real-path trigger test + provisioning SQL verified on live schema, rolled back) |
 | `015_auth_portal_authenticated_least_privilege.sql` | `authenticated` loses all write grants on `auth_portal`; keeps only `auth_users(id, is_active)` for the member-list join | Yes | ✅ (applied Oct 2 2026 after the portal-api fix deployed; denials + join verified) |
 | `016_drop_employer_from_marketplace_request.sql` | Scrubs `metadata.employer` (12 rows) and adds a guard trigger so it can never be stored again | Yes | ✅ (applied Oct 2 2026; history fingerprint unchanged) |
+| `017_integration_request_shadow_and_ordered_claim.sql` | Ordered per-aggregate delivery fix; `integration.request_shadow` + parity views (step 3, shadow mode, nothing live reads it) | Yes | ✅ (applied Oct 2 2026; replayed the 13 live requests: 12 match, 1 real drift found) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
