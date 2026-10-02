@@ -41,6 +41,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `009_entitlements.sql` | Module entitlement & metered-usage layer (`entitlements` schema) | Yes | ✅ (applied Aug 3 2026 — was missing) |
 | `010_autobid.sql` | Auto-bid rules engine (`autobid` schema) | Yes | ✅ (applied Aug 3 2026 — was missing) |
 | `011_integration.sql` | Integration contract v1: `integration` schema — outbox, inbox, delivery state. No client-role access; portal-api (as `postgres`) only | Yes | ✅ (applied Oct 1 2026 with smoke test; anon/authenticated/service_role verified to have no access) |
+| `012_security_lockdown_exposed_functions.sql` | Revokes anonymous (and unneeded signed-in) EXECUTE on 53 SECURITY DEFINER functions in the exposed schemas; aborts unless exact counts match | Yes | ✅ (applied Oct 2 2026; 93/93 tables still readable; get_admin_metrics 200 → 401 over HTTPS) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
