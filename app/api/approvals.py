@@ -15,8 +15,10 @@ import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..core.db import service_session
 from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
@@ -326,23 +328,17 @@ async def execute_user_update(
     if field not in allowed_fields:
         raise HTTPException(status_code=400, detail=f"Invalid field '{field}'.")
 
-    # Apply to institution.member
-    conn.execute(
-        text(f"UPDATE institution.member SET {field} = :value, updated_at = now() WHERE id = :mid"),
-        {"value": value, "mid": member_id},
-    )
-
-    # If email, also update auth_portal.auth_users
-    if field == "email":
-        member = conn.execute(
-            text("SELECT auth_user_id FROM institution.member WHERE id = :mid"),
-            {"mid": member_id},
-        ).fetchone()
-        if member and member.auth_user_id:
-            conn.execute(
-                text("UPDATE auth_portal.auth_users SET email = :value, updated_at = now() WHERE id = :uid"),
-                {"value": value, "uid": str(member.auth_user_id)},
-            )
+    # Apply to institution.member. For field == "email" the login row (auth_portal.auth_users)
+    # follows in the same transaction via the trigger institution.sync_member_login_state;
+    # tenant sessions cannot touch auth_portal themselves (RLS, no policies).
+    try:
+        conn.execute(
+            text(f"UPDATE institution.member SET {field} = :value, updated_at = now() WHERE id = :mid"),
+            {"value": value, "mid": member_id},
+        )
+    except IntegrityError:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="That email is already used by another login.") from None
 
     conn.execute(
         text("UPDATE governance.action SET execution_status = 'executed', executed_at = now() WHERE id = :aid"),
@@ -406,86 +402,68 @@ async def provision_user_from_action(
     if not custom_group_id:
         raise HTTPException(status_code=400, detail="No custom_group_id in action payload.")
 
-    # 2. Idempotency — if auth_portal entry already exists, return early
-    existing = conn.execute(
-        text("SELECT id FROM auth_portal.auth_users WHERE email = :email LIMIT 1"),
-        {"email": email},
-    ).fetchone()
-    if existing:
-        # Also ensure member row exists
-        member_exists = conn.execute(
-            text("SELECT id FROM institution.member WHERE auth_user_id = :uid AND institution_id = :iid LIMIT 1"),
-            {"uid": str(existing.id), "iid": institution_id},
-        ).fetchone()
-        if not member_exists:
-            conn.execute(
-                text("""
-                    INSERT INTO institution.member
-                        (institution_id, auth_user_id, email, full_name, role,
-                         is_primary_admin, active, custom_group_id, member_role,
-                         group_id, system_group_id)
-                    VALUES (:iid, :uid, :email, :full_name, 'member',
-                            false, true, :cgid, :mrole,
-                            (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
-                            (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1))
-                """),
-                {"iid": institution_id, "uid": str(existing.id), "email": email,
-                 "full_name": full_name, "cgid": custom_group_id, "mrole": member_role},
-            )
-            conn.commit()
-        return {"ok": True, "created": False, "message": "User already provisioned."}
-
-    # 3. Generate a secure temp password
+    # 2. Everything below touches auth_portal, which tenant sessions can neither read nor write
+    #    (RLS with no policies), so it runs in ONE privileged transaction. Authorisation is already
+    #    established above: the action was loaded through the caller's tenant session, so it belongs
+    #    to the caller's institution and is approved.
     alphabet    = string.ascii_letters + string.digits + "!@#$%"
     temp_password = "".join(secrets.choice(alphabet) for _ in range(16))
-
     hasher = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=4, hash_len=32, salt_len=16)
     pw_hash = hasher.hash(temp_password)
 
-    # 4. Create auth_portal.auth_users
-    new_user = conn.execute(
-        text("""
-            INSERT INTO auth_portal.auth_users
-                (institution_id, email, username, role, password_hash, is_active,
-                 email_verified, created_at, updated_at)
-            VALUES (:iid, :email, :username, 'institution_member', :pw, true,
-                    true, now(), now())
-            RETURNING id
-        """),
-        {"iid": institution_id, "email": email, "username": username, "pw": pw_hash},
-    ).fetchone()
+    insert_member = text("""
+        INSERT INTO institution.member
+            (institution_id, auth_user_id, email, full_name, role,
+             is_primary_admin, active, custom_group_id, member_role,
+             group_id, system_group_id)
+        VALUES (:iid, :uid, :email, :full_name, 'member',
+                false, true, :cgid, :mrole,
+                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
+                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1))
+    """)
+    member_params = {"iid": institution_id, "email": email, "full_name": full_name,
+                     "cgid": custom_group_id, "mrole": member_role}
 
-    if new_user is None:
-        raise HTTPException(status_code=500, detail="Auth user record could not be created.")
-    new_user_id = str(new_user.id)
+    try:
+        with service_session() as svc:
+            # Idempotency: an existing login for this email is reused ONLY inside this institution.
+            existing = svc.execute(
+                text("SELECT id, institution_id FROM auth_portal.auth_users WHERE email = :email LIMIT 1"),
+                {"email": email},
+            ).fetchone()
+            if existing is not None:
+                if str(existing.institution_id) != institution_id:
+                    raise HTTPException(status_code=409, detail="That email is already registered to another institution.")
+                member_exists = svc.execute(
+                    text("SELECT id FROM institution.member WHERE auth_user_id = :uid AND institution_id = :iid LIMIT 1"),
+                    {"uid": str(existing.id), "iid": institution_id},
+                ).fetchone()
+                if member_exists is None:
+                    svc.execute(insert_member, {**member_params, "uid": str(existing.id)})
+                return {"ok": True, "created": False, "message": "User already provisioned."}
 
-    # 5. Create institution.member
-    conn.execute(
-        text("""
-            INSERT INTO institution.member
-                (institution_id, auth_user_id, email, full_name, role,
-                 is_primary_admin, active, custom_group_id, member_role,
-                 group_id, system_group_id)
-            VALUES (:iid, :uid, :email, :full_name, 'member',
-                    false, true, :cgid, :mrole,
-                    (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
-                    (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1))
-        """),
-        {"iid": institution_id, "uid": new_user_id, "email": email,
-         "full_name": full_name, "cgid": custom_group_id, "mrole": member_role},
-    )
+            new_user = svc.execute(
+                text("""
+                    INSERT INTO auth_portal.auth_users
+                        (institution_id, email, username, role, password_hash, is_active,
+                         email_verified, created_at, updated_at)
+                    VALUES (:iid, :email, :username, 'institution_member', :pw, true,
+                            true, now(), now())
+                    RETURNING id
+                """),
+                {"iid": institution_id, "email": email, "username": username, "pw": pw_hash},
+            ).fetchone()
+            if new_user is None:
+                raise HTTPException(status_code=500, detail="Auth user record could not be created.")
+            new_user_id = str(new_user.id)
 
-    # 6. Mark execution_status as completed on the governance action
-    conn.execute(
-        text("""
-            UPDATE governance.action
-            SET execution_status = 'executed', executed_at = now()
-            WHERE id = :aid
-        """),
-        {"aid": action_id},
-    )
-
-    conn.commit()
+            svc.execute(insert_member, {**member_params, "uid": new_user_id})
+            svc.execute(
+                text("UPDATE governance.action SET execution_status = 'executed', executed_at = now() WHERE id = :aid"),
+                {"aid": action_id},
+            )
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="That username or email is already in use.") from None
 
     return {
         "ok": True,
