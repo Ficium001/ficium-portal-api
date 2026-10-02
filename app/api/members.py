@@ -10,6 +10,7 @@ import string
 from argon2 import PasswordHasher
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
@@ -284,11 +285,9 @@ async def update_member(
         updates["full_name"] = body["full_name"].strip()
     if "email" in body and body["email"]:
         new_email = body["email"].strip().lower()
-        # Update both institution.member and auth_portal.auth_users
-        conn.execute(
-            text("UPDATE auth_portal.auth_users SET email = :email, updated_at = now() WHERE id = :uid"),
-            {"email": new_email, "uid": str(row.auth_user_id)},
-        )
+        # The login row (auth_portal.auth_users) follows automatically: the trigger
+        # institution.sync_member_login_state mirrors member.email in the same transaction.
+        # (Tenant sessions cannot touch auth_portal: RLS, no policies.)
         updates["email"] = new_email
     if "member_role" in body and body["member_role"]:
         allowed_roles = {"maker", "checker", "viewer", "analyst"}
@@ -301,11 +300,16 @@ async def update_member(
 
     set_clause = ", ".join(f"{k} = :{k}" for k in updates)
     updates["mid"] = member_id
-    conn.execute(
-        text(f"UPDATE institution.member SET {set_clause}, updated_at = now() WHERE id = :mid"),
-        updates,
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            text(f"UPDATE institution.member SET {set_clause}, updated_at = now() WHERE id = :mid"),
+            updates,
+        )
+        conn.commit()
+    except IntegrityError:
+        # auth_users.email is unique; the sync trigger refuses an email another login already uses.
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="That email is already used by another login.") from None
     return {"ok": True, "updated": list(k for k in updates if k != "mid")}
 
 
@@ -318,7 +322,7 @@ async def deactivate_member(
 ) -> dict:
     """
     Deactivate a member — removes portal access immediately.
-    Sets active = false in institution.member and is_active = false in auth_portal.auth_users.
+    Sets active = false in institution.member; the DB trigger sets auth_users.is_active = false atomically.
     Cannot deactivate primary admin.
     """
     _require_institution_admin(claims)
@@ -332,15 +336,12 @@ async def deactivate_member(
     if row.is_primary_admin:
         raise HTTPException(status_code=403, detail="Primary admin cannot be deactivated.")
 
+    # The login row follows in the same transaction (trigger institution.sync_member_login_state);
+    # ficium-auth gates login and token refresh on auth_users.is_active.
     conn.execute(
         text("UPDATE institution.member SET active = false, updated_at = now() WHERE id = :mid"),
         {"mid": member_id},
     )
-    if row.auth_user_id:
-        conn.execute(
-            text("UPDATE auth_portal.auth_users SET is_active = false, updated_at = now() WHERE id = :uid"),
-            {"uid": str(row.auth_user_id)},
-        )
     conn.commit()
     return {"ok": True, "member_id": member_id, "status": "deactivated"}
 
@@ -365,11 +366,6 @@ async def reactivate_member(
         text("UPDATE institution.member SET active = true, updated_at = now() WHERE id = :mid"),
         {"mid": member_id},
     )
-    if row.auth_user_id:
-        conn.execute(
-            text("UPDATE auth_portal.auth_users SET is_active = true, updated_at = now() WHERE id = :uid"),
-            {"uid": str(row.auth_user_id)},
-        )
     conn.commit()
     return {"ok": True, "member_id": member_id, "status": "reactivated"}
 
