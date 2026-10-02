@@ -444,6 +444,8 @@ def _dsr(monthly_income, monthly_loan_payments, amount, term_months, parsed) -> 
     return dsr_current, dsr_post
 
 def _build_phase1(r, parsed: dict) -> dict:
+    # The employer name is deliberately NOT part of Phase 1 (decision 2026-10-02): in a market this
+    # small it identifies a borrower. It is neither selected nor sent; the Portal DB also strips it.
     income        = float(r.monthly_income or r.snap_income or 0) or None
     net_worth     = float(r.snap_net_worth or r.total_net_worth or 0) or None
     monthly_px    = float(r.monthly_loan_payments or 0) or None
@@ -458,8 +460,6 @@ def _build_phase1(r, parsed: dict) -> dict:
     except (TypeError, ValueError):
         pass
 
-    employer = r.emp_employer_name or r.dossier_employer
-
     phase1 = {
         "loan_purpose":               parsed.get("purpose"),
         "collateral_type":            col_type,
@@ -468,7 +468,6 @@ def _build_phase1(r, parsed: dict) -> dict:
         "kyc_verified":               r.kyc_status == "verified",
         "employment_status":          r.employment_status,
         "employment_type":            r.employment_type,
-        "employer":                   employer,
         "years_employed":             float(r.years_of_employment) if r.years_of_employment else None,
         "gross_monthly_income":       income,
         "income_verified":            r.kyc_status == "verified",
@@ -515,14 +514,12 @@ _ENRICH_SQL = """
         c.kyc_status,
         EXTRACT(YEAR FROM AGE(c.date_of_birth))::int AS client_age,
         cd.employment_status,
-        cd.employer_name            AS dossier_employer,
         cd.monthly_income,
         cd.total_net_worth,
         cd.has_existing_loans,
         cd.health_score,
         cd.risk_score,
         cd.affordability_score,
-        ed.employer_name            AS emp_employer_name,
         ed.employment_type,
         ed.years_of_employment,
         s.monthly_loan_payments,
