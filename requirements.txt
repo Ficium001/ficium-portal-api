@@ -14,4 +14,4 @@ reportlab==5.0.0
 pypdf==6.19.0
 docxtpl==0.20.2
 python-multipart==0.0.32
-ficium-contract @ https://github.com/Ficium001/ficium-contract/archive/refs/tags/v1.1.0.tar.gz
+ficium-contract @ https://github.com/Ficium001/ficium-contract/archive/refs/tags/v1.2.0.tar.gz
