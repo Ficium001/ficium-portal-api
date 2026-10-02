@@ -44,6 +44,8 @@ table below in the same change.** Don't let code and schema drift again.
 | `012_security_lockdown_exposed_functions.sql` | Revokes anonymous (and unneeded signed-in) EXECUTE on 53 SECURITY DEFINER functions in the exposed schemas; aborts unless exact counts match | Yes | ✅ (applied Oct 2 2026; 93/93 tables still readable; get_admin_metrics 200 → 401 over HTTPS) |
 | `013_member_login_sync_and_anon_table_lockdown.sql` | Trigger: member.active → auth_users.is_active (deactivation really blocks login); removes all `anon` grants on `auth_portal` tables + 2 public tables | Yes | ✅ (applied Oct 2 2026; real-path trigger test passed; 92/92 tables still readable; anon probes 200 → 401) |
 | `014_member_login_sync_email.sql` | Trigger also mirrors member.email → auth_users.email (unique-violation → HTTP 409); lets portal-api stop writing auth_portal from tenant sessions | Yes | ✅ (applied Oct 2 2026; real-path trigger test + provisioning SQL verified on live schema, rolled back) |
+| `015_auth_portal_authenticated_least_privilege.sql` | `authenticated` loses all write grants on `auth_portal`; keeps only `auth_users(id, is_active)` for the member-list join | Yes | ✅ (applied Oct 2 2026 after the portal-api fix deployed; denials + join verified) |
+| `016_drop_employer_from_marketplace_request.sql` | Scrubs `metadata.employer` (12 rows) and adds a guard trigger so it can never be stored again | Yes | ✅ (applied Oct 2 2026; history fingerprint unchanged) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
