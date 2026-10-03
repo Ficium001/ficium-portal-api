@@ -1,8 +1,8 @@
 """Scheduled maintenance that runs inside portal-api.
 
-Close expired bid windows every `maintenance_interval_s` seconds. Safe with several replicas: the work
-itself takes a transaction-scoped advisory lock (see marketplace.close_expired_once). OFF unless
-MAINTENANCE_CLOSE_EXPIRED_ENABLED=true.
+Close expired bid windows every `maintenance_interval_s` seconds. Safe with several replicas:
+the work itself takes a transaction-scoped advisory lock (see marketplace.close_expired_once).
+OFF unless MAINTENANCE_CLOSE_EXPIRED_ENABLED=true.
 """
 
 from __future__ import annotations
