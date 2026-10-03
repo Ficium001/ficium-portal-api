@@ -53,6 +53,24 @@ async def dispatch_once(client: httpx.AsyncClient, limit: int = 20) -> dict[str,
     counts = {"delivered": 0, "pending": 0, "dead": 0}
     rows = await asyncio.to_thread(_claim, limit)
     for event_id, envelope in rows:
+        # Never send anything that breaks the contract. Bid events are built in SQL, which
+        # cannot check the JSON Schema, so this is the gate (the borrower dispatcher has the
+        # same one). A violation is recorded like any other failure: retried with backoff,
+        # and it blocks later events of the same aggregate (ordered delivery).
+        try:
+            fc.validate_event(envelope)
+        except fc.ContractError as e:
+            reason = f"contract violation: {str(e)[:300]}"
+            outcome = await asyncio.to_thread(_mark, event_id, False, reason)
+            counts[outcome] = counts.get(outcome, 0) + 1
+            log.warning(
+                "integration_blocked_by_contract",
+                event_id=event_id,
+                type=envelope.get("type"),
+                outcome=outcome,
+                reason=reason,
+            )
+            continue
         body = encode(envelope)
         try:
             r = await client.post(

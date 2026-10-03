@@ -237,3 +237,45 @@ def test_enqueue_validates_what_the_db_built():
     assert enqueue(FakeSession(ok), "ping", "ping", {}) == ok  # type: ignore[arg-type]
     with pytest.raises(fc.ContractError):
         enqueue(FakeSession(ping(source="martian")), "ping", "ping", {})  # type: ignore[arg-type]
+
+
+async def test_dispatcher_never_sends_an_event_that_breaks_the_contract(monkeypatch):
+    from app.integration import dispatcher as d
+
+    bad = ping(source="institution")
+    bad["type"] = "bid.placed"  # a bid.placed with ping's empty data: invalid
+    marks: list[tuple[str, bool, str]] = []
+    monkeypatch.setattr(d.settings, "integration_i2b_signing_key", I2B)
+    monkeypatch.setattr(d.settings, "integration_peer_url", "https://borrower.test/api/integration")
+    monkeypatch.setattr(d, "_claim", lambda n: [(bad["id"], bad)])
+    monkeypatch.setattr(d, "_mark", lambda i, ok, e: marks.append((i, ok, e)) or "pending")
+    sent: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        counts = await d.dispatch_once(c)
+    assert sent == []  # nothing left the building
+    assert marks and marks[0][1] is False and marks[0][2].startswith("contract violation")
+    assert counts["pending"] == 1
+
+
+async def test_dispatcher_sends_a_real_bid_payload(monkeypatch):
+    from app.integration import dispatcher as d
+
+    env = json.load(open("tests/fixtures/bid-placed.json"))
+    monkeypatch.setattr(d.settings, "integration_i2b_signing_key", I2B)
+    monkeypatch.setattr(d.settings, "integration_peer_url", "https://borrower.test/api/integration")
+    monkeypatch.setattr(d, "_claim", lambda n: [(env["id"], env)])
+    monkeypatch.setattr(d, "_mark", lambda i, ok, e: "delivered" if ok else "pending")
+    sent: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        counts = await d.dispatch_once(c)
+    assert len(sent) == 1 and counts["delivered"] == 1
