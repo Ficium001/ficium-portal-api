@@ -47,6 +47,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `015_auth_portal_authenticated_least_privilege.sql` | `authenticated` loses all write grants on `auth_portal`; keeps only `auth_users(id, is_active)` for the member-list join | Yes | ✅ (applied Oct 2 2026 after the portal-api fix deployed; denials + join verified) |
 | `016_drop_employer_from_marketplace_request.sql` | Scrubs `metadata.employer` (12 rows) and adds a guard trigger so it can never be stored again | Yes | ✅ (applied Oct 2 2026; history fingerprint unchanged) |
 | `017_integration_request_shadow_and_ordered_claim.sql` | Ordered per-aggregate delivery fix; `integration.request_shadow` + parity views (step 3, shadow mode, nothing live reads it) | Yes | ✅ (applied Oct 2 2026; replayed the 13 live requests: 12 match, 1 real drift found) |
+| `018_integration_bid_publisher.sql` | Step 4 stage A: bid payload builder (== today's readback), catalog -> borrower product mapping, coalescing publisher, backfill. No trigger attached | Yes | ✅ (applied Oct 3 2026; payload == readback 2/2; contract-valid) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
