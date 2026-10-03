@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     integration_peer_url: str = Field(default="", description="Borrower side inbound events URL")
     integration_dispatch_interval_s: float = 10.0
 
+    # Step 5: the synchronous acceptance call (POST /integration/v1/acceptances). OFF by default.
+    # It has its OWN key, separate from the event keys, so a leaked event key cannot accept bids.
+    integration_acceptance_enabled: bool = False
+    integration_acceptance_verify_keys: str = Field(
+        default="", description="ACCEPT_SIGNING_KEY(s), comma-separated"
+    )
+
+    @property
+    def integration_acceptance_keys(self) -> list[bytes]:
+        raw = self.integration_acceptance_verify_keys.split(",")
+        return [k.strip().encode() for k in raw if k.strip()]
+
     # ── Scheduled maintenance inside the API (replaces the GitHub cron, which had no secret and
     #    only ran every 3-4 h). OFF by default: turning it on is an operator decision.
     maintenance_close_expired_enabled: bool = False
