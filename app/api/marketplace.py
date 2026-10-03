@@ -286,41 +286,52 @@ def _verify_service_secret(received: str) -> None:
     if not hmac.compare_digest(received.encode(), expected.encode()):
         raise HTTPException(status_code=403, detail="Invalid service secret.")
 
+# Stable id for the transaction-scoped advisory lock: only one caller (any replica, the scheduler
+# or this endpoint) closes windows at a time.
+_CLOSE_EXPIRED_LOCK_KEY = 7240011
+
+
+def close_expired_once() -> dict[str, int]:
+    """Close every bid window that has passed. Blocking; call via asyncio.to_thread.
+
+    Semantics are those of marketplace.close_expired_windows() (a set-returning function):
+      * with active bids  -> request becomes 'closed'  (bids stay alive for the borrower to choose)
+      * no active bids    -> request becomes 'expired'
+    Nothing is rejected here, so no bid.rejected webhook is sent. (The previous version pre-selected
+    bids on requests with status 'open' - a status the portal never uses - so its bid.rejected loop never
+    fired; "fixing" that filter to 'bidding' would have sent FALSE rejections for bids that stay alive.)
+    """
+    with service_session() as conn:
+        got = conn.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _CLOSE_EXPIRED_LOCK_KEY}
+        ).scalar()
+        if not got:
+            return {"closed": 0, "expired": 0, "skipped": 1}
+        rows = conn.execute(
+            text("SELECT request_id, new_status FROM marketplace.close_expired_windows()")
+        ).fetchall()
+    return {
+        "closed": sum(1 for r in rows if r.new_status == "closed"),
+        "expired": sum(1 for r in rows if r.new_status == "expired"),
+        "skipped": 0,
+    }
+
+
 @router.post("/close-expired")
 async def close_expired(
     x_service_secret: str = Header(default="", alias="X-Service-Secret"),
 ) -> dict:
     _verify_service_secret(x_service_secret)
-
-    # Collect bids on about-to-expire requests BEFORE closing them
-    # so we can notify each institution whose bid was rejected
-    with service_session() as conn:
-        rejected_bids = conn.execute(text("""
-            SELECT b.institution_id, b.id AS bid_id, b.request_id
-            FROM marketplace.bid b
-            JOIN marketplace.request r ON r.id = b.request_id
-            WHERE r.status = 'open'
-              AND r.bid_window_closes_at < now()
-              AND b.status IN ('submitted', 'under_review')
-        """)).fetchall()
-
-        result = conn.execute(text("SELECT marketplace.close_expired_windows() AS closed")).fetchone()
-
-    closed = result.closed if result else 0
-
-    # Fire bid.rejected webhooks for each affected institution
-    for bid in rejected_bids:
-        asyncio.create_task(dispatch_event(
-            str(bid.institution_id),
-            "bid.rejected",
-            {
-                "bid_id":     str(bid.bid_id),
-                "request_id": str(bid.request_id),
-                "reason":     "request_expired",
-            },
-        ))
-
-    return {"closed": closed, "message": f"Closed {closed} expired bid window(s).", "bids_rejected": len(rejected_bids)}
+    counts = await asyncio.to_thread(close_expired_once)
+    total = counts["closed"] + counts["expired"]
+    return {
+        "closed": total,  # total windows closed; kept as an int for existing callers
+        "windows_closed_with_bids": counts["closed"],
+        "windows_expired": counts["expired"],
+        "bids_rejected": 0,
+        "skipped_another_run_in_progress": bool(counts["skipped"]),
+        "message": f"Closed {total} expired bid window(s).",
+    }
 
 # ── POST /marketplace/sync-requests ──────────────────────────────────────────
 # Phase 1 helpers ─────────────────────────────────────────────────────────────

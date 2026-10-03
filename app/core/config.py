@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     integration_peer_url: str = Field(default="", description="Borrower side inbound events URL")
     integration_dispatch_interval_s: float = 10.0
 
+    # ── Scheduled maintenance inside the API (replaces the GitHub cron, which had no secret and
+    #    only ran every 3-4 h). OFF by default: turning it on is an operator decision.
+    maintenance_close_expired_enabled: bool = False
+    maintenance_interval_s: float = 300.0
+
     @property
     def integration_inbound_keys(self) -> list[bytes]:
         raw = self.integration_b2i_verify_keys.split(",")

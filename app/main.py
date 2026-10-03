@@ -13,6 +13,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from . import maintenance
 from .api.admin import public_router as admin_public_router
 from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
@@ -62,12 +63,18 @@ async def lifespan(app: FastAPI):
     dispatcher: asyncio.Task[None] | None = None
     if settings.integration_outbound_enabled:
         dispatcher = asyncio.create_task(integration_dispatcher.run_forever(stop))
+    maintenance_task: asyncio.Task[None] | None = None
+    if settings.maintenance_close_expired_enabled:
+        maintenance_task = asyncio.create_task(maintenance.run_forever(stop))
     log.info("portal_api_ready", integration_outbound=settings.integration_outbound_enabled,
+             maintenance_close_expired=settings.maintenance_close_expired_enabled,
              integration_inbound=bool(settings.integration_inbound_keys))
     yield
     stop.set()
     if dispatcher is not None:
         await dispatcher
+    if maintenance_task is not None:
+        await maintenance_task
     close_pool()
     log.info("portal_api_stopped")
 
