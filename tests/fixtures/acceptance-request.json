@@ -1,0 +1,11 @@
+{
+  "bid_id": "00000000-0000-4000-8000-000000000010",
+  "request_id": "00000000-0000-4000-8000-000000000001",
+  "anon_borrower_id": "00000000-0000-4000-8000-000000000002",
+  "consent_ref": "consent_01J9X",
+  "released_identity": {
+    "full_name": "Jane Doe",
+    "email": "jane@example.com",
+    "phone": "+230 5555 0000"
+  }
+}

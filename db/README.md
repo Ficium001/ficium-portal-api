@@ -49,6 +49,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `017_integration_request_shadow_and_ordered_claim.sql` | Ordered per-aggregate delivery fix; `integration.request_shadow` + parity views (step 3, shadow mode, nothing live reads it) | Yes | ✅ (applied Oct 2 2026; replayed the 13 live requests: 12 match, 1 real drift found) |
 | `018_integration_bid_publisher.sql` | Step 4 stage A: bid payload builder (== today's readback), catalog -> borrower product mapping, coalescing publisher, backfill. No trigger attached | Yes | ✅ (applied Oct 3 2026; payload == readback 2/2; contract-valid) |
 | `019_integration_bid_publisher_triggers.sql` | Step 4 stage B: deferred triggers on bid / bid_benefit / bid_allocation + backfill (bid events start, shadow mode) | Yes | ✅ (applied Oct 3 2026 after both sides deployed; 2/2 delivered and identical on the borrower side) |
+| `020_integration_acceptance_log.sql` | Step 5: idempotency log for the acceptance call (endpoint OFF by default) | Yes | ✅ (applied Oct 3 2026) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a

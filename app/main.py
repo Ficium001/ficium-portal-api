@@ -14,6 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from . import maintenance
+from .api.acceptance import router as acceptance_router
 from .api.admin import public_router as admin_public_router
 from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
@@ -172,3 +173,4 @@ app.include_router(api_keys_router)     # institution API key management
 app.include_router(webhooks_router)     # webhook CRUD + delivery log
 app.include_router(v1_marketplace_router)  # /v1/ versioned public API
 app.include_router(integration_router)     # contract v1 inbound events (signed, B2I)
+app.include_router(acceptance_router)      # contract v1 acceptance call (own key, OFF by default)
