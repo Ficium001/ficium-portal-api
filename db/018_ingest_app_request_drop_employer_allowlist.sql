@@ -1,0 +1,10 @@
+-- APPLIED to the Portal DB (egwobcajdlragubtkpqp) on 2026-10-05 as migration
+-- ingest_app_request_drop_employer.
+--
+-- Housekeeping after 016: marketplace.ingest_app_request() still listed 'employer' in its
+-- Phase 1 metadata allowlist. Dead code (016's trg_request_strip_employer removes it on every
+-- insert/update, and the sync no longer sends it), but the allowlist is the documented
+-- source of truth for what institutions can see, so it must not name the field.
+-- Change: the single allowlist line removed; function otherwise identical.
+-- VERIFIED (rolled back): ingest with employer in Phase 1 -> absent; employment_status/age kept.
+-- Full definition: see pg_get_functiondef('marketplace.ingest_app_request'::regproc).
