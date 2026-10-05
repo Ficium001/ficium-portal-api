@@ -1,6 +1,6 @@
 -- =============================================================================
 -- Integration contract v1: outbox, inbox and delivery state.
--- Identical on both databases (App DB and Portal DB). See ficium-contract.
+-- Identical on both databases (App DB and Portal DB). See ficium-integration.
 --
 -- Access model: nothing here is reachable by `anon` or `authenticated`.
 --   * Portal DB: portal-api connects as `postgres` and calls integration.* directly.

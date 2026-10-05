@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # Set APP_SERVICE_SECRET to the same value in both services.
     app_service_secret: str = Field(default="", description="X-Service-Secret for s2s calls")
 
-    # ── Integration contract v1 (ficium-contract) ─────────────
+    # ── Integration contract v1 (ficium-integration) ─────────────
     # Inbound: borrower -> institution events, verified with B2I keys.
     # Comma-separated so a rotation can accept old and new keys at once.
     integration_b2i_verify_keys: str = Field(
