@@ -1,5 +1,5 @@
 """POST /integration/v1/events — the institution side's only inbound channel
-from the borrower app. Contract v1 (ficium-contract).
+from the borrower app. Contract v1 (ficium-integration).
 
 Order of checks: integration configured -> signature (B2I keys) -> envelope
 valid -> sent by the borrower side -> we have a handler for this type ->
