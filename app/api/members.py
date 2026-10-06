@@ -72,8 +72,8 @@ async def get_my_group(
     if not sub:
         return None
 
-    # 0. Admin path — platform admins live in admin.user, not institution.member.
-    #    Their modules come from admin.system_group (super_admin → ["*"]).
+    # 0. Admin path — platform admins live in portal_admin.admin_users, not institution.member.
+    #    Their modules come from portal_admin.user_groups (super_admin → ["*"]).
     if claims.get("user_role") in ("admin", "super_admin"):
         row = conn.execute(
             text("""
@@ -86,8 +86,8 @@ async def get_my_group(
                     'user_type',          'admin',
                     'is_system',          true
                 ) AS grp
-                FROM  admin."user" u
-                JOIN  admin.system_group sg ON sg.id = u.system_group_id
+                FROM  portal_admin.admin_users u
+                JOIN  portal_admin.user_groups sg ON sg.id = u.group_id
                 WHERE u.auth_user_id = :uid
                 LIMIT 1
             """),
@@ -426,7 +426,7 @@ async def get_member_audit(
 ) -> dict:
     """
     Per-user audit report:
-      - Login history (identity.login_event)
+      - Login history (auth_portal.auth_audit_events)
       - Portal actions (audit.event)
       - Governance actions they initiated or checked (governance.action)
     """
@@ -440,19 +440,33 @@ async def get_member_audit(
 
     auth_uid = str(member.auth_user_id) if member.auth_user_id else None
 
-    # Login history
+    # Login history. Source is auth_portal.auth_audit_events (what ficium-auth actually writes);
+    # the old identity.login_event table was never populated, so this tab used to show nothing.
+    # Tenant sessions cannot read auth_portal (RLS, no policies), so this single read runs in a
+    # privileged session. Authorisation is already established: `member` above was loaded through
+    # the caller's tenant session, i.e. it belongs to the caller's institution.
     logins = []
     if auth_uid:
-        login_rows = conn.execute(
-            text("""
-                SELECT id, email, ip, user_agent, country, city, outcome, failure_reason, occurred_at
-                FROM identity.login_event
-                WHERE user_id = :uid
-                ORDER BY occurred_at DESC
-                LIMIT :lim
-            """),
-            {"uid": auth_uid, "lim": limit},
-        ).fetchall()
+        with service_session() as svc:
+            login_rows = svc.execute(
+                text("""
+                    SELECT id,
+                           event_metadata ->> 'email' AS email,
+                           ip_address                 AS ip,
+                           user_agent,
+                           NULL::text                 AS country,
+                           NULL::text                 AS city,
+                           outcome,
+                           NULL::text                 AS failure_reason,
+                           created_at                 AS occurred_at
+                    FROM auth_portal.auth_audit_events
+                    WHERE user_id = :uid
+                      AND event_type IN ('login.success', 'login.failed')
+                    ORDER BY created_at DESC
+                    LIMIT :lim
+                """),
+                {"uid": auth_uid, "lim": limit},
+            ).fetchall()
         for r in login_rows:
             m = dict(r._mapping)
             m["id"] = str(m["id"]) if m.get("id") else None

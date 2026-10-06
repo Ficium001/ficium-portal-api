@@ -415,10 +415,9 @@ async def provision_user_from_action(
         INSERT INTO institution.member
             (institution_id, auth_user_id, email, full_name, role,
              is_primary_admin, active, custom_group_id, member_role,
-             group_id, system_group_id)
+             group_id)
         VALUES (:iid, :uid, :email, :full_name, 'member',
                 false, true, :cgid, :mrole,
-                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
                 (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1))
     """)
     member_params = {"iid": institution_id, "email": email, "full_name": full_name,

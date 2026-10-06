@@ -84,8 +84,8 @@ def list_keys(
                 ak.last_used_ip::text,
                 ak.revoked_at,
                 ak.rejection_note,
-                admin.get_user_display_name(ak.requested_by) AS requested_by_username,
-                admin.get_user_display_name(ak.approved_by)  AS approved_by_username
+                portal_admin.get_user_display_name(ak.requested_by) AS requested_by_username,
+                portal_admin.get_user_display_name(ak.approved_by)  AS approved_by_username
             FROM institution.api_key ak
             WHERE ak.institution_id = CAST(:iid AS uuid)
               AND ak.revoked_at IS NULL

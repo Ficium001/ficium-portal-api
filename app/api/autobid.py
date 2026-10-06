@@ -442,8 +442,8 @@ def list_rules(
             SELECT r.id, r.name, r.description, r.status, r.priority,
                    r.created_at, r.updated_at,
                    v.version_no AS current_version_no,
-                   admin.get_user_display_name(v.submitted_by) AS submitted_by_username,
-                   admin.get_user_display_name(v.approved_by)  AS approved_by_username
+                   portal_admin.get_user_display_name(v.submitted_by) AS submitted_by_username,
+                   portal_admin.get_user_display_name(v.approved_by)  AS approved_by_username
             FROM autobid.rule r
             LEFT JOIN autobid.rule_version v ON v.id = r.current_version_id
             {where}
