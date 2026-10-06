@@ -5,6 +5,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # SQLAlchemy/DB-driver minor+major jumps change pooling behaviour against the Supabase
+    # pooler, which CI (plain Postgres) cannot exercise. 2.0 -> 2.1 hung production's
+    # /marketplace/sync-requests on 2026-10-05. Bump these deliberately, with a pooler test.
+    ignore:
+      - dependency-name: "sqlalchemy"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "psycopg2-binary"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types:
