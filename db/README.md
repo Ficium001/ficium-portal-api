@@ -52,6 +52,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `020_integration_acceptance_log.sql` | Step 5: idempotency log for the acceptance call (endpoint OFF by default) | Yes | ✅ (applied Oct 3 2026) |
 | `021_ingest_app_request_drop_employer_allowlist.sql` | Removes the dead `employer` entry from `ingest_app_request()`'s Phase 1 allowlist (016's trigger already strips it) | Yes | ✅ (applied Oct 5 2026) |
 | `022_schema_cleanup_step1.sql` | Retires `workflow` + `bid_notify` (renamed `_retired_*_20261006`, hard-drop ≥ 2026-11-06), folds `app` into `institution`. Rollback: `rollback/022_rollback.sql` | Yes | ✅ (applied Oct 6 2026) |
+| `023_sync_loop_fix_ingest_app_request.sql` | Fixes the request-sync write loop: `closed`→`expired`, upsert on `id`, window-repair, skip no-op rewrites, allocations only when changed. Rollback: `rollback/023_rollback.sql` | Yes | ✅ (applied Oct 6 2026) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
