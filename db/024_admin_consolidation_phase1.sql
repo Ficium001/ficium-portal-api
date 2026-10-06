@@ -1,0 +1,34 @@
+-- APPLIED to the Portal DB (egwobcajdlragubtkpqp) on 2026-10-06 as migration 024_admin_consolidation_phase1.
+-- Rollback: db/rollback/024_rollback.sql (reads _rollback.snapshot WHERE migration = '024').
+--
+-- WHY: `admin` (old) and `portal_admin` (new) held the SAME 2 staff accounts, 5 roles and 7 groups, and the
+-- "new" portal_admin.is_admin()/has_permission() were one-line wrappers around the old admin.* functions, so
+-- 14 security policies still depended on the old tables. Worse, institution.current_member_ctx*() let the
+-- stale admin.system_group win over portal_admin.user_groups (missing inst:esign/approvals/pipeline/analytics
+-- ...), so any new member without a custom group would get the old, smaller permission set. Today's 4 members
+-- all have custom groups, so it was latent. admin.commission_event is the revenue ledger and had to move.
+--
+-- WHAT (Phase 1 of 4; code is Phase 2, retirement Phase 3, rename-to-platform Phase 4):
+--   1. portal_admin.is_admin / has_permission / get_user_display_name / get_my_group read portal_admin only.
+--   2. admin.is_admin / has_permission / get_user_display_name become thin delegates to portal_admin
+--      (compat during the cool-off; the dependency now points the right way).
+--   3. policies on audit.event and governance.action call portal_admin.*.
+--   4. institution.current_member_ctx / _v2 / assign_default_member_group use portal_admin.user_groups only
+--      (system_group_id is no longer read or written; the column is dropped in Phase 3).
+--   5. admin.commission_event moves to portal_admin (rows, FK and conflict key intact);
+--      advance_pipeline_stage repointed.
+--   6. DATA: the 2nd platform admin had NO group_id in portal_admin.admin_users (the old store had it);
+--      back-filled from admin."user".system_group_id (group ids are identical across both tables), otherwise
+--      switching the platform-admin lookup would have left that account with no modules.
+--
+-- SELF-VERIFYING: the migration captures a baseline for both staff, all 4 members and an unknown user
+-- (rights, effective modules, and what the API role can see through the policies), applies the changes,
+-- recomputes, and RAISES (rolling everything back) on any difference, any member LOSING a module, any staff
+-- losing a right, any live function still naming admin./identity., or any policy still calling admin.*.
+--
+-- Verified after apply (rolled-back tests): a new primary member with no custom group gets institution_admin
+-- with 18 modules (the old table gave 9); commission ledger moved (rows preserved), ON CONFLICT intact;
+-- both staff resolve to super_admin / modules ['*']; anon cannot execute portal_admin.get_user_display_name.
+--
+-- The full statement text is in the migration history of the project (supabase_migrations) and in the
+-- _rollback.snapshot originals; this file records intent, scope and verification.
