@@ -54,6 +54,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `022_schema_cleanup_step1.sql` | Retires `workflow` + `bid_notify` (renamed `_retired_*_20261006`, hard-drop ≥ 2026-11-06), folds `app` into `institution`. Rollback: `rollback/022_rollback.sql` | Yes | ✅ (applied Oct 6 2026) |
 | `023_sync_loop_fix_ingest_app_request.sql` | Fixes the request-sync write loop: `closed`→`expired`, upsert on `id`, window-repair, skip no-op rewrites, allocations only when changed. Rollback: `rollback/023_rollback.sql` | Yes | ✅ (applied Oct 6 2026) |
 | `024_admin_consolidation_phase1.sql` | Phase 1 of retiring `admin`/`identity`: portal_admin self-contained, policies + institution functions repointed, `commission_event` moved, staff group back-fill. Self-verifying. Rollback: `rollback/024_rollback.sql` | Yes | ✅ (applied Oct 6 2026) |
+| `025_deal_booking.sql` | Booking hand-off: `marketplace.loan_booking` (tenant read-only via RLS + GRANT SELECT), `record_loan_booking()` (all rules + commission event; not executable by anon/authenticated), `deal_booked` notification kind, `inst:booking` granted to every group holding `inst:pipeline`. Dry-run verified in a rolled-back transaction (11 rule checks) | Yes | ✅ (applied Oct 16 2026) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a

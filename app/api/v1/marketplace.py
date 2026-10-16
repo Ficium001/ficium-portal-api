@@ -9,6 +9,8 @@
 #   POST /v1/bids              → bids:write
 #   GET  /v1/bids              → bids:read
 #   PUT  /v1/pipeline/.../advance → pipeline:write
+#   POST /v1/pipeline/{id}/booking → pipeline:write  (record core banking booking)
+#   PUT  /v1/pipeline/{id}/booking → pipeline:write  (correct it)
 #   GET  /v1/analytics/summary → analytics:read
 #
 # Response shape is stable — breaking changes increment to /v2/.
@@ -16,14 +18,14 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ...core.bidding import BidInput, BidPlacementError, place_bid
+from ...core.booking import BookingInput, has_booking_permission, record_booking
 from ...core.db import service_session as _svc
 from ...core.ratelimit import limiter
 from ...core.webhooks import dispatch_event
@@ -233,15 +235,11 @@ def submit_bid(
         "submitted_at": result.submitted_at,
     }
 
-    # Fire webhook to the institution (confirmation their system bid was received)
-    asyncio.create_task(
-        dispatch_event(iid, "bid.accepted", {
-            "bid_id": result.id,
-            "request_id": body.request_id,
-            "status": result.status,
-            "source": "api",
-        })
-    )
+    # No webhook here. This used to send 'bid.accepted', which means the BORROWER
+    # accepted the bid, to a system that had only just submitted it; and it was
+    # scheduled with asyncio.create_task from a sync endpoint, which raises after
+    # the bid is committed (500 -> client retries -> duplicate-bid error).
+    # The caller already has the result in this response.
 
     return response
 
@@ -262,12 +260,21 @@ class StageAdvanceRequest(BaseModel):
 def advance_pipeline_stage(
     loan_id: str,
     stage_id: str,
+    background: BackgroundTasks,
     body: Annotated[StageAdvanceRequest, Body()],
     claims: dict[str, Any] = Depends(api_or_jwt_claims),
 ) -> dict:
     """
     Advance a pipeline stage from the institution's LOS.
-    Stage must be the current active stage (in_progress) for this pipeline.
+
+    The stage must be the deal's active stage. A stage that requires
+    maker-checker goes to 'awaiting_approval' and a portal user approves it
+    (four-eyes stays with people); otherwise it completes and the next stage
+    activates, or the deal completes after the last one.
+
+    Fixed Oct 2026: this compared against 'in_progress' / 'cancelled', which
+    are not values of stage_status_enum / pipeline_status_enum, so every call
+    returned 409 and the endpoint had never worked.
     """
     iid = _institution_id_from_claims(claims)
 
@@ -282,14 +289,14 @@ def advance_pipeline_stage(
         ).fetchone()
         if pipeline is None:
             raise HTTPException(status_code=404, detail="Pipeline not found.")
-        if pipeline.status in ("completed", "cancelled"):
+        if pipeline.status != "active":
             raise HTTPException(status_code=409, detail=f"Pipeline is {pipeline.status}.")
 
         # Verify stage belongs to this pipeline and is in_progress
         stage = conn.execute(
             text("""
                 SELECT psi.id, psi.status, psi.position,
-                       psd.stage_key, psd.borrower_label
+                       psd.stage_key, psd.borrower_label, psd.requires_maker_checker
                 FROM marketplace.pipeline_stage_instance psi
                 JOIN institution.pipeline_stage_def psd ON psd.id = psi.stage_def_id
                 WHERE psi.id          = CAST(:sid AS uuid)
@@ -299,26 +306,50 @@ def advance_pipeline_stage(
         ).fetchone()
         if stage is None:
             raise HTTPException(status_code=404, detail="Stage not found in this pipeline.")
-        if stage.status != "in_progress":
-            raise HTTPException(status_code=409, detail=f"Stage is {stage.status}, not in_progress.")
+        if stage.status != "active":
+            raise HTTPException(status_code=409, detail=f"Stage is {stage.status}, not active.")
+
+        if stage.requires_maker_checker:
+            conn.execute(
+                text("""
+                    UPDATE marketplace.pipeline_stage_instance
+                    SET status = 'awaiting_approval', submitted_at = now(),
+                        notes = COALESCE(:note, notes), updated_at = now()
+                    WHERE id = CAST(:sid AS uuid)
+                """),
+                {"sid": stage_id, "note": body.note},
+            )
+            conn.commit()
+            background.add_task(dispatch_event, iid, "pipeline.stage_changed", {
+                "loan_id": loan_id, "stage_id": stage_id, "stage_key": stage.stage_key,
+                "previous_status": "active", "new_status": "awaiting_approval",
+                "pipeline_completed": False, "note": body.note,
+            })
+            return {
+                "loan_id": loan_id, "stage_id": stage_id, "stage_key": stage.stage_key,
+                "status": "awaiting_approval", "pipeline_completed": False, "next_stage_id": None,
+            }
 
         # Complete this stage
         conn.execute(
             text("""
                 UPDATE marketplace.pipeline_stage_instance
                 SET status       = 'completed',
-                    completed_at = now()
+                    completed_at = now(),
+                    notes        = COALESCE(:note, notes),
+                    updated_at   = now()
                 WHERE id = CAST(:sid AS uuid)
             """),
-            {"sid": stage_id},
+            {"sid": stage_id, "note": body.note},
         )
 
         # Activate the next stage if it exists
         next_stage = conn.execute(
             text("""
                 UPDATE marketplace.pipeline_stage_instance
-                SET status     = 'in_progress',
-                    started_at = now()
+                SET status     = 'active',
+                    started_at = now(),
+                    updated_at = now()
                 WHERE pipeline_id = CAST(:lid AS uuid)
                   AND position    = :next_pos
                   AND status      = 'pending'
@@ -332,29 +363,34 @@ def advance_pipeline_stage(
             conn.execute(
                 text("""
                     UPDATE marketplace.loan_pipeline
-                    SET status = 'completed', completed_at = now()
+                    SET status = 'completed', completed_at = now(), updated_at = now()
                     WHERE id = CAST(:lid AS uuid)
                 """),
                 {"lid": loan_id},
             )
             pipeline_done = True
         else:
+            conn.execute(
+                text("""
+                    UPDATE marketplace.loan_pipeline
+                    SET current_stage_id = CAST(:nid AS uuid), updated_at = now()
+                    WHERE id = CAST(:lid AS uuid)
+                """),
+                {"nid": str(next_stage.id), "lid": loan_id},
+            )
             pipeline_done = False
 
         conn.commit()
 
-    # Fire webhook: pipeline.stage_changed
-    asyncio.create_task(
-        dispatch_event(iid, "pipeline.stage_changed", {
-            "loan_id": loan_id,
-            "stage_id": stage_id,
-            "stage_key": stage.stage_key,
-            "previous_status": "in_progress",
-            "new_status": "completed",
-            "pipeline_completed": pipeline_done,
-            "note": body.note,
-        })
-    )
+    background.add_task(dispatch_event, iid, "pipeline.stage_changed", {
+        "loan_id": loan_id,
+        "stage_id": stage_id,
+        "stage_key": stage.stage_key,
+        "previous_status": "active",
+        "new_status": "completed",
+        "pipeline_completed": pipeline_done,
+        "note": body.note,
+    })
 
     return {
         "loan_id": loan_id,
@@ -364,6 +400,78 @@ def advance_pipeline_stage(
         "pipeline_completed": pipeline_done,
         "next_stage_id": str(next_stage.id) if next_stage else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# POST|PUT /v1/pipeline/{loan_id}/booking — the bank's core banking system
+# reports that the loan is booked (or corrects the record).
+# ---------------------------------------------------------------------------
+
+def _v1_booking(
+    loan_id: str, body: BookingInput, claims: dict[str, Any],
+    background: BackgroundTasks, correction: bool,
+) -> dict:
+    iid = _institution_id_from_claims(claims)
+    is_api_key = claims.get("auth_method") == "api_key"
+    if not is_api_key:
+        # A person using a portal token: same permission as the portal endpoint.
+        with _svc() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT COALESCE(cg.module_permissions, pg.module_permissions, '{}'::text[]) AS modules
+                      FROM institution.member m
+                      LEFT JOIN institution."group"      cg ON cg.id = m.custom_group_id
+                      LEFT JOIN portal_admin.user_groups pg ON pg.id = m.group_id
+                     WHERE m.auth_user_id = CAST(:uid AS uuid) AND m.active
+                     LIMIT 1
+                """),
+                {"uid": claims.get("sub")},
+            ).first()
+        if not has_booking_permission(list(row.modules) if row else [], claims.get("user_role")):
+            raise HTTPException(status_code=403, detail="Requires 'inst:booking'.")
+    with _svc() as conn:
+        booking = record_booking(
+            conn, institution_id=iid, pipeline_id=loan_id, body=body,
+            source="api" if is_api_key else "portal",
+            actor_id=None if is_api_key else claims.get("sub"),
+            actor_email=None if is_api_key else claims.get("email"),
+            api_key_id=claims.get("key_id") if is_api_key else None,
+            correction=correction, background=background,
+        )
+    return {"loan_id": loan_id, **booking}
+
+
+@router.post(
+    "/pipeline/{loan_id}/booking",
+    status_code=201,
+    dependencies=[Depends(require_scope("pipeline:write"))],
+)
+def record_pipeline_booking(
+    loan_id: str,
+    background: BackgroundTasks,
+    body: Annotated[BookingInput, Body()],
+    claims: dict[str, Any] = Depends(api_or_jwt_claims),
+) -> dict:
+    """
+    Record that the deal's loan is booked in your core banking system.
+    The deal must have completed every processing stage. One booking per deal;
+    use PUT to correct it. Fires the deal.booked webhook.
+    """
+    return _v1_booking(loan_id, body, claims, background, correction=False)
+
+
+@router.put(
+    "/pipeline/{loan_id}/booking",
+    dependencies=[Depends(require_scope("pipeline:write"))],
+)
+def correct_pipeline_booking(
+    loan_id: str,
+    background: BackgroundTasks,
+    body: Annotated[BookingInput, Body()],
+    claims: dict[str, Any] = Depends(api_or_jwt_claims),
+) -> dict:
+    """Correct a recorded booking. Previous values are kept in the audit trail."""
+    return _v1_booking(loan_id, body, claims, background, correction=True)
 
 
 # ---------------------------------------------------------------------------

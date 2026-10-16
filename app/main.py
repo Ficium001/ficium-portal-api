@@ -23,6 +23,7 @@ from .api.approvals import router as approvals_router
 from .api.auth_provision import router as auth_provision_router
 from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
+from .api.booking import router as booking_router
 from .api.borrower_portfolio import router as borrower_portfolio_router
 from .api.catalog import router as catalog_router
 from .api.doc_templates.router import router as doc_templates_router
@@ -166,6 +167,7 @@ app.include_router(documents_router)
 app.include_router(esign_router)        # e-signature envelopes + public ceremony
 app.include_router(pipeline_templates_router)
 app.include_router(doc_templates_router)  # document template designer (inst:doctemplates)
+app.include_router(booking_router)        # deal booking hand-off (inst:booking)
 app.include_router(pipeline_router)
 app.include_router(notifications_router)
 app.include_router(public_router)       # server-to-server, no JWT
