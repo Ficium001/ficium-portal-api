@@ -281,7 +281,7 @@ BEGIN
 
     INSERT INTO institution.doa_rule
         (institution_id, entity_type, priority, conditions, template_id, status, created_by)
-    VALUES (r.institution_id, 'facility', 1000, '{}'::jsonb, v_tpl, 'active', v_admin);
+    VALUES (r.institution_id, 'facility', 9999, '{}'::jsonb, v_tpl, 'active', v_admin);  -- 9999 = pinned catch-all (portal convention)
   END LOOP;
 
   UPDATE institution.pipeline_stage_def SET approval_route = true
