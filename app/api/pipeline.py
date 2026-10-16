@@ -130,7 +130,10 @@ async def list_pipelines(
             -- SLA breached if active and past due
             (psi_cur.sla_due_at IS NOT NULL
              AND psi_cur.sla_due_at < now()
-             AND psi_cur.status NOT IN ('completed','skipped'))            AS sla_breached
+             AND psi_cur.status NOT IN ('completed','skipped'))            AS sla_breached,
+            -- booked in the bank's core system (db/025)
+            EXISTS (SELECT 1 FROM marketplace.loan_booking b
+                    WHERE b.pipeline_id = lp.id)                           AS booked
         FROM marketplace.loan_pipeline lp
         JOIN marketplace.pipeline_stage_instance psi_cur
             ON  psi_cur.id = lp.current_stage_id
