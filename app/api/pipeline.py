@@ -296,7 +296,7 @@ async def advance_stage(
                 kind="approval_needed",
                 title="Stage awaiting approval",
                 body="A pipeline stage requires checker sign-off.",
-                link=f"/pipeline/{pipeline_id}",
+                link=f"/deals/{pipeline_id}",
                 metadata={"pipeline_id": pipeline_id, "stage_id": stage_id},
             )
             conn.commit()
@@ -407,7 +407,7 @@ def _complete_stage(
             kind="pipeline_advanced",
             title="Pipeline stage completed",
             body="A processing stage has been completed and the next stage is now active.",
-            link=f"/pipeline/{pipeline_id}",
+            link=f"/deals/{pipeline_id}",
             metadata={"pipeline_id": pipeline_id, "completed_stage_id": stage_id},
         )
         conn.commit()
