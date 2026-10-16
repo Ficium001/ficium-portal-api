@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Any
@@ -570,7 +571,42 @@ async def cast_action(
         "acting_as": body.get("acting_as"),
     }).fetchone()
     conn.commit()
+    _after_facility_decision(conn, instance_id)
     return {"stage_status": row.status}
+
+
+def _after_facility_decision(conn: Session, instance_id: str) -> None:
+    """A facility's credit decision moves its deal in the DB (db/026 trigger).
+    Here: the side effects the DB can't do — tell the borrower and the bank's
+    systems. Best-effort; the decision is already committed."""
+    try:
+        r = conn.execute(text("""
+            SELECT ai.status, ai.entity_id, ai.institution_id, lp.status AS deal_status,
+                   lp.closed_reason, psi.id AS stage_id
+            FROM institution.approval_instance ai
+            JOIN marketplace.loan_pipeline lp ON lp.id = ai.entity_id
+            LEFT JOIN marketplace.pipeline_stage_instance psi ON psi.approval_instance_id = ai.id
+            WHERE ai.id = :iid AND ai.entity_type = 'facility'
+        """), {"iid": instance_id}).fetchone()
+    except Exception:  # noqa: BLE001
+        return
+    if r is None or r.status not in ("approved", "rejected"):
+        return
+    from ..core.webhooks import dispatch_event
+    from .pipeline import _notify_borrower_stage_advanced
+
+    pid, iid = str(r.entity_id), str(r.institution_id)
+    if r.status == "approved":
+        _notify_borrower_stage_advanced(pid, str(r.stage_id), r.deal_status == "completed")
+        asyncio.create_task(dispatch_event(iid, "pipeline.stage_changed", {
+            "loan_id": pid, "stage_id": str(r.stage_id), "new_status": "completed",
+            "pipeline_completed": r.deal_status == "completed", "source": "credit_approval",
+        }))
+    else:
+        asyncio.create_task(dispatch_event(iid, "deal.closed", {
+            "loan_id": pid, "outcome": "declined", "reason": r.closed_reason,
+            "source": "credit_approval",
+        }))
 
 
 @router.post("/instances/{instance_id}/withdraw")
