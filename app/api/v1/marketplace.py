@@ -30,6 +30,7 @@ from ...core.db import service_session as _svc
 from ...core.ratelimit import limiter
 from ...core.webhooks import dispatch_event
 from ...deps import api_or_jwt_claims, require_scope
+from ..pipeline import documents_gate
 
 router = APIRouter(prefix="/v1", tags=["v1-public-api"])
 
@@ -308,6 +309,8 @@ def advance_pipeline_stage(
             raise HTTPException(status_code=404, detail="Stage not found in this pipeline.")
         if stage.status != "active":
             raise HTTPException(status_code=409, detail=f"Stage is {stage.status}, not active.")
+
+        documents_gate(conn, loan_id, stage_id)
 
         if stage.requires_maker_checker:
             conn.execute(

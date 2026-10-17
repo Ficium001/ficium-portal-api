@@ -94,6 +94,25 @@ def _notify_borrower_stage_advanced(
     except RuntimeError:
         pass  # no event loop in sync context — skip
 
+def _documents_outstanding(conn, pipeline_id: str, stage_id: str) -> int:
+    """Mandatory checklist documents of this stage not yet verified or waived (db/027)."""
+    conn.execute(text("SELECT marketplace.ensure_deal_documents(CAST(:pid AS uuid))"),
+                 {"pid": pipeline_id})
+    n = conn.execute(text("SELECT marketplace.stage_documents_outstanding(CAST(:sid AS uuid))"),
+                     {"sid": stage_id}).scalar_one()
+    return int(n or 0)
+
+
+def documents_gate(conn, pipeline_id: str, stage_id: str) -> None:
+    n = _documents_outstanding(conn, pipeline_id, stage_id)
+    if n:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{n} required document{'s' if n > 1 else ''} for this stage "
+                   f"{'are' if n > 1 else 'is'} not verified or waived yet. See the Documents tab.",
+        )
+
+
 def _rows(result) -> list[dict]:  return [dict(r._mapping) for r in result.fetchall()]
 def _one(result)  -> dict | None:
     row = result.fetchone()
@@ -210,6 +229,12 @@ async def get_pipeline(
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found.")
 
+    # Materialise the document checklist so stage counts are complete.
+    with service_session() as svc:
+        svc.execute(text("SELECT marketplace.ensure_deal_documents(CAST(:pid AS uuid))"),
+                    {"pid": pipeline_id})
+        svc.commit()
+
     # Stage instances
     stages = _rows(conn.execute(text("""
         SELECT
@@ -235,6 +260,15 @@ async def get_pipeline(
             psd.requires_maker_checker,
             psd.requires_documents,
             psd.approval_route,
+            -- document checklist for this stage (db/027)
+            (SELECT count(*) FROM marketplace.deal_document dd
+               JOIN institution.doc_requirement r ON r.id = dd.requirement_id
+              WHERE dd.pipeline_id = psi.pipeline_id AND r.stage_def_id = psi.stage_def_id
+                AND r.mandatory)::int                                         AS documents_required,
+            (SELECT count(*) FROM marketplace.deal_document dd
+               JOIN institution.doc_requirement r ON r.id = dd.requirement_id
+              WHERE dd.pipeline_id = psi.pipeline_id AND r.stage_def_id = psi.stage_def_id
+                AND r.mandatory AND dd.status IN ('verified', 'waived'))::int AS documents_done,
             psi.approval_instance_id,
             ai.status                         AS approval_status,
             psi.rejection_reason,
@@ -300,6 +334,8 @@ async def advance_stage(
         if stage["status"] != "active":
             raise HTTPException(status_code=409,
                 detail=f"Stage is '{stage['status']}', not active.")
+
+        documents_gate(conn, pipeline_id, stage_id)
 
         if stage["approval_route"]:
             if not member_id:
