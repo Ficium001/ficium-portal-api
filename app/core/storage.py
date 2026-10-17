@@ -76,14 +76,17 @@ async def storage_signed_url(path: str, expires_in: int = 600, *, bucket: str = 
     return f"{url}/storage/v1{resp.json()['signedURL']}"
 
 
-async def storage_signed_upload_url(object_name: str, *, bucket: str = BUCKET) -> dict[str, str]:
-    """For client-side direct uploads: returns {upload_url, storage_path}."""
+async def storage_signed_upload_url(
+    object_name: str, *, bucket: str = BUCKET, upsert: bool = True,
+) -> dict[str, str]:
+    """For client-side direct uploads: returns {upload_url, storage_path}.
+    upsert=False for one-time slots handed outside the portal (borrower uploads)."""
     url, key = _creds()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{url}/storage/v1/object/upload/sign/{bucket}/{object_name}",
             headers=_headers(key, **{"Content-Type": "application/json"}),
-            json={"upsert": True},
+            json={"upsert": upsert},
         )
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=502, detail="Could not generate upload URL.")

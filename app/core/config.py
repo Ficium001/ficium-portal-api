@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     # Step 5: the synchronous acceptance call (POST /integration/v1/acceptances). OFF by default.
     # It has its OWN key, separate from the event keys, so a leaked event key cannot accept bids.
     integration_acceptance_enabled: bool = False
+    # Contract 1.5: borrower document uploads (POST /integration/v1/deal-documents/uploads).
+    # Same caller and keys as the acceptance call. OFF by default.
+    integration_documents_enabled: bool = False
     integration_acceptance_verify_keys: str = Field(
         default="", description="ACCEPT_SIGNING_KEY(s), comma-separated"
     )
