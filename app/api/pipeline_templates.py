@@ -181,7 +181,7 @@ async def create_template(
                     (template_id, institution_id, stage_key, label, description,
                      position, sla_hours, requires_maker_checker, requires_documents, approval_route, decision_source,
                      borrower_label, borrower_visible)
-                VALUES (:tid, :iid, :sk::institution.stage_key_enum, :label, :desc,
+                VALUES (:tid, :iid, CAST(:sk AS institution.stage_key_enum), :label, :desc,
                         :pos, :sla, :rmc, :rdoc, :aroute, :dsrc, :blabel, :bvis)
                 RETURNING id, position, stage_key, label, description, sla_hours,
                           requires_maker_checker, requires_documents, approval_route, decision_source,
@@ -349,7 +349,7 @@ async def add_stage(
                 (template_id, institution_id, stage_key, label, description,
                  position, sla_hours, requires_maker_checker, requires_documents, approval_route, decision_source,
                  borrower_label, borrower_visible)
-            VALUES (:tid, :iid, :sk::institution.stage_key_enum, :label, :desc,
+            VALUES (:tid, :iid, CAST(:sk AS institution.stage_key_enum), :label, :desc,
                     :pos, :sla, :rmc, :rdoc, :aroute, :dsrc, :blabel, :bvis)
             RETURNING id, position, stage_key, label, description, sla_hours,
                       requires_maker_checker, requires_documents, approval_route, decision_source,
@@ -404,7 +404,7 @@ async def update_stage(
         stage = _one(sconn.execute(text("""
             UPDATE institution.pipeline_stage_def
             SET stage_key              = CASE WHEN :sk IS NOT NULL
-                                              THEN :sk::institution.stage_key_enum
+                                              THEN CAST(:sk AS institution.stage_key_enum)
                                               ELSE stage_key END,
                 label                  = COALESCE(:label, label),
                 description            = COALESCE(:desc,  description),
