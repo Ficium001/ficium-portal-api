@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # Contract 1.5: borrower document uploads (POST /integration/v1/deal-documents/uploads).
     # Same caller and keys as the acceptance call. OFF by default.
     integration_documents_enabled: bool = False
+    # This API's public https origin, e.g. https://ficium-portal-api-production.up.railway.app.
+    # Used to build upload_url (contract 1.6: an interface endpoint, never storage).
+    integration_public_base_url: str = Field(default="", description="INTEGRATION_PUBLIC_BASE_URL")
     integration_acceptance_verify_keys: str = Field(
         default="", description="ACCEPT_SIGNING_KEY(s), comma-separated"
     )

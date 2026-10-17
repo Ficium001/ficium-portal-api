@@ -1,7 +1,12 @@
-"""Contract 1.5: the borrower answers a bank's document request.
+"""Contract 1.6: the borrower answers a bank's document request.
 
     POST /integration/v1/deal-documents/uploads                       one-time upload slot
+    PUT  /integration/v1/deal-documents/uploads/{upload_id}/content   the file's bytes (signed)
     POST /integration/v1/deal-documents/uploads/{upload_id}/complete  confirm with SHA-256
+
+Architecture rule: everything between the borrower side and this side goes through
+this interface API. The borrower side never sees a storage URL or the Portal DB;
+this API stores the bytes itself.
 
 Caller: the borrower app's server, signed with the same keys as the acceptance call.
 OFF unless INTEGRATION_DOCUMENTS_ENABLED=true.
@@ -11,9 +16,9 @@ the calling anon_borrower_id, and only for an active deal's borrower-provided it
 that is still required or was rejected. A vault copy older than the item's
 max_age_days is refused here too, not only by the borrower app.
 
-The file goes straight to storage (one-time, non-overwriting signed URL). On
-complete, the stored object is downloaded and checked: size, SHA-256, and that its
-first bytes match the declared type. Only then is it registered with the same
+The content endpoint checks the bytes (exact declared size, first bytes match the
+declared type), stores them under the deal's folder and records their SHA-256.
+complete compares that hash with the borrower's. Only then is the file registered with the same
 deal_document_act('receive') bank staff use, marked uploaded_via='borrower'. The
 existing review (verify / reject, four eyes) applies unchanged; the checklist change
 is published back to the borrower by the db/031 triggers.
@@ -35,12 +40,13 @@ from sqlalchemy import text
 
 from ..core.config import settings
 from ..core.db import service_session
-from ..core.storage import storage_download, storage_signed_upload_url
+from ..core.storage import storage_upload
 
 log = structlog.get_logger()
 router = APIRouter(prefix="/integration/v1/deal-documents", tags=["integration"])
 
 SLOT_MINUTES = 15
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # contract: document_upload.request size_bytes maximum
 _EXT = {"application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png"}
 _MAGIC = {"application/pdf": (b"%PDF-",), "image/jpeg": (b"\xff\xd8\xff",), "image/png": (b"\x89PNG\r\n\x1a\n",)}
 
@@ -119,11 +125,13 @@ async def create_upload(request: Request) -> JSONResponse:
     body = await _verified_body(request, fc.validate_document_upload_request)
     if isinstance(body, JSONResponse):
         return body
+    base = settings.integration_public_base_url.rstrip("/")
+    if not base.startswith("https://"):
+        return _e(503, "documents_not_configured", "INTEGRATION_PUBLIC_BASE_URL must be an https origin")
     err, ctx = await asyncio.to_thread(_open_slot, body)
     if err is not None:
         return err
     assert ctx is not None
-    slot = await storage_signed_upload_url(ctx["path"], upsert=False)
 
     def _record() -> dict[str, Any]:
         with service_session() as conn:
@@ -139,7 +147,8 @@ async def create_upload(request: Request) -> JSONResponse:
                    "fname": body["file_name"], "mime": body["mime_type"], "size": body["size_bytes"],
                    "src": body["source"], "ddate": ctx["doc_date"], "mins": SLOT_MINUTES}).one()
             conn.commit()
-            return {"upload_id": str(row.upload_id), "upload_url": slot["upload_url"],
+            return {"upload_id": str(row.upload_id),
+                    "upload_url": f"{base}/integration/v1/deal-documents/uploads/{row.upload_id}/content",
                     "expires_at": row.expires_at.isoformat().replace("+00:00", "Z")}
 
     out = await asyncio.to_thread(_record)
@@ -147,11 +156,69 @@ async def create_upload(request: Request) -> JSONResponse:
     return JSONResponse(status_code=201, content=out)
 
 
-def _check_file(data: bytes, up: Any, sha256: str) -> str | None:
+@router.put("/uploads/{upload_id}/content", response_model=None)
+async def put_content(upload_id: str, request: Request) -> JSONResponse:
+    keys = settings.integration_acceptance_keys
+    if not settings.integration_documents_enabled or not keys:
+        return _e(503, "documents_disabled")
+    try:
+        uuid.UUID(upload_id)
+    except ValueError:
+        return _e(404, "upload_not_found")
+    # Refuse oversized bodies before reading them: the signature can only be
+    # checked after the bytes are in memory.
+    try:
+        declared = int(request.headers.get("content-length", ""))
+    except ValueError:
+        return _e(411, "content_length_required")
+    if declared > MAX_UPLOAD_BYTES:
+        return _e(413, "too_large")
+    raw = await request.body()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        return _e(413, "too_large")
+    try:
+        fc.verify(request.headers.get(fc.SIGNATURE_HEADER, ""), raw, keys)
+    except fc.ContractError:
+        return _e(401, "bad_signature")
+
+    def _load() -> Any:
+        with service_session() as conn:
+            return conn.execute(text("""
+                SELECT *, expires_at < now() AS expired FROM integration.document_upload
+                 WHERE upload_id = CAST(:u AS uuid)
+            """), {"u": upload_id}).fetchone()
+
+    up = await asyncio.to_thread(_load)
+    if up is None:
+        return _e(404, "upload_not_found")
+    if up.status != "open":
+        return _e(409, "upload_already_completed")
+    if up.expired:
+        return _e(410, "upload_expired")
+    if request.headers.get("content-type", "").split(";")[0].strip() != up.mime_type:
+        return _e(415, "content_type_mismatch")
+    problem = _check_file(raw, up)
+    if problem:
+        log.warning("borrower_upload_rejected", upload_id=upload_id, reason=problem)
+        return _e(422, problem)
+    await storage_upload(up.storage_path, raw, up.mime_type)
+
+    def _mark() -> None:
+        with service_session() as conn:
+            conn.execute(text("""
+                UPDATE integration.document_upload
+                   SET content_sha256 = :sha, content_received_at = now()
+                 WHERE upload_id = CAST(:u AS uuid) AND status = 'open'
+            """), {"sha": hashlib.sha256(raw).hexdigest(), "u": upload_id})
+            conn.commit()
+
+    await asyncio.to_thread(_mark)
+    return JSONResponse(status_code=200, content={"upload_id": upload_id, "size_bytes": len(raw)})
+
+
+def _check_file(data: bytes, up: Any) -> str | None:
     if len(data) != up.size_bytes:
         return "size_mismatch"
-    if hashlib.sha256(data).hexdigest() != sha256:
-        return "hash_mismatch"
     if not data.startswith(_MAGIC[up.mime_type]):
         return "type_mismatch"
     return None
@@ -179,11 +246,11 @@ async def complete_upload(upload_id: str, request: Request) -> JSONResponse:
         return _e(404, "upload_not_found")
     if up.status != "open":
         return _e(409, "upload_already_completed")
-    data = await storage_download(up.storage_path)
-    problem = _check_file(data, up, body["sha256"])
-    if problem:
-        log.warning("borrower_upload_rejected", upload_id=upload_id, reason=problem)
-        return _e(422, problem)
+    if up.content_sha256 is None:
+        return _e(409, "content_not_received")
+    if up.content_sha256 != body["sha256"]:
+        log.warning("borrower_upload_rejected", upload_id=upload_id, reason="hash_mismatch")
+        return _e(422, "hash_mismatch")
 
     def _register() -> tuple[JSONResponse | None, dict[str, Any] | None]:
         with service_session() as conn:
