@@ -26,6 +26,7 @@ from sqlalchemy import text
 
 from ...core.bidding import BidInput, BidPlacementError, place_bid
 from ...core.booking import BookingInput, has_booking_permission, record_booking
+from ...core.credit_decision import CreditDecisionInput, has_decision_permission, record_decision
 from ...core.db import service_session as _svc
 from ...core.ratelimit import limiter
 from ...core.webhooks import dispatch_event
@@ -297,7 +298,8 @@ def advance_pipeline_stage(
         stage = conn.execute(
             text("""
                 SELECT psi.id, psi.status, psi.position,
-                       psd.stage_key, psd.borrower_label, psd.requires_maker_checker
+                       psd.stage_key, psd.borrower_label, psd.requires_maker_checker,
+                       psd.approval_route, psd.decision_source
                 FROM marketplace.pipeline_stage_instance psi
                 JOIN institution.pipeline_stage_def psd ON psd.id = psi.stage_def_id
                 WHERE psi.id          = CAST(:sid AS uuid)
@@ -309,6 +311,18 @@ def advance_pipeline_stage(
             raise HTTPException(status_code=404, detail="Stage not found in this pipeline.")
         if stage.status != "active":
             raise HTTPException(status_code=409, detail=f"Stage is {stage.status}, not active.")
+
+        # The credit stage is never ticked through from outside. Before Oct 2026
+        # this endpoint ignored approval_route, so any pipeline:write key could
+        # complete credit approval without the committee or DoA limits.
+        if stage.approval_route:
+            if stage.decision_source == "external":
+                raise HTTPException(status_code=409, detail=(
+                    "This is the credit decision stage. Record the decision with "
+                    "POST /v1/pipeline/{loan_id}/credit-decision."))
+            raise HTTPException(status_code=409, detail=(
+                "This is the credit decision stage. It is decided in Ficium's approval "
+                "engine; submit it from the portal."))
 
         documents_gate(conn, loan_id, stage_id)
 
@@ -475,6 +489,62 @@ def correct_pipeline_booking(
 ) -> dict:
     """Correct a recorded booking. Previous values are kept in the audit trail."""
     return _v1_booking(loan_id, body, claims, background, correction=True)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/pipeline/{loan_id}/credit-decision — the bank's credit system reports
+# its decision, for products whose credit stage is decision_source='external'.
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/pipeline/{loan_id}/credit-decision",
+    status_code=201,
+    dependencies=[Depends(require_scope("pipeline:write"))],
+)
+def record_pipeline_credit_decision(
+    loan_id: str,
+    background: BackgroundTasks,
+    body: Annotated[CreditDecisionInput, Body()],
+    claims: dict[str, Any] = Depends(api_or_jwt_claims),
+) -> dict:
+    """
+    Record the credit decision made in your own system.
+
+    outcome: approved | approved_with_conditions | referred_back | declined.
+    external_reference is required (your application or minute number).
+    conditions are required for approved_with_conditions; reason for
+    referred_back and declined. Approval advances the deal, refer-back keeps
+    the stage open, decline declines the deal. Fires deal.credit_decided (and
+    deal.closed on decline). Refused with 409 for products whose credit is
+    decided in Ficium's approval engine.
+    """
+    iid = _institution_id_from_claims(claims)
+    is_api_key = claims.get("auth_method") == "api_key"
+    if not is_api_key:
+        with _svc() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT COALESCE(cg.module_permissions, pg.module_permissions, '{}'::text[]) AS modules
+                      FROM institution.member m
+                      LEFT JOIN institution."group"      cg ON cg.id = m.custom_group_id
+                      LEFT JOIN portal_admin.user_groups pg ON pg.id = m.group_id
+                     WHERE m.auth_user_id = CAST(:uid AS uuid) AND m.active
+                     LIMIT 1
+                """),
+                {"uid": claims.get("sub")},
+            ).first()
+        if not has_decision_permission(list(row.modules) if row else [], claims.get("user_role")):
+            raise HTTPException(status_code=403, detail="Requires 'inst:approvals'.")
+    with _svc() as conn:
+        decision = record_decision(
+            conn, institution_id=iid, pipeline_id=loan_id, body=body,
+            source="api" if is_api_key else "portal",
+            actor_id=None if is_api_key else claims.get("sub"),
+            actor_email=None if is_api_key else claims.get("email"),
+            api_key_id=claims.get("key_id") if is_api_key else None,
+            background=background,
+        )
+    return {"loan_id": loan_id, **decision}
 
 
 # ---------------------------------------------------------------------------

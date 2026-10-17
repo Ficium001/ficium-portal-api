@@ -111,7 +111,8 @@ def _client(session: Session):
 
 
 ROUTED = {"id": "s1", "status": "active", "requires_maker_checker": True,
-          "approval_route": True, "label": "Credit approval", "position": 4}
+          "approval_route": True, "decision_source": "internal",
+          "label": "Credit approval", "position": 4}
 CATCH_ALL = _Row(id=RULE, entity_type="facility", priority=1000, conditions={}, template_id=TPL)
 
 

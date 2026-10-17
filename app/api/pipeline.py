@@ -8,6 +8,7 @@
 #   POST /pipelines/{id}/stages/{stage_id}/advance   — mark stage complete / submit for approval
 #   POST /pipelines/{id}/stages/{stage_id}/approve   — checker approves (maker-checker stages)
 #   POST /pipelines/{id}/close                         — decline (bank) or withdraw (borrower), with reason
+#   POST /pipelines/{id}/credit-decision               — record a decision made in the bank's own system
 #
 # Credit approval (db/026): a stage with approval_route=true is decided by the
 # approval engine, not by a checker click. Submitting it routes the facility
@@ -30,12 +31,18 @@ from decimal import Decimal
 
 import httpx
 import structlog
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core import doa
 from ..core.config import settings
+from ..core.credit_decision import (
+    CreditDecisionInput,
+    has_decision_permission,
+    list_decisions,
+    record_decision,
+)
 from ..core.db import service_session
 from ..core.webhooks import dispatch_event
 from ..deps import current_claims, require_module, tenant_conn
@@ -260,6 +267,7 @@ async def get_pipeline(
             psd.requires_maker_checker,
             psd.requires_documents,
             psd.approval_route,
+            psd.decision_source,
             -- document checklist for this stage (db/027)
             (SELECT count(*) FROM marketplace.deal_document dd
                JOIN institution.doc_requirement r ON r.id = dd.requirement_id
@@ -286,7 +294,8 @@ async def get_pipeline(
         ORDER BY psi.position
     """), {"pid": pipeline_id}))
 
-    return {**pipeline, "stages": stages}
+    credit_decisions = list_decisions(conn, institution_id, pipeline_id)
+    return {**pipeline, "stages": stages, "credit_decisions": credit_decisions}
 
 
 # ── POST /pipelines/{id}/stages/{stage_id}/advance ────────────────────────────
@@ -324,7 +333,7 @@ async def advance_stage(
         # Guard: stage belongs to this pipeline and is active
         stage = _one(conn.execute(text("""
             SELECT psi.id, psi.status, psd.requires_maker_checker, psd.approval_route,
-                   psd.label, psi.position
+                   psd.decision_source, psd.label, psi.position
             FROM marketplace.pipeline_stage_instance psi
             JOIN institution.pipeline_stage_def psd ON psd.id = psi.stage_def_id
             WHERE psi.id = :sid AND psi.pipeline_id = :pid
@@ -336,6 +345,11 @@ async def advance_stage(
                 detail=f"Stage is '{stage['status']}', not active.")
 
         documents_gate(conn, pipeline_id, stage_id)
+
+        if stage["approval_route"] and stage["decision_source"] == "external":
+            raise HTTPException(status_code=409,
+                detail="This product's credit decision is made in your credit system. "
+                       "Record the decision on the deal instead.")
 
         if stage["approval_route"]:
             if not member_id:
@@ -661,3 +675,35 @@ async def close_deal(
         "loan_id": pipeline_id, "outcome": outcome, "reason": reason,
     }))
     return dict(result)
+
+
+# ── POST /pipelines/{id}/credit-decision ──────────────────────────────────────
+@router.post("/{pipeline_id}/credit-decision", status_code=201)
+async def record_credit_decision(
+    pipeline_id: str,
+    background:  BackgroundTasks,
+    body:        CreditDecisionInput = Body(...),
+    conn:        Session = Depends(tenant_conn),
+    claims:      dict = Depends(current_claims),
+) -> dict:
+    """
+    Record a credit decision made in the institution's own system, for a
+    product whose credit stage is set to decision_source='external'.
+    approved / approved_with_conditions advance the deal; referred_back keeps
+    the stage open with the reason; declined declines the deal.
+    """
+    institution_id = claims.get("institution_id")
+    member_id = claims.get("sub")
+    if not institution_id or not member_id:
+        raise HTTPException(status_code=403, detail="Not associated with an institution.")
+    # Live group permissions, not the JWT snapshot (same as booking).
+    row = conn.execute(text("SELECT modules FROM institution.current_member_ctx_v2()")).first()
+    if not has_decision_permission(list(row.modules) if row and row.modules else [],
+                                   claims.get("user_role")):
+        raise HTTPException(status_code=403, detail="Requires 'inst:approvals'.")
+    with service_session() as svc:
+        return record_decision(
+            svc, institution_id=str(institution_id), pipeline_id=pipeline_id, body=body,
+            source="portal", actor_id=member_id, actor_email=claims.get("email"),
+            api_key_id=None, background=background,
+        )
