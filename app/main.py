@@ -3,6 +3,7 @@
 # =============================================================================
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 
 import structlog
@@ -94,29 +95,34 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
 
+_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+_origin_re = re.compile(settings.allowed_origin_regex) if settings.allowed_origin_regex else None
+
+
+def _cors_headers(request: Request) -> dict[str, str]:
+    """The CORS headers CORSMiddleware would have added for this request."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    if origin in _origins or (_origin_re is not None and _origin_re.fullmatch(origin)):
+        return {"Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
+    return {}
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """
-    Without this, an unhandled exception (a raw DB error, a bug, anything that
-    isn't an HTTPException) propagates past Starlette's ExceptionMiddleware to
-    ServerErrorMiddleware, which sits OUTSIDE CORSMiddleware in the default
-    middleware stack. Starlette adds user middleware innermost-last, so the
-    plain 500 that ServerErrorMiddleware returns never passes back through
-    CORSMiddleware and carries no Access-Control-Allow-Origin header. The
-    browser then reports the failure as a CORS error, hiding the real 500 and
-    making it look like a frontend/config problem when it's a backend bug.
+    Log an unhandled exception and return a generic 500 the browser can read.
 
-    Registering a handler for the base Exception runs it inside Starlette's
-    ExceptionMiddleware instead, which IS wrapped by CORSMiddleware, so the
-    resulting response gets CORS headers like any other. This does not change
-    what gets returned to a well-behaved client (HTTPException still goes
-    through FastAPI's normal path) — it only stops genuine bugs from
-    presenting as a browser-side CORS failure.
-
-    Real incident: GET /institution/doc-templates 500ed with "permission
-    denied for table doc_template" (a missing GRANT, fixed separately) and
-    the browser showed only a CORS error — the actual cause was invisible
-    without server logs.
+    Starlette routes a handler for the base Exception (or status 500) to
+    ServerErrorMiddleware, the OUTERMOST layer, outside CORSMiddleware. So the
+    500 never passes back through CORS and the browser reports a CORS error,
+    hiding the real failure. (The Aug 2026 version of this handler assumed it
+    ran inside CORS; it didn't, and every 500 still showed as CORS: the
+    doc-templates missing GRANT, then the workflow editor's broken SQL in
+    Oct 2026.) The handler therefore adds the same CORS headers itself, from
+    the same allow-list.
     """
     log.error(
         "unhandled_exception",
@@ -125,13 +131,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
         error=str(exc),
         error_type=type(exc).__name__,
     )
-    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."},
+                        headers=_cors_headers(request))
 
 
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(DefaultResponseHeadersMiddleware)
 
-_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
 app.add_middleware(RequestObservabilityMiddleware)
 app.add_middleware(
     CORSMiddleware,
