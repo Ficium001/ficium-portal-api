@@ -547,7 +547,7 @@ def _submit_for_credit_approval(
         raise HTTPException(
             status_code=409,
             detail="No credit approval rule covers this facility. "
-                   "Add one under Setup > Institution > Approval chains.",
+                   "Add one under Setup > Credit approval.",
         ) from exc
 
     snapshot = {
