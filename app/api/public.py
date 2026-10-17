@@ -72,6 +72,8 @@ async def get_bids_for_request(
                             jsonb_build_object(
                               'title',        bb.title,
                               'value_display',bb.value_display,
+                              'value_amount',bb.value_amount,
+                              'value_unit',bb.value_unit,
                               'is_guaranteed',bb.is_guaranteed,
                               'cat_code',     bb.cat_code
                             ) ORDER BY bb.is_guaranteed DESC
@@ -157,6 +159,8 @@ async def get_bids_bulk(
                             jsonb_build_object(
                               'title',        bb.title,
                               'value_display',bb.value_display,
+                              'value_amount',bb.value_amount,
+                              'value_unit',bb.value_unit,
                               'is_guaranteed',bb.is_guaranteed,
                               'cat_code',     bb.cat_code
                             ) ORDER BY bb.is_guaranteed DESC
