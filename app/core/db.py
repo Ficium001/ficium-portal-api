@@ -153,21 +153,16 @@ def tenant_session(claims: dict[str, Any]) -> Generator[Session]:
     claims_json = json.dumps(claims, separators=(",", ":"))
     session = SessionLocal()
     try:
-        # set_config publishes JWT claims so auth.uid() / auth.jwt() resolve
-        # for RLS policies.
+        # One round trip for both steps (was two): set_config('role', ...,
+        # true) is SET LOCAL ROLE. Verified on the Portal DB that it leaves
+        # current_user = authenticated with rolbypassrls = false. Every API
+        # call pays each DB round trip, so this matters when the API and
+        # the database are in different regions.
         session.execute(
-            text("SELECT set_config('request.jwt.claims', :c, true)"),
+            text("SELECT set_config('request.jwt.claims', :c, true), "
+                 "set_config('role', 'authenticated', true)"),
             {"c": claims_json},
         )
-        # SET LOCAL ROLE authenticated — drops BYPASSRLS so the policies set
-        # above actually get evaluated. The pooler connects as `postgres`
-        # (rolbypassrls=true, confirmed via pg_roles); without this, every
-        # RLS policy on every table is a no-op regardless of how it's
-        # written. `postgres` is already a member of `authenticated` (no
-        # extra GRANT needed for the role switch itself — confirmed via
-        # pg_auth_members), and `authenticated` holds USAGE + the required
-        # table grants on every schema/table the routers touch.
-        session.execute(text("SET LOCAL ROLE authenticated"))
         yield session
         session.commit()
     except Exception:

@@ -40,6 +40,8 @@ from .api.members import router as members_router
 from .api.notifications import router as notifications_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
+from .api.portal_badges import router as portal_badges_router
+from .api.product_limits import router as product_limits_router
 from .api.public import router as public_router
 from .api.request_chat import router as request_chat_router
 from .api.v1.marketplace import router as v1_marketplace_router
@@ -178,6 +180,8 @@ app.include_router(doc_templates_router)  # document template designer (inst:doc
 app.include_router(booking_router)        # deal booking hand-off (inst:booking)
 app.include_router(pipeline_router)
 app.include_router(notifications_router)
+app.include_router(product_limits_router)
+app.include_router(portal_badges_router)
 app.include_router(public_router)       # server-to-server, no JWT
 app.include_router(api_keys_router)     # institution API key management
 app.include_router(webhooks_router)     # webhook CRUD + delivery log

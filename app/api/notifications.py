@@ -7,17 +7,19 @@
 #   - This API (on pipeline advance, approval events, bid acceptance)
 #   - The public.py server-to-server endpoint (on bid accepted from app DB)
 #
-# Reads are handled directly by the portal UI via the Supabase client with
-# RLS (institution_members_read_own_notifications policy). This router handles
-# the server-side writes that require service_role access.
+# The portal reads through this router, not the Supabase client: portal users
+# sign in with ficium-auth, so a direct Supabase read has no session and 401s
+# (it did, every 30 s, until Oct 2026).
 #
 # Endpoints:
-#   POST /notifications/write        Write a notification (service-to-service)
-#   GET  /notifications              List for current institution (via portal client)
+#   GET  /notifications                  latest notifications for the institution
+#   GET  /notifications/unread-count     badge count
+#   POST /notifications/{id}/mark-read   mark one read
+#   POST /notifications/mark-all-read    mark all read
 # =============================================================================
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
 from ..core.db import service_session
@@ -62,7 +64,30 @@ def _write_notification(
 
 
 # ---------------------------------------------------------------------------
-# GET /notifications — summary count for shell badge
+# GET /notifications — latest for the caller's institution
+# ---------------------------------------------------------------------------
+@router.get("")
+async def list_notifications(
+    limit: int = Query(default=50, ge=1, le=200),
+    claims: dict = Depends(current_claims),
+) -> list[dict]:
+    institution_id = claims.get("institution_id")
+    if not institution_id:
+        raise HTTPException(status_code=403, detail="Not associated with an institution.")
+
+    with service_session() as conn:
+        rows = conn.execute(text("""
+            SELECT id, kind, title, body, link, read_at, created_at, metadata
+            FROM public.portal_notifications
+            WHERE institution_id = :iid
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """), {"iid": institution_id, "lim": limit}).mappings().all()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# GET /notifications/unread-count — summary count for shell badge
 # ---------------------------------------------------------------------------
 @router.get("/unread-count")
 async def unread_count(claims: dict = Depends(current_claims)) -> dict:
