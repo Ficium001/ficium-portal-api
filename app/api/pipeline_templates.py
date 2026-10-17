@@ -160,12 +160,12 @@ async def create_template(
             row = _one(sconn.execute(text("""
                 INSERT INTO institution.pipeline_stage_def
                     (template_id, institution_id, stage_key, label, description,
-                     position, sla_hours, requires_maker_checker, requires_documents,
+                     position, sla_hours, requires_maker_checker, requires_documents, approval_route,
                      borrower_label, borrower_visible)
                 VALUES (:tid, :iid, :sk::institution.stage_key_enum, :label, :desc,
-                        :pos, :sla, :rmc, :rdoc, :blabel, :bvis)
+                        :pos, :sla, :rmc, :rdoc, :aroute, :blabel, :bvis)
                 RETURNING id, position, stage_key, label, description, sla_hours,
-                          requires_maker_checker, requires_documents,
+                          requires_maker_checker, requires_documents, approval_route,
                           borrower_label, borrower_visible, is_active
             """), {
                 "tid":    tmpl["id"],
@@ -177,6 +177,7 @@ async def create_template(
                 "sla":    s.get("sla_hours", 48),
                 "rmc":    s.get("requires_maker_checker", False),
                 "rdoc":   s.get("requires_documents", False),
+                "aroute": s.get("approval_route", False),
                 "blabel": (s.get("borrower_label") or "").strip() or None,
                 "bvis":   s.get("borrower_visible", True),
             }))
@@ -212,7 +213,7 @@ async def get_template(
 
     stages = _rows(conn.execute(text("""
         SELECT id, position, stage_key, label, description, sla_hours,
-               requires_maker_checker, requires_documents,
+               requires_maker_checker, requires_documents, approval_route,
                borrower_label, borrower_visible, is_active, created_at
         FROM institution.pipeline_stage_def
         WHERE template_id = :tid AND institution_id = :iid
@@ -326,12 +327,12 @@ async def add_stage(
         stage = _one(sconn.execute(text("""
             INSERT INTO institution.pipeline_stage_def
                 (template_id, institution_id, stage_key, label, description,
-                 position, sla_hours, requires_maker_checker, requires_documents,
+                 position, sla_hours, requires_maker_checker, requires_documents, approval_route,
                  borrower_label, borrower_visible)
             VALUES (:tid, :iid, :sk::institution.stage_key_enum, :label, :desc,
-                    :pos, :sla, :rmc, :rdoc, :blabel, :bvis)
+                    :pos, :sla, :rmc, :rdoc, :aroute, :blabel, :bvis)
             RETURNING id, position, stage_key, label, description, sla_hours,
-                      requires_maker_checker, requires_documents,
+                      requires_maker_checker, requires_documents, approval_route,
                       borrower_label, borrower_visible, is_active, created_at
         """), {
             "tid":    template_id,
@@ -343,6 +344,7 @@ async def add_stage(
             "sla":    body.get("sla_hours", 48),
             "rmc":    body.get("requires_maker_checker", False),
             "rdoc":   body.get("requires_documents", False),
+            "aroute": body.get("approval_route", False),
             "blabel": (body.get("borrower_label") or "").strip() or None,
             "bvis":   body.get("borrower_visible", True),
         }))
@@ -388,11 +390,12 @@ async def update_stage(
                 sla_hours              = COALESCE(:sla,   sla_hours),
                 requires_maker_checker = COALESCE(:rmc,   requires_maker_checker),
                 requires_documents     = COALESCE(:rdoc,  requires_documents),
+                approval_route         = COALESCE(:aroute, approval_route),
                 borrower_label         = COALESCE(:blabel, borrower_label),
                 borrower_visible       = COALESCE(:bvis,   borrower_visible)
             WHERE id = :sid
             RETURNING id, position, stage_key, label, description, sla_hours,
-                      requires_maker_checker, requires_documents,
+                      requires_maker_checker, requires_documents, approval_route,
                       borrower_label, borrower_visible, is_active
         """), {
             "sid":    stage_id,
@@ -402,6 +405,7 @@ async def update_stage(
             "sla":    body.get("sla_hours"),
             "rmc":    body.get("requires_maker_checker"),
             "rdoc":   body.get("requires_documents"),
+            "aroute": body.get("approval_route"),
             "blabel": body.get("borrower_label"),
             "bvis":   body.get("borrower_visible"),
         }))
