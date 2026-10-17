@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Generator
 from typing import Any
 
@@ -149,6 +150,29 @@ async def api_or_jwt_claims(
         raise HTTPException(status_code=401, detail=str(e)) from e
 
 
+# Licensed modules per institution, cached briefly. require_module runs on
+# most portal requests and used to open its own DB connection each time
+# (pre-ping, query, commit: three extra round trips per call). Licensing
+# changes rarely; a change takes effect within _MODULES_TTL seconds.
+_MODULES_TTL = 30.0
+_modules_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _institution_modules(institution_id: str) -> list[str]:
+    now = time.monotonic()
+    hit = _modules_cache.get(institution_id)
+    if hit and now - hit[0] < _MODULES_TTL:
+        return hit[1]
+    with service_session() as conn:
+        row = conn.execute(
+            text("SELECT modules FROM institution.institution WHERE id = :iid"),
+            {"iid": institution_id},
+        ).fetchone()
+    modules = list(row.modules) if row and row.modules else []
+    _modules_cache[institution_id] = (now, modules)
+    return modules
+
+
 def require_module(module_key: str):
     """
     Dependency factory — 403s unless the caller's institution is entitled
@@ -162,12 +186,7 @@ def require_module(module_key: str):
         institution_id = claims.get("institution_id")
         if not institution_id:
             raise HTTPException(status_code=403, detail="Not associated with an institution.")
-        with service_session() as conn:
-            row = conn.execute(
-                text("SELECT modules FROM institution.institution WHERE id = :iid"),
-                {"iid": institution_id},
-            ).fetchone()
-        modules = list(row.modules) if row and row.modules else []
+        modules = _institution_modules(str(institution_id))
         if module_key not in modules:
             raise HTTPException(
                 status_code=403,
