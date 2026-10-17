@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
+from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims, require_module, tenant_conn
 
 # Every route below requires the institution to be licensed for the
@@ -32,6 +33,24 @@ router = APIRouter(
     tags=["pipeline-templates"],
     dependencies=[Depends(require_module("pipeline"))],
 )
+
+
+def _admin_only(claims: dict = Depends(current_claims)) -> None:
+    # Workflows decide how credit is approved (approval_route, decision_source).
+    # Until Oct 2026 any member could edit them — an officer could switch off
+    # credit approval on their own deal's product. Admins only.
+    if claims.get("user_role", "") not in INSTITUTION_ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Requires institution admin.")
+
+
+def _decision_source(v: object, default: str | None) -> str | None:
+    if v is None:
+        return default
+    if v not in ("internal", "external"):
+        raise HTTPException(status_code=422,
+            detail="decision_source must be 'internal' or 'external'.")
+    return str(v)
+
 
 def _rows(result) -> list[dict]: return [dict(r._mapping) for r in result.fetchall()]
 def _one(result)  -> dict | None:
@@ -80,7 +99,7 @@ async def list_templates(
 
 
 # ── POST /pipelines/templates ──────────────────────────────────────────────────
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(_admin_only)])
 async def create_template(
     body:   dict = Body(...),
     claims: dict = Depends(current_claims),
@@ -160,12 +179,12 @@ async def create_template(
             row = _one(sconn.execute(text("""
                 INSERT INTO institution.pipeline_stage_def
                     (template_id, institution_id, stage_key, label, description,
-                     position, sla_hours, requires_maker_checker, requires_documents, approval_route,
+                     position, sla_hours, requires_maker_checker, requires_documents, approval_route, decision_source,
                      borrower_label, borrower_visible)
                 VALUES (:tid, :iid, :sk::institution.stage_key_enum, :label, :desc,
-                        :pos, :sla, :rmc, :rdoc, :aroute, :blabel, :bvis)
+                        :pos, :sla, :rmc, :rdoc, :aroute, :dsrc, :blabel, :bvis)
                 RETURNING id, position, stage_key, label, description, sla_hours,
-                          requires_maker_checker, requires_documents, approval_route,
+                          requires_maker_checker, requires_documents, approval_route, decision_source,
                           borrower_label, borrower_visible, is_active
             """), {
                 "tid":    tmpl["id"],
@@ -178,6 +197,7 @@ async def create_template(
                 "rmc":    s.get("requires_maker_checker", False),
                 "rdoc":   s.get("requires_documents", False),
                 "aroute": s.get("approval_route", False),
+                "dsrc":   _decision_source(s.get("decision_source"), "internal"),
                 "blabel": (s.get("borrower_label") or "").strip() or None,
                 "bvis":   s.get("borrower_visible", True),
             }))
@@ -213,7 +233,7 @@ async def get_template(
 
     stages = _rows(conn.execute(text("""
         SELECT id, position, stage_key, label, description, sla_hours,
-               requires_maker_checker, requires_documents, approval_route,
+               requires_maker_checker, requires_documents, approval_route, decision_source,
                borrower_label, borrower_visible, is_active, created_at
         FROM institution.pipeline_stage_def
         WHERE template_id = :tid AND institution_id = :iid
@@ -224,7 +244,7 @@ async def get_template(
 
 
 # ── PUT /pipelines/templates/{id} ─────────────────────────────────────────────
-@router.put("/{template_id}")
+@router.put("/{template_id}", dependencies=[Depends(_admin_only)])
 async def update_template(
     template_id: str,
     body:        dict = Body(...),
@@ -288,7 +308,7 @@ async def update_template(
 
 
 # ── POST /pipelines/templates/{id}/stages ─────────────────────────────────────
-@router.post("/{template_id}/stages", status_code=201)
+@router.post("/{template_id}/stages", status_code=201, dependencies=[Depends(_admin_only)])
 async def add_stage(
     template_id: str,
     body:        dict = Body(...),
@@ -327,12 +347,12 @@ async def add_stage(
         stage = _one(sconn.execute(text("""
             INSERT INTO institution.pipeline_stage_def
                 (template_id, institution_id, stage_key, label, description,
-                 position, sla_hours, requires_maker_checker, requires_documents, approval_route,
+                 position, sla_hours, requires_maker_checker, requires_documents, approval_route, decision_source,
                  borrower_label, borrower_visible)
             VALUES (:tid, :iid, :sk::institution.stage_key_enum, :label, :desc,
-                    :pos, :sla, :rmc, :rdoc, :aroute, :blabel, :bvis)
+                    :pos, :sla, :rmc, :rdoc, :aroute, :dsrc, :blabel, :bvis)
             RETURNING id, position, stage_key, label, description, sla_hours,
-                      requires_maker_checker, requires_documents, approval_route,
+                      requires_maker_checker, requires_documents, approval_route, decision_source,
                       borrower_label, borrower_visible, is_active, created_at
         """), {
             "tid":    template_id,
@@ -345,6 +365,7 @@ async def add_stage(
             "rmc":    body.get("requires_maker_checker", False),
             "rdoc":   body.get("requires_documents", False),
             "aroute": body.get("approval_route", False),
+            "dsrc":   _decision_source(body.get("decision_source"), "internal"),
             "blabel": (body.get("borrower_label") or "").strip() or None,
             "bvis":   body.get("borrower_visible", True),
         }))
@@ -355,7 +376,7 @@ async def add_stage(
 
 
 # ── PUT /pipelines/templates/{id}/stages/{sid} ────────────────────────────────
-@router.put("/{template_id}/stages/{stage_id}")
+@router.put("/{template_id}/stages/{stage_id}", dependencies=[Depends(_admin_only)])
 async def update_stage(
     template_id: str,
     stage_id:    str,
@@ -391,11 +412,12 @@ async def update_stage(
                 requires_maker_checker = COALESCE(:rmc,   requires_maker_checker),
                 requires_documents     = COALESCE(:rdoc,  requires_documents),
                 approval_route         = COALESCE(:aroute, approval_route),
+                decision_source        = COALESCE(:dsrc,   decision_source),
                 borrower_label         = COALESCE(:blabel, borrower_label),
                 borrower_visible       = COALESCE(:bvis,   borrower_visible)
             WHERE id = :sid
             RETURNING id, position, stage_key, label, description, sla_hours,
-                      requires_maker_checker, requires_documents, approval_route,
+                      requires_maker_checker, requires_documents, approval_route, decision_source,
                       borrower_label, borrower_visible, is_active
         """), {
             "sid":    stage_id,
@@ -406,6 +428,7 @@ async def update_stage(
             "rmc":    body.get("requires_maker_checker"),
             "rdoc":   body.get("requires_documents"),
             "aroute": body.get("approval_route"),
+            "dsrc":   _decision_source(body.get("decision_source"), None),
             "blabel": body.get("borrower_label"),
             "bvis":   body.get("borrower_visible"),
         }))
@@ -416,7 +439,7 @@ async def update_stage(
 
 
 # ── DELETE /pipelines/templates/{id}/stages/{sid} ─────────────────────────────
-@router.delete("/{template_id}/stages/{stage_id}")
+@router.delete("/{template_id}/stages/{stage_id}", dependencies=[Depends(_admin_only)])
 async def delete_stage(
     template_id: str,
     stage_id:    str,

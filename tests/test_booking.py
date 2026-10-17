@@ -276,7 +276,8 @@ class _AdvanceSession(FakeSession):
         if "FROM marketplace.pipeline_stage_instance psi" in q:
             return _Result(first=_Row(id="s1", status=self.stage_status, position=1,
                                       stage_key="kyc", borrower_label="KYC",
-                                      requires_maker_checker=self.mc))
+                                      requires_maker_checker=self.mc,
+                                      approval_route=False, decision_source="internal"))
         if "RETURNING id, position" in q:
             return _Result(first=_Row(id="s2", position=2) if self.has_next else None)
         return _Result()
