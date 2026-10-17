@@ -72,11 +72,17 @@ async def get_bids_for_request(
                             jsonb_build_object(
                               'title',        bb.title,
                               'value_display',bb.value_display,
-                              'value_amount',bb.value_amount,
-                              'value_unit',bb.value_unit,
                               'is_guaranteed',bb.is_guaranteed,
                               'cat_code',     bb.cat_code
-                            ) ORDER BY bb.is_guaranteed DESC
+                            )
+                            -- Contract units (v1.3.0), same conversion as the
+                            -- bid events: rate_pa / fee_fraction as decimal
+                            -- fractions, amount in the bid currency (db/030).
+                            || integration.benefit_value(
+                                 bb.value_amount, bb.value_unit,
+                                 (SELECT rq.currency FROM marketplace.request rq
+                                   WHERE rq.id = b.request_id))
+                            ORDER BY bb.is_guaranteed DESC
                           ) FILTER (WHERE bb.id IS NOT NULL),
                           '[]'::jsonb
                         ) AS benefits,
@@ -159,11 +165,17 @@ async def get_bids_bulk(
                             jsonb_build_object(
                               'title',        bb.title,
                               'value_display',bb.value_display,
-                              'value_amount',bb.value_amount,
-                              'value_unit',bb.value_unit,
                               'is_guaranteed',bb.is_guaranteed,
                               'cat_code',     bb.cat_code
-                            ) ORDER BY bb.is_guaranteed DESC
+                            )
+                            -- Contract units (v1.3.0), same conversion as the
+                            -- bid events: rate_pa / fee_fraction as decimal
+                            -- fractions, amount in the bid currency (db/030).
+                            || integration.benefit_value(
+                                 bb.value_amount, bb.value_unit,
+                                 (SELECT rq.currency FROM marketplace.request rq
+                                   WHERE rq.id = b.request_id))
+                            ORDER BY bb.is_guaranteed DESC
                           ) FILTER (WHERE bb.id IS NOT NULL),
                           '[]'::jsonb
                         ) AS benefits,
