@@ -35,6 +35,11 @@ from ..deps import current_claims, require_module
 router = APIRouter(tags=["documents-checklist"], dependencies=[Depends(require_module("pipeline"))])
 
 MAX_BYTES = 20 * 1024 * 1024
+DOCUMENT_TYPES = frozenset({
+    "payslip", "employment_letter", "tax_return", "bank_statement", "loan_statement", "credit_card_statement",
+    "title_deed", "valuation_report", "land_registry_extract", "brn_certificate", "audited_accounts",
+    "insurance_policy", "nic", "passport", "birth_certificate", "driving_licence", "other",
+})
 ALLOWED_MIME = {
     "application/pdf", "image/jpeg", "image/png", "image/heic", "image/webp",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -118,10 +123,11 @@ def list_deal_documents(pipeline_id: str, claims: dict = Depends(current_claims)
             SELECT dd.id, dd.status, dd.file_name, dd.mime_type, dd.file_size,
                    dd.uploaded_at, dd.reviewed_at, dd.review_note,
                    dd.uploaded_by, dd.reviewed_by,
+                   dd.uploaded_via, dd.source, dd.document_date,
                    portal_admin.get_user_display_name(dd.uploaded_by) AS uploaded_by_name,
                    portal_admin.get_user_display_name(dd.reviewed_by) AS reviewed_by_name,
                    r.id AS requirement_id, r.name, r.description, r.provided_by, r.mandatory,
-                   r.position, r.stage_def_id,
+                   r.position, r.stage_def_id, r.document_type, r.max_age_days,
                    sd.label AS stage_label, sd.position AS stage_position,
                    psi.status AS stage_status
               FROM marketplace.deal_document dd
@@ -232,7 +238,8 @@ async def document_file(pipeline_id: str, doc_id: str,
 
 
 # ── Checklist configuration (per workflow) ────────────────────────────────────
-_REQ_COLS = "id, template_id, stage_def_id, name, description, provided_by, mandatory, position, is_active"
+_REQ_COLS = ("id, template_id, stage_def_id, name, description, provided_by, mandatory, position, is_active, "
+             "document_type, max_age_days")
 
 
 def _template(conn: Session, iid: str, tid: str) -> None:
@@ -261,6 +268,23 @@ def _clean(body: dict, conn: Session, tid: str, partial: bool) -> dict:
         out["mandatory"] = bool(body.get("mandatory", True))
     if "position" in body:
         out["position"] = int(body["position"])
+    # Contract 1.5: lets the borrower reuse a matching vault copy, no older than max_age_days.
+    if "document_type" in body:
+        dt = body["document_type"] or None
+        if dt is not None and dt not in DOCUMENT_TYPES:
+            raise HTTPException(status_code=422, detail="Unknown document type.")
+        out["document_type"] = dt
+    if "max_age_days" in body:
+        raw_age = body["max_age_days"]
+        age: int | None = None
+        if raw_age not in (None, ""):
+            try:
+                age = int(raw_age)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="Maximum age is a number of days.") from None
+            if not 1 <= age <= 3650:
+                raise HTTPException(status_code=422, detail="Maximum age is 1 to 3650 days.")
+        out["max_age_days"] = age
     if "stage_def_id" in body or not partial:
         sid = body.get("stage_def_id")
         if sid and not conn.execute(text("""
@@ -295,13 +319,16 @@ def create_requirement(template_id: str, body: dict = Body(...),
         v = _clean(body, conn, template_id, partial=False)
         row = conn.execute(text(f"""
             INSERT INTO institution.doc_requirement
-                (institution_id, template_id, stage_def_id, name, description, provided_by, mandatory, position)
+                (institution_id, template_id, stage_def_id, name, description, provided_by, mandatory, position,
+                 document_type, max_age_days)
             VALUES (CAST(:iid AS uuid), CAST(:t AS uuid), CAST(:stage_def_id AS uuid), :name, :description,
                     :provided_by, :mandatory,
                     COALESCE(:position, (SELECT COALESCE(max(position), 0) + 1 FROM institution.doc_requirement
-                                          WHERE template_id = CAST(:t AS uuid))))
+                                          WHERE template_id = CAST(:t AS uuid))),
+                    :document_type, :max_age_days)
             RETURNING {_REQ_COLS}
-        """), {"iid": iid, "t": template_id, "description": None, "position": None, **v}).mappings().one()
+        """), {"iid": iid, "t": template_id, "description": None, "position": None,
+               "document_type": None, "max_age_days": None, **v}).mappings().one()
         conn.commit()
     return dict(row)
 
