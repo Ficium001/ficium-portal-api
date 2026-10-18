@@ -1,4 +1,5 @@
 """A decline is per institution and never touches the borrower database (db/035, contract 1.8.0)."""
+
 from __future__ import annotations
 
 import os
@@ -64,15 +65,13 @@ def client(visible: bool = True, error: str | None = None):
     def service():
         yield svc
 
-    def no_app_db():
-        raise AssertionError("a decline must never open a borrower-database session")
-
     app.dependency_overrides[current_claims] = claims
     app.dependency_overrides[tenant_conn] = tc
     try:
-        with patch.object(mp, "service_session", service), \
-             patch("app.core.db.app_service_session", no_app_db), \
-             patch.object(mp, "dispatch_event", lambda *a, **k: _noop()):
+        with (
+            patch.object(mp, "service_session", service),
+            patch.object(mp, "dispatch_event", lambda *a, **k: _noop()),
+        ):
             yield TestClient(app, raise_server_exceptions=False), svc
     finally:
         app.dependency_overrides.clear()
@@ -98,11 +97,14 @@ def test_request_not_visible_to_this_institution():
         assert c.post(f"/marketplace/requests/{RID}/reject", json={}).status_code == 404
 
 
-@pytest.mark.parametrize(("code", "status", "text_"), [
-    ("DECLINE_HAS_BID", 409, "Withdraw it instead"),
-    ("DECLINE_ALREADY", 409, "already declined"),
-    ("DECLINE_NOT_OPEN", 409, "no longer open"),
-])
+@pytest.mark.parametrize(
+    ("code", "status", "text_"),
+    [
+        ("DECLINE_HAS_BID", 409, "Withdraw it instead"),
+        ("DECLINE_ALREADY", 409, "already declined"),
+        ("DECLINE_NOT_OPEN", 409, "no longer open"),
+    ],
+)
 def test_refusals(code, status, text_):
     with client(error=code) as (c, _):
         r = c.post(f"/marketplace/requests/{RID}/reject", json={})
@@ -113,5 +115,5 @@ def test_marketplace_module_has_no_borrower_database_access():
     import inspect
 
     src = inspect.getsource(mp)
-    assert "app_service_session" not in src          # no session to the borrower database
+    assert "app_service_session" not in src  # no session to the borrower database
     assert "SELECT public.reject_request" not in src  # no call into it

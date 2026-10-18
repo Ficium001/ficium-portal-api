@@ -108,8 +108,12 @@ def test_events_from_institution_side_rejected(client):
     assert client.recorded == []
 
 
-def test_unhandled_type_not_recorded_so_sender_retries(client):
-    # a borrower-side type with no handler yet: 501 and NOT recorded, so the sender retries
+def test_unhandled_type_not_recorded_so_sender_retries(client, monkeypatch):
+    from app.api import integration as api
+
+    # a type with no handler: 501 and NOT recorded, so the sender retries (every borrower-side
+    # type is handled since chat moved to the contract, so remove one for this test)
+    monkeypatch.delitem(api.HANDLERS, "chat.message")
     r = post(client, json.load(open("tests/fixtures/chat-from-borrower.json")))
     assert r.status_code == 501
     assert client.recorded == []
@@ -308,3 +312,49 @@ async def test_dispatcher_sends_a_real_bid_payload(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
         counts = await d.dispatch_once(c)
     assert len(sent) == 1 and counts["delivered"] == 1
+
+
+def test_borrower_chat_message_is_accepted(client):
+    r = post(client, json.load(open("tests/fixtures/chat-from-borrower.json")))
+    assert r.status_code == 200 and client.recorded
+
+
+def _chat_env(**data):
+    base = {
+        "message_id": "m1",
+        "request_id": "r1",
+        "institution_id": "i1",
+        "sender_side": "borrower",
+        "template_code": "q.insurance",
+        "params": {},
+        "body": "Is insurance required for this facility?",
+        "sent_at": "2026-10-18T09:00:00Z",
+    }
+    return {"id": "evt_0123456789abcdef", "type": "chat.message", "data": {**base, **data}}
+
+
+def test_chat_handler_stores_a_matching_borrower_message():
+    from app.api import integration as api
+
+    rec = _Rec()
+    api.HANDLERS["chat.message"](rec, _chat_env())
+    assert len(rec.calls) == 1 and "integration.apply_chat_message(" in rec.calls[0][0]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"body": "Call me on 5555 1234"},  # body differs from its template
+        {
+            "template_code": "a.rate_final",
+            "body": "The offered rate is final.",
+        },  # bank template from a borrower
+        {"sender_side": "institution"},  # only borrower messages come this way
+    ],
+)
+def test_chat_handler_drops_what_does_not_render(data):
+    from app.api import integration as api
+
+    rec = _Rec()
+    api.HANDLERS["chat.message"](rec, _chat_env(**data))
+    assert rec.calls == []

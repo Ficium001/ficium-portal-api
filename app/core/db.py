@@ -50,14 +50,12 @@ log = structlog.get_logger()
 _engine = None
 _SessionLocal = None
 
-# Cross-project engine for the Ficium App database (marketplace pool).
-# Lazily created only if app_database_url is configured.
-_app_engine = None
-_AppSessionLocal = None
+# There is deliberately no engine for the borrower (App) database: all traffic
+# with the borrower app goes through the integration contract (Oct 2026).
 
 
 def init_pool() -> None:
-    global _engine, _SessionLocal, _app_engine, _AppSessionLocal
+    global _engine, _SessionLocal
     if _engine is None:
         _engine = create_engine(
             settings.database_url,
@@ -83,39 +81,14 @@ def init_pool() -> None:
         _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
         log.info("db_pool_ready", min=settings.db_pool_min, max=settings.db_pool_max)
 
-    if _app_engine is None and settings.app_database_url:
-        _app_engine = create_engine(
-            settings.app_database_url,
-            pool_size=settings.db_pool_min,
-            max_overflow=settings.db_pool_max - settings.db_pool_min,
-            pool_pre_ping=True,
-            pool_recycle=300,
-            connect_args={
-                "sslmode": "require",
-                "keepalives": 1,
-                "keepalives_idle": 30,
-                "keepalives_interval": 10,
-                "keepalives_count": 5,
-            },
-        )
-        _AppSessionLocal = sessionmaker(bind=_app_engine, autocommit=False, autoflush=False)
-        log.info("app_db_pool_ready")
-    elif not settings.app_database_url:
-        log.warning("app_db_pool_skipped", reason="APP_DATABASE_URL not set")
-
 
 def close_pool() -> None:
-    global _engine, _SessionLocal, _app_engine, _AppSessionLocal
+    global _engine, _SessionLocal
     if _engine is not None:
         _engine.dispose()
         _engine = None
         _SessionLocal = None
         log.info("db_pool_closed")
-    if _app_engine is not None:
-        _app_engine.dispose()
-        _app_engine = None
-        _AppSessionLocal = None
-        log.info("app_db_pool_closed")
 
 
 def _session_or_raise() -> sessionmaker:
@@ -177,36 +150,6 @@ def service_session() -> Generator[Session]:
     """Privileged session for admin operations outside tenant RLS scope."""
     SessionLocal = _session_or_raise()
     session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-class AppDatabaseUnavailable(RuntimeError):
-    """Raised when APP_DATABASE_URL is not configured but an App read is attempted."""
-
-
-@contextmanager
-def app_service_session() -> Generator[Session]:
-    """
-    Read-only session against the Ficium App database (cross-project).
-    Used by the marketplace, which reads public.requests and
-    public.client_financial_snapshot from the App Supabase project.
-
-    Raises AppDatabaseUnavailable (mapped to HTTP 503 by the router) if
-    APP_DATABASE_URL is not configured, so a missing var surfaces as a
-    clear "temporarily unavailable" rather than an opaque 500.
-    """
-    if _AppSessionLocal is None:
-        raise AppDatabaseUnavailable(
-            "APP_DATABASE_URL not configured — marketplace reads are unavailable."
-        )
-    session = _AppSessionLocal()
     try:
         yield session
         session.commit()

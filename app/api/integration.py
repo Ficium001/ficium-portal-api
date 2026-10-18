@@ -62,10 +62,30 @@ def _handle_request_status_changed(session: Session, envelope: dict[str, Any]) -
     return False
 
 
+def _handle_chat_message(session: Session, envelope: dict[str, Any]) -> None:
+    """A borrower's chat message (contract 1.9.1). A structured one must render, with the shared
+    contract renderer, to exactly its body; anything else is dropped (logged), not stored."""
+    d = envelope["data"]
+    if d.get("sender_side") != "borrower":
+        log.warning("chat_message_wrong_side", event_id=envelope.get("id"))
+        return
+    if d.get("template_code"):
+        try:
+            body, _ = fc.render_chat_message(d["template_code"], d.get("params") or {}, "borrower")
+        except fc.ContractError as exc:
+            log.warning("chat_message_bad_template", event_id=envelope.get("id"), error=str(exc))
+            return
+        if body != d.get("body"):
+            log.warning("chat_message_body_mismatch", event_id=envelope.get("id"))
+            return
+    session.execute(text("SELECT integration.apply_chat_message(CAST(:e AS jsonb))"), {"e": json.dumps(envelope)})
+
+
 HANDLERS: dict[str, Handler] = {
     "ping": _handle_ping,
     "request.published": _handle_request_published,
     "request.status_changed": _handle_request_status_changed,
+    "chat.message": _handle_chat_message,
 }
 
 

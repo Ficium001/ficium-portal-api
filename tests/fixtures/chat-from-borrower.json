@@ -11,9 +11,9 @@
     "request_id": "00000000-0000-4000-8000-000000000001",
     "institution_id": "00000000-0000-4000-8000-000000000020",
     "sender_side": "borrower",
-    "template_code": "ask_fees",
+    "template_code": "q.fees_breakdown",
     "params": {},
-    "body": "What fees apply?",
+    "body": "Can you break down the fees on this offer?",
     "sent_at": "2026-10-02T11:00:00Z"
   }
 }

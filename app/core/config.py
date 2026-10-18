@@ -21,12 +21,6 @@ class Settings(BaseSettings):
     db_command_timeout:  float = 30.0
 
     # ── Cross-project: Ficium App database (marketplace pool) ──
-    # The marketplace reads public.requests / public.client_financial_snapshot
-    # which live in the Ficium App Supabase project, NOT the Portal project.
-    # Set to the App project's transaction-pooler DSN (port 6543).
-    # Optional: if empty, marketplace endpoints return 503 rather than 500.
-    app_database_url:    str = Field(default="", description="Ficium App Postgres DSN")
-
     # Ficium App's Supabase project (for verifying borrower session tokens via
     # GoTrue introspection — see core/app_auth.py). Different signer than
     # ficium-auth, so this is a separate trust path, not an extension of
@@ -34,7 +28,7 @@ class Settings(BaseSettings):
     app_supabase_url:      str = Field(default="", description="Ficium App Supabase project URL")
     app_supabase_anon_key: str = Field(default="", description="Ficium App Supabase anon key")
 
-    @field_validator("database_url", "app_database_url", mode="before")
+    @field_validator("database_url", mode="before")
     @classmethod
     def normalize_db_url(cls, v: str) -> str:
         """
