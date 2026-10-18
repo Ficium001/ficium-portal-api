@@ -4,19 +4,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import logging
-import uuid as uuid_mod
-from typing import Annotated
 
-from fastapi import APIRouter, Body, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Header, HTTPException
 from sqlalchemy import text
 
 from ..core.config import settings
-from ..core.db import AppDatabaseUnavailable, app_service_session, service_session
-from .notifications import _write_notification
+from ..core.db import service_session
 
 log = logging.getLogger(__name__)
 
@@ -31,9 +26,6 @@ def _verify_secret(received: str) -> None:
         raise HTTPException(status_code=403, detail="Invalid service secret.")
 
 
-def _anon_uuid(real_id: str) -> str:
-    """Derive the anonymised consumer UUID stored in Portal DB from the real Supabase user ID."""
-    return str(uuid_mod.UUID(hashlib.md5((real_id + ":ficium-anon-v1:").encode()).hexdigest()))
 
 
 # (removed) GET /public/requests/{id}/bids and POST /public/requests/bids/bulk: they were
@@ -41,180 +33,11 @@ def _anon_uuid(real_id: str) -> str:
 # reads its own copy of the bid.* contract events (integration.bid_shadow, ficium #89).
 
 
-async def after_acceptance(result: dict, request_id: str, bid_id: str) -> None:
-    """Notify the winning institution and fire its webhooks.
-
-    Shared by the legacy accept-bid endpoint and the contract acceptance call, so both send the same
-    thing. Field names follow what marketplace.accept_bid() actually returns (pipeline_id,
-    amount_offered, rate, term_months). The previous inline code read loan_id / deal_amount /
-    deal_rate / deal_term_months, which the function never returns, so every bid.accepted webhook
-    carried null deal terms.
-    """
-    import asyncio as _asyncio
-
-    from ..core.webhooks import dispatch_event as _dispatch
-
-    winning_institution = result.get("institution_id")
-    if not winning_institution:
-        return
-    product_label = result.get("product_label", "loan")
-    pipeline_id = str(result["pipeline_id"]) if result.get("pipeline_id") else None
-
-    with service_session() as notif_conn:
-        _write_notification(
-            notif_conn,
-            str(winning_institution),
-            kind="bid_accepted",
-            title="Your bid was accepted!",
-            body=f"A borrower accepted your {product_label} offer. Their identity has been revealed.",
-            link="/bids",
-            metadata={"request_id": request_id, "bid_id": bid_id},
-        )
-        notif_conn.commit()
-
-    _asyncio.create_task(
-        _dispatch(
-            str(winning_institution),
-            "bid.accepted",
-            {
-                "bid_id": bid_id,
-                "request_id": request_id,
-                "pipeline_id": pipeline_id,
-                "loan_id": pipeline_id,  # kept for existing subscribers; same value as pipeline_id
-                "deal_amount": result.get("amount_offered"),
-                "deal_rate": result.get("rate"),
-                "deal_term_months": result.get("term_months"),
-                "institution_id": str(winning_institution),
-            },
-        )
-    )
-    # Same moment, separate signal: a bank's system may subscribe only to this to know when to pull
-    # borrower PII through the pipeline API. No PII in the webhook itself.
-    _asyncio.create_task(
-        _dispatch(
-            str(winning_institution),
-            "identity.revealed",
-            {
-                "bid_id": bid_id,
-                "request_id": request_id,
-                "pipeline_id": pipeline_id,
-                "loan_id": pipeline_id,
-                "pii_available": True,
-            },
-        )
-    )
-
-
-class AcceptBidRequest(BaseModel):
-    bid_id:      str
-    consumer_id: str   # real Supabase user ID — we derive anon UUID here
-
-
-@router.post("/requests/{request_id}/accept-bid")
-async def accept_bid(
-    request_id: str,
-    body: Annotated[AcceptBidRequest, Body()],
-    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
-) -> dict:
-    """
-    Phase 2 reveal — server-to-server only.
-
-    1. Verify ownership (anon UUID check against Portal DB).
-    2. Fetch borrower PII from App DB.
-    3. Call marketplace.accept_bid() atomically:
-         - winning bid → accepted
-         - all others  → rejected
-         - request     → accepted + winning_bid_id
-         - bid_acceptance row with Phase 2 PII written
-    4. Return institution contact info to caller.
-    """
-    _verify_secret(x_service_secret)
-
-    anon_id = _anon_uuid(body.consumer_id)
-
-    # ── Ownership guard ───────────────────────────────────────────────────────
-    with service_session() as conn:
-        req_row = conn.execute(
-            text("""
-                SELECT r.consumer_id, r.status
-                FROM marketplace.request r
-                WHERE r.id = :rid
-            """),
-            {"rid": request_id},
-        ).fetchone()
-
-    if req_row is None:
-        raise HTTPException(status_code=404, detail="Request not found.")
-    if str(req_row.consumer_id) != anon_id:
-        raise HTTPException(status_code=403, detail="Not the request owner.")
-    if req_row.status in ("accepted", "cancelled", "expired"):
-        raise HTTPException(status_code=409, detail=f"Request already {req_row.status}.")
-
-    # ── Fetch Phase 2 PII from App DB ─────────────────────────────────────────
-    try:
-        with app_service_session() as app_conn:
-            client = app_conn.execute(
-                text("""
-                    SELECT
-                        c.full_name,
-                        c.email,
-                        c.phone,
-                        c.date_of_birth,
-                        CONCAT_WS(', ', c.address_line_1, c.city, c.postal_code) AS address,
-                        k.document_number
-                    FROM public.clients c
-                    LEFT JOIN (
-                        SELECT DISTINCT ON (client_id) client_id, document_number
-                        FROM public.kyc_submissions
-                        WHERE status = 'approved'
-                        ORDER BY client_id, submitted_at DESC
-                    ) k ON k.client_id = c.id
-                    WHERE c.id = :uid
-                """),
-                {"uid": body.consumer_id},
-            ).fetchone()
-    except AppDatabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail="App DB unavailable.") from exc
-
-    if client is None:
-        raise HTTPException(status_code=404, detail="Client profile not found.")
-
-    phase2 = {
-        "full_name":       client.full_name or "",
-        "email":           client.email or "",
-        "phone":           client.phone,
-        "address":         client.address,
-        "date_of_birth":   client.date_of_birth.isoformat() if client.date_of_birth else None,
-        "document_number": client.document_number,
-    }
-
-    # ── Atomic accept — writes reveal + transitions all statuses ──────────────
-    import json as _json
-    with service_session() as conn:
-        try:
-            result = conn.execute(
-                text("""
-                    SELECT marketplace.accept_bid(
-                        :request_id,
-                        :bid_id,
-                        :consumer_id,
-                        CAST(:phase2 AS jsonb)
-                    ) AS result
-                """),
-                {
-                    "request_id":  request_id,
-                    "bid_id":      body.bid_id,
-                    "consumer_id": anon_id,
-                    "phase2":      _json.dumps(phase2),
-                },
-            ).fetchone()
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    res_data = dict(result.result) if result and result.result else {}
-    if res_data:
-        await after_acceptance(res_data, request_id, body.bid_id)
-    return res_data
+# (removed) POST /public/requests/{id}/accept-bid: the legacy acceptance path. It took the
+# borrower's raw account id and md5-hashed it into the portal's borrower id (unkeyed, so anyone
+# knowing an App id could compute it). Acceptance is now only the contract call
+# (POST /integration/v1/acceptances, acceptance.py), and borrower ids are the contract's keyed
+# anon_borrower_id (db/034). after_acceptance moved to app/core/acceptance_effects.py.
 
 
 # ── (removed) GET /public/requests/{request_id}/pipeline ──────────────────────

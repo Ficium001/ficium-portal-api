@@ -44,13 +44,18 @@ def client(monkeypatch):
     monkeypatch.setattr(m.settings, "integration_i2b_signing_key", "")  # no dispatcher in tests
     recorded: list[dict[str, Any]] = []
 
-    def fake_record(env: dict[str, Any]) -> str:
+    notified: list[str] = []
+
+    def fake_record(env: dict[str, Any]) -> tuple[str, bool]:
         recorded.append(env)
-        return "apply"
+        return "apply", env.get("type") == "request.published"
+
+    monkeypatch.setattr(api, "_notify_new_request", lambda rid: notified.append(rid))
 
     monkeypatch.setattr(api, "_record_and_apply", fake_record)
     with TestClient(m.app) as c:
         c.recorded = recorded  # type: ignore[attr-defined]
+        c.notified = notified  # type: ignore[attr-defined]
         yield c
 
 
@@ -131,11 +136,19 @@ def test_request_with_an_employer_name_is_rejected_by_the_contract(client):
 
 
 class _Rec:
-    def __init__(self) -> None:
+    def __init__(self, is_new: bool = False) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.is_new = is_new
 
     def execute(self, stmt, params=None):
         self.calls.append((" ".join(str(stmt).split()), params or {}))
+        rec = self
+
+        class _R:
+            def scalar_one(self):  # noqa: ANN201
+                return rec.is_new
+
+        return _R()
 
 
 @pytest.mark.parametrize(
@@ -148,11 +161,27 @@ class _Rec:
 def test_request_handlers_call_the_matching_sql_function(etype, fn):
     from app.api import integration as api
 
-    rec = _Rec()
-    env = {"id": "evt_0123456789abcdef", "type": etype, "sequence": 3, "data": {"request_id": "r"}}
-    api.HANDLERS[etype](rec, env)
-    assert len(rec.calls) == 1 and f"integration.{fn}(" in rec.calls[0][0]
+    rec = _Rec(is_new=True)
+    env = {
+        "id": "evt_0123456789abcdef",
+        "type": etype,
+        "sequence": 3,
+        "aggregate_id": "r",
+        "data": {"request_id": "r"},
+    }
+    is_new = api.HANDLERS[etype](rec, env)
+    # shadow first, then the live marketplace (db/034): no App DB read anywhere
+    assert len(rec.calls) == 2 and f"integration.{fn}(" in rec.calls[0][0]
     assert json.loads(rec.calls[0][1]["e"]) == env
+    assert "integration.apply_request_live(" in rec.calls[1][0] and rec.calls[1][1] == {"r": "r"}
+    # only a newly published request alerts institutions
+    assert is_new is (etype == "request.published")
+
+
+def test_new_request_alerts_institutions_after_commit(client):
+    env = json.load(open("tests/fixtures/request-published.json"))
+    assert post(client, env).status_code == 200
+    assert client.notified == [env["aggregate_id"]]
 
 
 def test_disabled_without_keys(client, monkeypatch):
