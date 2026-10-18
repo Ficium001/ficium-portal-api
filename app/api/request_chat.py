@@ -1,43 +1,48 @@
 # =============================================================================
 # Request chat — institution side
 #
-# Chat lives in the App DB (public.request_messages), NOT the Portal DB. The
-# portal frontend therefore cannot reach it with a Supabase client at all —
-# every route here proxies through app_service_session(). That mismatch is why
-# the portal's chat component sat as a stub: it was wired to a Portal DB client
-# that could never see the table.
+# Per-lender threads through the contract only (1.9.1). This module used to read
+# and write the borrower database (public.request_messages) directly, storing the
+# sending staff member's id there. Now:
 #
-# Two invariants this module exists to hold:
+#   - Threads live in marketplace.request_message (db/036), this side's copy.
+#     Borrower messages arrive as chat.message events (integration.py); ours
+#     leave as chat.message events from marketplace.send_institution_message().
+#   - Templates come from the contract (ficium_contract.chat_templates), and
+#     bodies are rendered with its renderer, the same one the borrower side uses.
+#   - The rules come from this side's own data (who won = an accepted bid):
+#     a thread closes once another institution's offer is accepted; free text
+#     only for the institution whose offer was accepted.
 #
-#   1. Thread isolation. A message belongs to (request_id, institution_id).
-#      Every query below filters on the CALLER's institution_id from their JWT,
-#      never on a value supplied by the client, so one bank cannot read another
-#      bank's conversation on the same request.
-#
-#   2. Borrower anonymity. request_messages.sender_id is the borrower's real
-#      auth.uid() — a stable identifier that would link the same person across
-#      every request they have ever posted. It is NEVER projected outward.
-#      _mask() is the only shape that leaves this module.
-#
-# The App DB enforces the rest (structured-only before acceptance, free text
-# for the winner only, frozen losing threads) in a BEFORE trigger, which
-# matters here because a service session bypasses RLS entirely.
+# Invariants kept:
+#   1. Thread isolation: every query filters on the CALLER's institution_id
+#      from the JWT, never a client-supplied value.
+#   2. No person's identity crosses: chat.message carries no staff or borrower
+#      id; member_id stays on this side.
 # =============================================================================
 from __future__ import annotations
 
 import json
-import re
+from typing import Any
 from uuid import UUID
 
+import ficium_contract as fc
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
-from ..core.db import AppDatabaseUnavailable, app_service_session
+from ..core.db import service_session
 from ..deps import current_claims
 
 router = APIRouter(prefix="/marketplace/requests", tags=["marketplace"])
 
 MAX_BODY_LEN = 2000
+_COLS = "id, request_id, sender_side, body, kind, template_code, params, created_at"
+_ERRORS = {
+    "CHAT_REQUEST_NOT_FOUND": (404, "Request not found."),
+    "CHAT_CLOSED": (409, "This conversation is closed: another lender's offer was accepted."),
+    "CHAT_FREE_TEXT_NOT_ALLOWED": (409, "Free text opens once the borrower accepts your offer."),
+}
 
 
 def _institution_id(claims: dict) -> str:
@@ -47,152 +52,54 @@ def _institution_id(claims: dict) -> str:
     return str(inst_id)
 
 
-def _mask(row) -> dict:
-    """Project a message for institution eyes.
-
-    Deliberately omits sender_id. The borrower's auth.uid() is stable across
-    every request they post, so returning it would let an institution correlate
-    the same anonymous borrower across the marketplace — exactly what the
-    pre-acceptance anonymity model prevents everywhere else.
-    """
-    m = row._mapping
+def _mask(m: Any) -> dict:
+    """A message as this institution sees it. Never a person's id."""
+    row = m._mapping if hasattr(m, "_mapping") else m
+    side = row["sender_side"]
     return {
-        "id": str(m["id"]),
-        "request_id": str(m["request_id"]),
-        "sender_type": m["sender_type"],
-        "sender_label": "You" if m["sender_type"] == "institution" else "Borrower",
-        "body": m["body"],
-        "kind": m["kind"],
-        "template_code": m["template_code"],
-        "params": m["params"],
-        "created_at": m["created_at"],
+        "id": str(row["id"]),
+        "request_id": str(row["request_id"]),
+        "sender_type": "institution" if side == "institution" else "client",
+        "sender_label": "You" if side == "institution" else "Borrower",
+        "body": row["body"],
+        "kind": row["kind"],
+        "template_code": row["template_code"],
+        "params": row["params"],
+        "created_at": row["created_at"],
     }
 
 
-def _thread_state(app_conn, request_id: str, institution_id: str) -> dict:
-    """Whether this institution may still write, and in what mode."""
-    row = app_conn.execute(
-        text("""
-            SELECT public.request_chat_is_open(CAST(:rid AS uuid), CAST(:iid AS uuid))   AS is_open,
-                   public.request_chat_is_winner(CAST(:rid AS uuid), CAST(:iid AS uuid)) AS is_winner
-        """),
-        {"rid": request_id, "iid": institution_id},
-    ).fetchone()
-    return {
-        "is_open": bool(row.is_open),
-        "is_winner": bool(row.is_winner),
-        # Free text only once this institution has actually won; before that the
-        # marketplace is still anonymous and both sides are template-bound.
-        "can_send_free_text": bool(row.is_winner),
-    }
-
-
-def _validate_params(schema: dict, params: dict) -> dict:
-    """Check supplied params against the template's declared params_schema.
-
-    The schema is authored alongside the template and carries real bounds
-    (`min`/`max` on numerics, `values` on enums, `max_items`/`max_len` on
-    lists). Enforcing it here rather than trusting the caller keeps a bank
-    from putting an implausible figure in front of a borrower via a direct
-    API call. Unknown keys are dropped rather than substituted, so a caller
-    cannot inject placeholders the template never declared.
-    """
-    if not schema:
-        return {}
-
-    cleaned: dict = {}
-    for key, spec in schema.items():
-        if key not in params:
-            continue  # missing keys are caught by the leftover-placeholder check
-        value = params[key]
-        kind = (spec or {}).get("type")
-
-        if kind in ("int", "decimal"):
-            try:
-                num = int(value) if kind == "int" else float(value)
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=422, detail=f"'{key}' must be a number.") from None
-            lo, hi = spec.get("min"), spec.get("max")
-            if lo is not None and num < lo:
-                raise HTTPException(status_code=422, detail=f"'{key}' must be at least {lo}.")
-            if hi is not None and num > hi:
-                raise HTTPException(status_code=422, detail=f"'{key}' must be at most {hi}.")
-            cleaned[key] = num
-
-        elif kind == "enum":
-            allowed = spec.get("values") or []
-            if str(value) not in allowed:
-                raise HTTPException(status_code=422, detail=f"'{key}' must be one of: {', '.join(allowed)}.")
-            cleaned[key] = str(value)
-
-        elif kind in ("string_list", "label_amount_list"):
-            items = value if isinstance(value, list) else [value]
-            items = [str(v).strip() for v in items if str(v).strip()]
-            if not items:
-                raise HTTPException(status_code=422, detail=f"'{key}' needs at least one entry.")
-            max_items = spec.get("max_items")
-            if max_items is not None and len(items) > max_items:
-                raise HTTPException(status_code=422, detail=f"'{key}' allows at most {max_items} entries.")
-            max_len = spec.get("max_len")
-            if max_len is not None and any(len(v) > max_len for v in items):
-                raise HTTPException(status_code=422, detail=f"Each '{key}' entry must be {max_len} characters or fewer.")
-            cleaned[key] = items
-
-        else:
-            cleaned[key] = str(value)
-
-    return cleaned
+def _state(conn: Any, request_id: str, institution_id: str) -> dict:
+    row = conn.execute(
+        text("SELECT is_open, is_winner FROM marketplace.chat_thread_state(CAST(:r AS uuid), CAST(:i AS uuid))"),
+        {"r": request_id, "i": institution_id},
+    ).one()
+    return {"is_open": bool(row.is_open), "is_winner": bool(row.is_winner),
+            "can_send_free_text": bool(row.is_open and row.is_winner)}
 
 
 @router.get("/message-templates")
-async def list_message_templates(
-    claims: dict = Depends(current_claims),
-) -> list[dict]:
-    """Structured messages this institution may send."""
+async def list_message_templates(claims: dict = Depends(current_claims)) -> list[dict]:
+    """Structured messages this institution may send (from the contract)."""
     _institution_id(claims)
-    try:
-        with app_service_session() as app_conn:
-            rows = app_conn.execute(
-                text("""
-                    SELECT code, label, body_template, params_schema, sort_order
-                      FROM public.request_message_template
-                     WHERE sender_type = 'institution' AND is_active
-                     ORDER BY sort_order
-                """)
-            ).fetchall()
-    except AppDatabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return [dict(r._mapping) for r in rows]
+    return [{k: t[k] for k in ("code", "label", "body_template", "params_schema", "sort_order")}
+            for t in fc.chat_templates("institution")]
 
 
 @router.get("/{request_id}/messages")
-async def list_messages(
-    request_id: UUID,
-    claims: dict = Depends(current_claims),
-) -> dict:
-    """This institution's thread on one request.
-
-    Scoped to the caller's own institution_id from the JWT — a bank cannot pass
-    someone else's id and read their conversation.
-    """
+async def list_messages(request_id: UUID, claims: dict = Depends(current_claims)) -> dict:
+    """This institution's thread on one request (scoped to the caller's institution)."""
     inst_id = _institution_id(claims)
-    try:
-        with app_service_session() as app_conn:
-            rows = app_conn.execute(
-                text("""
-                    SELECT id, request_id, sender_type, body, kind,
-                           template_code, params, created_at
-                      FROM public.request_messages
-                     WHERE request_id     = CAST(:rid AS uuid)
-                       AND institution_id = CAST(:iid AS uuid)
-                     ORDER BY created_at
-                """),
-                {"rid": str(request_id), "iid": inst_id},
-            ).fetchall()
-            state = _thread_state(app_conn, str(request_id), inst_id)
-    except AppDatabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
+    with service_session() as conn:
+        rows = conn.execute(
+            text(f"""
+                SELECT {_COLS} FROM marketplace.request_message
+                 WHERE request_id = CAST(:rid AS uuid) AND institution_id = CAST(:iid AS uuid)
+                 ORDER BY created_at
+            """),
+            {"rid": str(request_id), "iid": inst_id},
+        ).fetchall()
+        state = _state(conn, str(request_id), inst_id)
     return {"messages": [_mask(r) for r in rows], **state}
 
 
@@ -204,10 +111,9 @@ async def send_message(
 ) -> dict:
     """Post a message onto this institution's thread.
 
-    institution_id and sender_id come from the JWT, never the request body.
-    Structured/free eligibility and thread-frozen state are enforced by the App
-    DB trigger — a service session bypasses RLS, so the trigger is the real
-    boundary and its errors are surfaced as 409 rather than swallowed.
+    institution_id and member id come from the JWT, never the body. Structured
+    messages are rendered with the contract renderer (what the borrower side
+    re-renders and checks); the rules are enforced in send_institution_message.
     """
     inst_id = _institution_id(claims)
     member_id = claims.get("sub") or claims.get("member_id")
@@ -218,82 +124,38 @@ async def send_message(
     if kind not in ("structured", "free"):
         raise HTTPException(status_code=422, detail="kind must be 'structured' or 'free'.")
 
-    template_code = body.get("template_code")
-    params = body.get("params") or {}
-    text_body = (body.get("body") or "").strip()
-
-    if kind == "structured" and not template_code:
-        raise HTTPException(status_code=422, detail="template_code is required for a structured message.")
-    if kind == "free":
+    template_code: str | None = body.get("template_code")
+    params: dict = body.get("params") or {}
+    if kind == "structured":
+        if not template_code:
+            raise HTTPException(status_code=422, detail="template_code is required for a structured message.")
+        try:
+            text_body, params = fc.render_chat_message(template_code, params, "institution")
+        except fc.ContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        text_body = (body.get("body") or "").strip()
         if not text_body:
             raise HTTPException(status_code=422, detail="body is required for a free-text message.")
         if len(text_body) > MAX_BODY_LEN:
             raise HTTPException(status_code=422, detail=f"body too long (max {MAX_BODY_LEN} chars).")
-        template_code = None
+        template_code, params = None, {}
 
     try:
-        with app_service_session() as app_conn:
-            if kind == "structured":
-                # Render server-side from the catalogue: the stored body must
-                # match the template it claims, not whatever text a caller sends.
-                tpl = app_conn.execute(
-                    text("""
-                        SELECT code, body_template, params_schema
-                          FROM public.request_message_template
-                         WHERE code = :code AND sender_type = 'institution' AND is_active
-                    """),
-                    {"code": template_code},
-                ).fetchone()
-                if tpl is None:
-                    raise HTTPException(status_code=422, detail="Unknown or unavailable template.")
-
-                # params_schema declares min/max/max_items/max_len per
-                # placeholder. Nothing used to enforce them — the portal UI
-                # validated client-side, but a direct POST bypassed that, so a
-                # bank could send a borrower "a fee of 99999% of the
-                # outstanding balance". Validate before substituting.
-                params = _validate_params(tpl.params_schema or {}, params)
-
-                text_body = tpl.body_template
-                for key, value in params.items():
-                    rendered = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
-                    text_body = text_body.replace("{" + str(key) + "}", rendered)
-
-                # A placeholder with no supplied param is left verbatim by the
-                # substitution above, which would send the borrower a literal
-                # "{days}". Reject rather than deliver a broken message.
-                leftover = re.findall(r"\{(\w+)\}", text_body)
-                if leftover:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"Missing template parameter(s): {', '.join(sorted(set(leftover)))}.",
-                    )
-
-            row = app_conn.execute(
-                text("""
-                    INSERT INTO public.request_messages
-                        (request_id, institution_id, sender_type, sender_id,
-                         body, kind, template_code, params)
-                    VALUES
-                        (CAST(:rid AS uuid), CAST(:iid AS uuid), 'institution', CAST(:sid AS uuid),
-                         :body, :kind, :tpl, CAST(:params AS jsonb))
-                    RETURNING id, request_id, sender_type, body, kind,
-                              template_code, params, created_at
+        with service_session() as conn:
+            row = conn.execute(
+                text(f"""
+                    SELECT {_COLS} FROM marketplace.send_institution_message(
+                        CAST(:rid AS uuid), CAST(:iid AS uuid), CAST(:mid AS uuid),
+                        :tpl, CAST(:params AS jsonb), :body)
                 """),
-                {
-                    "rid": str(request_id), "iid": inst_id, "sid": str(member_id),
-                    "body": text_body, "kind": kind, "tpl": template_code,
-                    "params": json.dumps(params),
-                },
-            ).fetchone()
-    except AppDatabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except HTTPException:
+                {"rid": str(request_id), "iid": inst_id, "mid": str(member_id),
+                 "tpl": template_code, "params": json.dumps(params), "body": text_body},
+            ).one()
+    except DBAPIError as exc:
+        msg = str(getattr(exc, "orig", exc))
+        hit = next((v for k, v in _ERRORS.items() if k in msg), None)
+        if hit:
+            raise HTTPException(status_code=hit[0], detail=hit[1]) from exc
         raise
-    except Exception as exc:
-        # The App DB trigger rejects closed threads, ineligible free text and
-        # cross-role templates. Surface its message rather than a blank 500.
-        detail = str(getattr(exc, "orig", exc)).split("\n")[0]
-        raise HTTPException(status_code=409, detail=detail) from exc
-
     return _mask(row)
