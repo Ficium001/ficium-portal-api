@@ -18,7 +18,6 @@ os.environ.setdefault("APP_DATABASE_URL", "postgresql://test:test@localhost:5432
 os.environ.setdefault("APP_SERVICE_SECRET", "test-secret-1234")
 
 from app.api import acceptance as acc  # noqa: E402
-from app.api import public as pub  # noqa: E402
 
 KEY = "accept-key-test"
 BODY = json.load(open("tests/fixtures/acceptance-request.json"))
@@ -259,7 +258,7 @@ def test_database_refusal_is_a_409_with_no_side_effects(env):
     assert state["fake"].called("INSERT INTO integration.acceptance_log") and side == []
 
 
-# ── shared side effects (used by the legacy endpoint too) ───────────────────
+# ── side effects after acceptance (app/core/acceptance_effects.py) ───────────
 async def test_after_acceptance_sends_real_deal_terms(monkeypatch):
     sent: list[tuple] = []
     notes: list[tuple] = []
@@ -270,7 +269,9 @@ async def test_after_acceptance_sends_real_deal_terms(monkeypatch):
     import app.core.webhooks as wh
 
     monkeypatch.setattr(wh, "dispatch_event", _dispatch)
-    monkeypatch.setattr(pub, "_write_notification", lambda *a, **k: notes.append((a, k)))
+    import app.core.acceptance_effects as fx
+
+    monkeypatch.setattr(fx, "_write_notification", lambda *a, **k: notes.append((a, k)))
 
     class _S:
         def commit(self) -> None:
@@ -280,8 +281,8 @@ async def test_after_acceptance_sends_real_deal_terms(monkeypatch):
     def _svc():  # noqa: ANN202
         yield _S()
 
-    monkeypatch.setattr(pub, "service_session", _svc)
-    await pub.after_acceptance(dict(RESULT), "r1", "b1")
+    monkeypatch.setattr(fx, "service_session", _svc)
+    await fx.after_acceptance(dict(RESULT), "r1", "b1")
     import asyncio
 
     await asyncio.sleep(0)
@@ -298,8 +299,9 @@ async def test_after_acceptance_sends_real_deal_terms(monkeypatch):
     assert len(notes) == 1
 
 
-# ── the LIVE legacy endpoint still works after the refactor ─────────────────
-def test_legacy_accept_bid_endpoint_still_runs_the_same_flow(monkeypatch):
+# ── the legacy endpoint is gone ─────────────────────────────────────────────
+def test_legacy_accept_bid_endpoint_is_gone(monkeypatch):
+    """Acceptance is only the contract call. The legacy path md5-hashed the raw App id (db/034)."""
     import app.main as m
 
     async def _noop() -> None:
@@ -307,65 +309,10 @@ def test_legacy_accept_bid_endpoint_still_runs_the_same_flow(monkeypatch):
 
     monkeypatch.setattr(m, "init_pool", _noop)
     monkeypatch.setattr(m, "close_pool", _noop)
-    monkeypatch.setattr(m.settings, "app_service_secret", "svc-secret")
-    consumer = "aaaaaaaa-0000-4000-8000-000000000001"
-    anon = pub._anon_uuid(consumer)
-    calls: list[str] = []
-
-    class _Portal:
-        def execute(self, stmt, params=None):  # noqa: ANN001, ANN201
-            s = " ".join(str(stmt).split())
-            calls.append(s)
-            if "SELECT r.consumer_id, r.status" in s:
-                return _R(SimpleNamespace(consumer_id=anon, status="bidding"))
-            if "marketplace.accept_bid" in s:
-                assert json.loads(params["phase2"])["full_name"] == "Jane Doe"
-                return _R(SimpleNamespace(result=dict(RESULT)))
-            return _R()
-
-    class _App:
-        def execute(self, stmt, params=None):  # noqa: ANN001, ANN201
-            return _R(
-                SimpleNamespace(
-                    full_name="Jane Doe",
-                    email="j@example.com",
-                    phone=None,
-                    date_of_birth=None,
-                    address=None,
-                    document_number=None,
-                )
-            )
-
-    @contextmanager
-    def _svc():  # noqa: ANN202
-        yield _Portal()
-
-    @contextmanager
-    def _app():  # noqa: ANN202
-        yield _App()
-
-    side: list[tuple] = []
-
-    async def _after(result, rid, bid):  # noqa: ANN001, ANN202
-        side.append((result, rid, bid))
-
-    monkeypatch.setattr(pub, "service_session", _svc)
-    monkeypatch.setattr(pub, "app_service_session", _app)
-    monkeypatch.setattr(pub, "after_acceptance", _after)
-    with TestClient(m.app) as c:
+    with TestClient(m.app, raise_server_exceptions=False) as c:
         r = c.post(
             "/public/requests/r1/accept-bid",
-            json={"bid_id": "b1", "consumer_id": consumer},
+            json={"bid_id": "b1", "consumer_id": "x"},
             headers={"X-Service-Secret": "svc-secret"},
         )
-        assert r.status_code == 200, r.text
-        assert r.json()["pipeline_id"] == RESULT["pipeline_id"]
-        assert (
-            c.post(
-                "/public/requests/r1/accept-bid",
-                json={"bid_id": "b1", "consumer_id": "someone-else"},
-                headers={"X-Service-Secret": "svc-secret"},
-            ).status_code
-            == 403
-        )
-    assert len(side) == 1 and side[0][1:] == ("r1", "b1")
+    assert r.status_code in (404, 405)

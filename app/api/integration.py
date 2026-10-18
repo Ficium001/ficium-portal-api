@@ -29,27 +29,37 @@ from ..core.db import service_session
 log = structlog.get_logger()
 router = APIRouter(prefix="/integration/v1", tags=["integration"])
 
-Handler = Callable[[Session, dict[str, Any]], None]
+Handler = Callable[[Session, dict[str, Any]], bool | None]  # True: a new request (notify institutions)
 
 
 def _handle_ping(session: Session, envelope: dict[str, Any]) -> None:
     log.info("integration_ping_received", event_id=envelope["id"], sequence=envelope["sequence"])
 
 
-def _handle_request_published(session: Session, envelope: dict[str, Any]) -> None:
-    """Step 3 (shadow mode): store what the borrower side published. Nothing live reads this yet;
-    integration.v_request_parity compares it with marketplace.request."""
+def _live(session: Session, envelope: dict[str, Any]) -> bool:
+    """Apply the shadow to the live marketplace (db/034). True when the request is new."""
+    return bool(session.execute(
+        text("SELECT integration.apply_request_live(CAST(:r AS uuid))"),
+        {"r": envelope["aggregate_id"]},
+    ).scalar_one())
+
+
+def _handle_request_published(session: Session, envelope: dict[str, Any]) -> bool:
+    """A borrower request, new or changed: shadow first, then the live marketplace."""
     session.execute(
         text("SELECT integration.apply_request_published(CAST(:e AS jsonb))"),
         {"e": json.dumps(envelope)},
     )
+    return _live(session, envelope)
 
 
-def _handle_request_status_changed(session: Session, envelope: dict[str, Any]) -> None:
+def _handle_request_status_changed(session: Session, envelope: dict[str, Any]) -> bool:
     session.execute(
         text("SELECT integration.apply_request_status_changed(CAST(:e AS jsonb))"),
         {"e": json.dumps(envelope)},
     )
+    _live(session, envelope)
+    return False
 
 
 HANDLERS: dict[str, Handler] = {
@@ -59,7 +69,9 @@ HANDLERS: dict[str, Handler] = {
 }
 
 
-def _record_and_apply(envelope: dict[str, Any]) -> str:
+def _record_and_apply(envelope: dict[str, Any]) -> tuple[str, bool]:
+    """(inbox outcome, request is new). Commits when the session closes."""
+    is_new = False
     with service_session() as s:
         outcome = str(
             s.execute(
@@ -74,8 +86,35 @@ def _record_and_apply(envelope: dict[str, Any]) -> str:
             ).scalar_one()
         )
         if outcome == "apply":
-            HANDLERS[envelope["type"]](s, envelope)
-        return outcome
+            is_new = bool(HANDLERS[envelope["type"]](s, envelope))
+    return outcome, is_new
+
+
+def _notify_new_request(request_id: str) -> None:
+    """request.new webhook to every institution with the product enabled.
+
+    The sync this replaces filtered product_config on is_active / product_type, columns
+    that don't exist, so this webhook was never sent."""
+    from ..core.webhooks import dispatch_event
+
+    with service_session() as s:
+        req = s.execute(text("""
+            SELECT r.id, r.product_id, r.amount, r.term_months, r.params ->> 'app_product_type' AS product_type
+              FROM marketplace.request r WHERE r.id = CAST(:r AS uuid)
+        """), {"r": request_id}).fetchone()
+        if req is None:
+            return
+        institutions = [row.institution_id for row in s.execute(text("""
+            SELECT DISTINCT institution_id FROM institution.product_config
+             WHERE enabled AND product_id = :p
+        """), {"p": req.product_id})]
+    payload = {"request_id": str(req.id), "product_type": req.product_type,
+               "amount": float(req.amount or 0), "term_months": req.term_months, "source": "integration"}
+    for iid in institutions:
+        try:
+            asyncio.run(dispatch_event(str(iid), "request.new", payload))
+        except Exception as exc:  # noqa: BLE001 - one institution's webhook must not stop the others
+            log.warning("request_new_webhook_failed", institution_id=str(iid), error=str(exc))
 
 
 def _err(status: int, code: str, detail: str = "") -> JSONResponse:
@@ -102,5 +141,8 @@ async def receive_event(request: Request) -> JSONResponse:
         return _err(403, "wrong_source")
     if envelope["type"] not in HANDLERS:
         return _err(501, "not_handled_yet", envelope["type"])
-    outcome = await asyncio.to_thread(_record_and_apply, envelope)
+    outcome, is_new = await asyncio.to_thread(_record_and_apply, envelope)
+    if is_new:
+        # After commit: tell institutions licensed for the product.
+        await asyncio.to_thread(_notify_new_request, envelope["aggregate_id"])
     return JSONResponse(status_code=200, content={"status": outcome, "id": envelope["id"]})

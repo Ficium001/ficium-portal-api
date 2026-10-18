@@ -24,9 +24,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from ..core.acceptance_effects import after_acceptance
 from ..core.config import settings
 from ..core.db import service_session
-from .public import after_acceptance
 
 router = APIRouter(prefix="/integration/v1", tags=["integration"])
 
