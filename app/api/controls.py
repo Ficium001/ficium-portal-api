@@ -2,7 +2,8 @@
 # ficium-portal-api — Controls (four-eyes switches), Setup > Controls
 #
 #   GET  /controls/four-eyes                     every action, its screen, on/off,
-#                                                 locked?, pending switch-off
+#                                                 locked?, pending switch-off, and
+#                                                 can_change (the DB's own admin rule)
 #   POST /controls/four-eyes/{category}/enable   immediate (admins)
 #   POST /controls/four-eyes/{category}/disable  queues four_eyes.disable for a
 #                                                 second admin (locked four-eyes)
@@ -52,6 +53,7 @@ async def list_four_eyes(conn: Session = Depends(tenant_conn)) -> list[dict[str,
     rows = conn.execute(text("""
         SELECT c.category, c.label, c.screen, c.locked, c.locked_reason, c.sort_order,
                governance.four_eyes_required(ctx.institution_id, c.category) AS enabled,
+               ctx.is_admin AS can_change,
                p.changed_at,
                (SELECT a.id FROM governance.action a
                  WHERE a.institution_id = ctx.institution_id

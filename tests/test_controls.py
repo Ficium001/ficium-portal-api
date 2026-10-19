@@ -51,6 +51,7 @@ class Conn:
                 "category": "benefit.create", "label": "Add a benefit",
                 "screen": "Setup › Products",
                 "locked": False, "locked_reason": None, "sort_order": 30, "enabled": True,
+                "can_change": True,
                 "changed_at": None, "pending_disable_action_id": None,
             })
             return _R(rows=[row])
