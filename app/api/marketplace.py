@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from ..core.bidding import BidInput, BidPlacementError, place_bid
 from ..core.db import service_session
 from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..core.webhooks import dispatch_event
@@ -97,41 +97,40 @@ async def submit_bid(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
+    """
+    Submit a bid FOR APPROVAL. Bids are platform-locked to four-eyes
+    (governance.four_eyes_catalog: bid.submit), so this always queues for a
+    checker; the bid reaches the borrower only when a second person approves.
+    Until 2026-10-19 this endpoint inserted a live bid in one step, bypassing
+    four-eyes (the portal UI never used it; any portal user could).
+    """
     required = {"request_id", "rate", "rate_type", "amount_offered", "term_months"}
     missing = required - set(body.keys())
     if missing:
         raise HTTPException(status_code=422, detail=f"Missing fields: {missing}")
-
-    inst_id = claims.get("institution_id")
-    if not inst_id:
+    if not claims.get("institution_id"):
         raise HTTPException(status_code=403, detail="No institution context.")
 
-    bid = BidInput(
-        request_id=body["request_id"],
-        institution_id=str(inst_id),
-        rate=body["rate"],
-        rate_type=body.get("rate_type", "fixed"),
-        amount_offered=body["amount_offered"],
-        term_months=body["term_months"],
-        rate_valid_days=body.get("rate_valid_days"),
-        conditions=body.get("conditions", {}),
-        fee_structure=body.get("fee_structure", {}),
-        idempotency_key=body.get("idempotency_key"),
-        submitted_via="portal",
-    )
-    try:
-        result = place_bid(conn, bid)
-    except BidPlacementError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
-    conn.commit()
+    req = conn.execute(
+        text("SELECT status FROM marketplace.request WHERE id = CAST(:rid AS uuid)"),
+        {"rid": body["request_id"]},
+    ).fetchone()
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if req.status != "bidding":
+        raise HTTPException(status_code=409, detail="This request is not open for bids.")
 
-    if result.duplicate:
-        return {"status": "duplicate", "message": "Bid already submitted."}
-    return {
-        "id": result.id,
-        "status": result.status,
-        "submitted_at": result.submitted_at.isoformat() if result.submitted_at else None,
-    }
+    payload = {k: body[k] for k in (*sorted(required), "conditions", "allocations") if k in body}
+    payload["submitted_via"] = "portal"
+    row = conn.execute(
+        text("""
+            SELECT institution.submit_for_approval(
+              'bid.submit', 'request', CAST(:rid AS uuid), CAST(:p AS jsonb)) AS id
+        """),
+        {"rid": body["request_id"], "p": json.dumps(payload, default=str)},
+    ).fetchone()
+    conn.commit()
+    return {"status": "pending_approval", "action_id": str(row.id) if row else None}
 
 # ── GET /marketplace/bids/{bid_id} ───────────────────────────────────────────
 @router.get("/bids/{bid_id}")

@@ -114,64 +114,74 @@ def _member_row() -> SimpleNamespace:
     return SimpleNamespace(id=MEMBER, is_primary_admin=False, auth_user_id=AUTH_UID)
 
 
-# ── deactivate / reactivate / email change ──────────────────────────────────
-def test_deactivate_updates_only_the_member_row() -> None:
-    t = Recorder(script=[("FROM institution.member WHERE id", _member_row())])
+# ── deactivate / reactivate / edit: four-eyes, never a direct write ─────────
+# Since db/040 these endpoints only QUEUE a four-eyes action; the database
+# applies the change when a second person approves. They must never write the
+# member row or the login row themselves.
+def _queued() -> SimpleNamespace:
+    return SimpleNamespace(id=ACTION, status="pending", control="four_eyes")
+
+
+def _no_direct_writes(t: Recorder) -> None:
+    assert not any("auth_portal" in s for s in t.sqls()), t.sqls()
+    assert not any(s.startswith("UPDATE institution.member") for s in t.sqls()), t.sqls()
+
+
+def test_deactivate_queues_four_eyes_and_writes_nothing() -> None:
+    t = Recorder(script=[("FROM institution.member WHERE id", _member_row()),
+                         ("FROM governance.action", _queued())])
     r = _install(t).post(f"/members/{MEMBER}/deactivate")
     assert r.status_code == 200, r.text
-    assert not any("auth_portal" in s for s in t.sqls()), t.sqls()
-    assert any("SET active = false" in s for s in t.sqls())
-    assert t.commits == 1
+    assert r.json()["status"] == "pending_approval"
+    _no_direct_writes(t)
+    submit = next(c for c in t.calls if "submit_for_approval" in c[0])
+    assert submit[1]["cat"] == "user.deactivate"
 
 
-def test_reactivate_updates_only_the_member_row() -> None:
-    t = Recorder(script=[("FROM institution.member WHERE id", _member_row())])
+def test_reactivate_queues_four_eyes_and_writes_nothing() -> None:
+    t = Recorder(script=[("FROM institution.member WHERE id", _member_row()),
+                         ("FROM governance.action", _queued())])
     r = _install(t).post(f"/members/{MEMBER}/reactivate")
     assert r.status_code == 200, r.text
-    assert not any("auth_portal" in s for s in t.sqls()), t.sqls()
-    assert any("SET active = true" in s for s in t.sqls())
+    _no_direct_writes(t)
+    assert any(c[1].get("cat") == "user.reactivate" for c in t.calls)
 
 
-def test_email_change_updates_member_only_and_lowercases() -> None:
-    t = Recorder(script=[("FROM institution.member WHERE id", _member_row())])
-    r = _install(t).patch(f"/members/{MEMBER}", json={"email": "  New.Person@Example.com "})
+def test_edit_queues_one_action_per_field_and_lowercases_email() -> None:
+    t = Recorder(script=[("FROM institution.member WHERE id", _member_row()),
+                         ("FROM governance.action", _queued())])
+    r = _install(t).patch(
+        f"/members/{MEMBER}",
+        json={"email": "  New.Person@Example.com ", "member_role": "checker"},
+    )
     assert r.status_code == 200, r.text
-    assert not any("auth_portal" in s for s in t.sqls()), t.sqls()
-    update = next(c for c in t.calls if c[0].startswith("UPDATE institution.member"))
-    assert update[1]["email"] == "new.person@example.com"
+    assert r.json()["status"] == "pending_approval"
+    _no_direct_writes(t)
+    payloads = [c[1]["payload"] for c in t.calls if "submit_for_approval" in c[0]]
+    assert len(payloads) == 2
+    assert '"new.person@example.com"' in payloads[0]
 
 
-def test_email_already_used_by_another_login_is_a_409() -> None:
-    t = Recorder(
-        script=[("FROM institution.member WHERE id", _member_row())],
-        raise_on=(
-            "UPDATE institution.member SET",
-            IntegrityError("stmt", {}, Exception("duplicate key uq_auth_users_email")),
-        ),
-    )
-    r = _install(t).patch(f"/members/{MEMBER}", json={"email": "taken@example.com"})
-    assert r.status_code == 409
-    assert t.rollbacks == 1 and t.commits == 0
+def test_primary_admin_cannot_be_deactivated_or_edited() -> None:
+    primary = SimpleNamespace(id=MEMBER, is_primary_admin=True, auth_user_id=AUTH_UID)
+    t = Recorder(script=[("FROM institution.member WHERE id", primary)])
+    client = _install(t)
+    assert client.post(f"/members/{MEMBER}/deactivate").status_code == 403
+    assert client.patch(f"/members/{MEMBER}", json={"full_name": "x"}).status_code == 403
+    assert not any("submit_for_approval" in s for s in t.sqls())
 
 
-def test_approved_email_update_touches_only_member_and_conflicts_cleanly() -> None:
-    action = SimpleNamespace(
-        id=ACTION,
-        category="user.update",
-        status="approved",
-        payload={"member_id": MEMBER, "field": "email", "value": "x@example.com"},
-    )
-    t = Recorder(script=[("FROM governance.action WHERE id", action)])
+def test_execute_update_only_reports_what_the_database_did() -> None:
+    done = SimpleNamespace(category="user.update", status="approved", execution_status="executed")
+    t = Recorder(script=[("FROM governance.action WHERE id", done)])
     r = _install(t).post(f"/approvals/{ACTION}/execute-update")
     assert r.status_code == 200, r.text
-    assert not any("auth_portal" in s for s in t.sqls()), t.sqls()
+    _no_direct_writes(t)
 
-    t2 = Recorder(
-        script=[("FROM governance.action WHERE id", action)],
-        raise_on=("UPDATE institution.member SET email", IntegrityError("s", {}, Exception("dup"))),
-    )
+    pending = SimpleNamespace(category="user.update", status="pending", execution_status="pending")
+    t2 = Recorder(script=[("FROM governance.action WHERE id", pending)])
     assert _install(t2).post(f"/approvals/{ACTION}/execute-update").status_code == 409
-    assert t2.rollbacks == 1
+    _no_direct_writes(t2)
 
 
 # ── provisioning a user from an approved action ─────────────────────────────

@@ -26,6 +26,7 @@ from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
 from .api.booking import router as booking_router
 from .api.catalog import router as catalog_router
+from .api.controls import router as controls_router
 from .api.deal_document_uploads import router as deal_document_uploads_router
 from .api.deal_documents import router as deal_documents_router
 from .api.doc_templates.router import router as doc_templates_router
@@ -186,3 +187,4 @@ app.include_router(v1_marketplace_router)  # /v1/ versioned public API
 app.include_router(integration_router)     # contract v1 inbound events (signed, B2I)
 app.include_router(acceptance_router)      # contract v1 acceptance call (own key, OFF by default)
 app.include_router(deal_document_uploads_router)  # contract 1.5 borrower uploads (OFF by default)
+app.include_router(controls_router)        # four-eyes switches (Setup > Controls)

@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import string
 
 from argon2 import PasswordHasher
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..core.db import service_session
@@ -256,6 +256,39 @@ async def get_member(
     return _serialize(dict(row._mapping))
 
 
+def _submit(conn: Session, category: str, member_id: str, payload: dict) -> dict:
+    """Route a user change through four-eyes (governance.submit). User changes
+    are platform-locked to four-eyes, so this always queues for a checker; the
+    database applies the change atomically when the checker approves."""
+    row = conn.execute(
+        text("""
+            SELECT a.id, a.status, a.control
+              FROM governance.action a
+             WHERE a.id = institution.submit_for_approval(
+                     :cat, 'member', CAST(:mid AS uuid), CAST(:payload AS jsonb))
+        """),
+        {"cat": category, "mid": member_id, "payload": json.dumps(payload)},
+    ).fetchone()
+    conn.commit()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Submission returned no action.")
+    return {"action_id": str(row.id), "status": _outcome(row.status, row.control)}
+
+
+def _outcome(status: str, control: str) -> str:
+    return "executed" if control == "single" and status == "approved" else "pending_approval"
+
+
+def _load_member(conn: Session, member_id: str):
+    row = conn.execute(
+        text("SELECT id, is_primary_admin FROM institution.member WHERE id = :mid"),
+        {"mid": member_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Member not found.")
+    return row
+
+
 @router.patch("/{member_id}")
 async def update_member(
     member_id: str,
@@ -264,53 +297,41 @@ async def update_member(
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """
-    Update a member's full_name and/or member_role.
-    Only institution admins can do this.
-    Primary admin cannot be modified.
+    Request a change to a member's full_name, email and/or member_role.
+    Each changed field becomes one four-eyes action (user.update); nothing
+    changes until a second person approves. Primary admin cannot be modified.
+    Previously applied instantly by one admin (bypassing four-eyes).
     """
     _require_institution_admin(claims)
-
-    # Load member — ensure it exists in caller's institution (RLS via tenant_conn)
-    row = conn.execute(
-        text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
-        {"mid": member_id},
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Member not found.")
-    if row.is_primary_admin:
+    if _load_member(conn, member_id).is_primary_admin:
         raise HTTPException(status_code=403, detail="Primary admin cannot be modified.")
 
-    updates = {}
-    if "full_name" in body and body["full_name"]:
-        updates["full_name"] = body["full_name"].strip()
-    if "email" in body and body["email"]:
-        new_email = body["email"].strip().lower()
-        # The login row (auth_portal.auth_users) follows automatically: the trigger
-        # institution.sync_member_login_state mirrors member.email in the same transaction.
-        # (Tenant sessions cannot touch auth_portal: RLS, no policies.)
-        updates["email"] = new_email
-    if "member_role" in body and body["member_role"]:
+    changes: dict[str, str] = {}
+    if body.get("full_name"):
+        changes["full_name"] = str(body["full_name"]).strip()
+    if body.get("email"):
+        changes["email"] = str(body["email"]).strip().lower()
+    if body.get("member_role"):
         allowed_roles = {"maker", "checker", "viewer", "analyst"}
         if body["member_role"] not in allowed_roles:
-            raise HTTPException(status_code=422, detail=f"Invalid role. Must be one of: {sorted(allowed_roles)}")
-        updates["member_role"] = body["member_role"]
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid role. Must be one of: {sorted(allowed_roles)}",
+            )
+        changes["member_role"] = body["member_role"]
+    if not changes:
+        raise HTTPException(status_code=422, detail="Nothing to update.")
 
-    if not updates:
-        raise HTTPException(status_code=422, detail="Nothing to update. Provide full_name or member_role.")
-
-    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
-    updates["mid"] = member_id
-    try:
-        conn.execute(
-            text(f"UPDATE institution.member SET {set_clause}, updated_at = now() WHERE id = :mid"),
-            updates,
-        )
-        conn.commit()
-    except IntegrityError:
-        # auth_users.email is unique; the sync trigger refuses an email another login already uses.
-        conn.rollback()
-        raise HTTPException(status_code=409, detail="That email is already used by another login.") from None
-    return {"ok": True, "updated": list(k for k in updates if k != "mid")}
+    results = [
+        _submit(conn, "user.update", member_id,
+                {"member_id": member_id, "field": field, "value": value})
+        for field, value in changes.items()
+    ]
+    return {
+        "status": "pending_approval",
+        "fields": list(changes),
+        "action_ids": [r["action_id"] for r in results],
+    }
 
 
 @router.post("/{member_id}/deactivate")
@@ -320,30 +341,13 @@ async def deactivate_member(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
-    """
-    Deactivate a member — removes portal access immediately.
-    Sets active = false in institution.member; the DB trigger sets auth_users.is_active = false atomically.
-    Cannot deactivate primary admin.
-    """
+    """Request deactivation (four-eyes). Applied by the database on approval;
+    the login row follows via institution.sync_member_login_state."""
     _require_institution_admin(claims)
-
-    row = conn.execute(
-        text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
-        {"mid": member_id},
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Member not found.")
-    if row.is_primary_admin:
+    if _load_member(conn, member_id).is_primary_admin:
         raise HTTPException(status_code=403, detail="Primary admin cannot be deactivated.")
-
-    # The login row follows in the same transaction (trigger institution.sync_member_login_state);
-    # ficium-auth gates login and token refresh on auth_users.is_active.
-    conn.execute(
-        text("UPDATE institution.member SET active = false, updated_at = now() WHERE id = :mid"),
-        {"mid": member_id},
-    )
-    conn.commit()
-    return {"ok": True, "member_id": member_id, "status": "deactivated"}
+    return {"member_id": member_id,
+            **_submit(conn, "user.deactivate", member_id, {"member_id": member_id})}
 
 
 @router.post("/{member_id}/reactivate")
@@ -352,22 +356,11 @@ async def reactivate_member(
     claims: dict = Depends(current_claims),
     conn: Session = Depends(tenant_conn),
 ) -> dict:
-    """Reactivate a previously deactivated member."""
+    """Request reactivation (four-eyes). Applied by the database on approval."""
     _require_institution_admin(claims)
-
-    row = conn.execute(
-        text("SELECT id, auth_user_id FROM institution.member WHERE id = :mid"),
-        {"mid": member_id},
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Member not found.")
-
-    conn.execute(
-        text("UPDATE institution.member SET active = true, updated_at = now() WHERE id = :mid"),
-        {"mid": member_id},
-    )
-    conn.commit()
-    return {"ok": True, "member_id": member_id, "status": "reactivated"}
+    _load_member(conn, member_id)
+    return {"member_id": member_id,
+            **_submit(conn, "user.reactivate", member_id, {"member_id": member_id})}
 
 
 @router.post("/{member_id}/reset-password")

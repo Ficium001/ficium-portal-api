@@ -252,7 +252,17 @@ async def submit_for_approval(
             status_code=500,
             detail="submit_for_approval returned no action id.",
         )
-    return {"action_id": str(result.action_id)}
+    # Four-eyes may be switched off for this action (Setup > Controls). Then
+    # governance.submit has already executed it, as single control, audited.
+    state = conn.execute(
+        text("SELECT status, control FROM governance.action WHERE id = :aid"),
+        {"aid": result.action_id},
+    ).fetchone()
+    executed = state is not None and state.control == "single" and state.status == "approved"
+    return {
+        "action_id": str(result.action_id),
+        "status": "executed" if executed else "pending_approval",
+    }
 
 
 @router.post("/{action_id}/approve")
@@ -302,50 +312,22 @@ async def execute_user_update(
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """
-    Execute a user.update action after checker approval.
-    Applies field changes (full_name, email, member_role) to the member.
+    Kept for older portal builds. Since migration 040 the database applies a
+    user.update atomically when the checker approves (governance.execute), so
+    this only reports the result. It used to apply the change itself in a
+    second, browser-driven call, which could be skipped or replayed.
     """
     row = conn.execute(
-        text("SELECT id, category, status, payload FROM governance.action WHERE id = :aid"),
+        text("SELECT category, status, execution_status FROM governance.action WHERE id = :aid"),
         {"aid": action_id},
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Action not found.")
     if row.category != "user.update":
         raise HTTPException(status_code=400, detail="Not a user.update action.")
-    if row.status != "approved":
-        raise HTTPException(status_code=400, detail=f"Action not approved (status: {row.status}).")
-
-    payload     = row.payload
-    member_id   = payload.get("member_id")
-    field       = payload.get("field")
-    value       = payload.get("value")
-
-    if not member_id or not field or value is None:
-        raise HTTPException(status_code=400, detail="Invalid payload — missing member_id, field or value.")
-
-    allowed_fields = {"full_name", "email", "member_role"}
-    if field not in allowed_fields:
-        raise HTTPException(status_code=400, detail=f"Invalid field '{field}'.")
-
-    # Apply to institution.member. For field == "email" the login row (auth_portal.auth_users)
-    # follows in the same transaction via the trigger institution.sync_member_login_state;
-    # tenant sessions cannot touch auth_portal themselves (RLS, no policies).
-    try:
-        conn.execute(
-            text(f"UPDATE institution.member SET {field} = :value, updated_at = now() WHERE id = :mid"),
-            {"value": value, "mid": member_id},
-        )
-    except IntegrityError:
-        conn.rollback()
-        raise HTTPException(status_code=409, detail="That email is already used by another login.") from None
-
-    conn.execute(
-        text("UPDATE governance.action SET execution_status = 'executed', executed_at = now() WHERE id = :aid"),
-        {"aid": action_id},
-    )
-    conn.commit()
-    return {"ok": True, "field": field, "value": value}
+    if row.status != "approved" or row.execution_status != "executed":
+        raise HTTPException(status_code=409, detail="Not executed: the action is not approved.")
+    return {"ok": True}
 
 
 @router.post("/{action_id}/provision-user")
