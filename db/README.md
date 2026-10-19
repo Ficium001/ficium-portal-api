@@ -24,6 +24,24 @@ policies alone don't grant access — see the doc-templates incident below).
 **Before adding a new file here, apply it immediately and add a row to the
 table below in the same change.** Don't let code and schema drift again.
 
+## How migrations run now (Oct 19 2026)
+
+`ops.schema_migration` (039) records every file in this folder with its
+SHA-256. Use the runner, on Supabase or any plain Postgres:
+
+```
+PORTAL_DB_DSN=... python scripts/migrate.py --check   # what CI runs
+PORTAL_DB_DSN=... python scripts/migrate.py --apply   # apply pending, in order
+```
+
+Rules: a file is immutable once applied (an edit fails `--check`; fix forward
+with a new number). Each file and its ledger row run in one implicit
+transaction, so a failed file leaves nothing behind. Never apply SQL to a live
+database without a file here: several 2026 hotfixes exist only in Supabase's
+own history (e.g. `fix_portal_notification_deal_links`,
+`enable_rls_marketplace_sync_state`) and would be missing from a rebuild.
+The table below is history; the ledger is the source of truth.
+
 ## Files
 
 | File | Purpose | Must run on Supabase? | Live as of Aug 3 2026? |
@@ -59,6 +77,7 @@ table below in the same change.** Don't let code and schema drift again.
 | `027_document_checklist.sql` | Document checklist: `institution.doc_requirement` (per workflow, per stage, provided by, mandatory), `marketplace.deal_document` + `deal_document_event` (status required→received→verified / rejected / waived, full history), `ensure_deal_documents()`, `deal_document_act()` (four eyes on verify, notes on reject/waive, closed deals frozen, verified files not replaceable), `stage_documents_outstanding()` (stage gate). Starter checklist on `credit_docs` / lending `legal_review` stages. Tenant read-only + GRANT SELECT; functions not executable by anon/authenticated. Dry-run verified (13 checks) | Yes | ✅ (applied Oct 17 2026) |
 | `028_structured_benefits.sql` | Benefits get a priced value (`value_amount` + `value_unit` pct_pa/pct/mur; CHECK uses IS NOT NULL so a NULL unit can't slip through), copied into `bid_benefit` snapshots; `_execute_action` edited in place (asserted regex edits): duplicate `bid_benefit` insert in `bid.submit` removed (trigger is the single snapshot path), `benefit.create/update` carry the value; validity-order and title-length CHECKs (NOT VALID). Dry-run verified | Yes | ✅ (applied Oct 17 2026) |
 | `038_registration_and_admin_lockdown.sql` | **Critical security fix.** Self-registered users could insert themselves as active platform super_admin, as admin member of any institution, or create a pre-approved institution; also WORM audit-log forging and cross-tenant doc/notification updates. Locks registration to an unapproved institution + its first primary admin, removes client writes to `portal_admin.admin_users`/`admin_audit_log`, revokes stray `anon` grants. Self-verifying (replays every attack + the real registration path) | Yes | ✅ (applied Oct 19 2026; attacks re-run independently afterwards, all blocked) |
+| `039_migration_ledger.sql` | `ops.schema_migration` ledger + `scripts/migrate.py` runner; CI `--check` gate. Portable (Supabase roles handled conditionally; RLS not forced so a non-BYPASSRLS owner can migrate). 000 recorded as skipped, 001–038 as baseline | Yes | ✅ (applied Oct 19 2026; live ledger verified against all 41 repo hashes) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a

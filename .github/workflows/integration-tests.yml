@@ -31,6 +31,14 @@ jobs:
       - name: Install deps
         run: pip install -r requirements-dev.txt
 
+      - name: Migrations applied and unedited (db/ vs ops.schema_migration)
+        # Fails if a db/*.sql file was merged but never applied, or edited
+        # after it was applied. Closes the class behind the Aug 2026 incident
+        # (008/009/010 merged, never run). Read-only.
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+        run: python scripts/migrate.py --check
+
       - name: Run integration suite
         env:
           PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
