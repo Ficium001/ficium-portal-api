@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from ..core.bidding import BidInput, BidPlacementError, place_bid
-from ..core.config import settings
 from ..core.db import service_session
 from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..core.webhooks import dispatch_event
@@ -255,14 +253,7 @@ async def reject_request(
     }))
     return {"ok": True, "request_id": request_id, "status": "declined"}
 
-# ── POST /marketplace/close-expired ──────────────────────────────────────────
-def _verify_service_secret(received: str) -> None:
-    expected = settings.app_service_secret
-    if not expected:
-        raise HTTPException(status_code=503, detail="Service secret not configured.")
-    if not hmac.compare_digest(received.encode(), expected.encode()):
-        raise HTTPException(status_code=403, detail="Invalid service secret.")
-
+# ── Closing expired bid windows (maintenance loop only) ──────────────────────
 # Stable id for the transaction-scoped advisory lock: only one caller (any replica, the scheduler
 # or this endpoint) closes windows at a time.
 _CLOSE_EXPIRED_LOCK_KEY = 7240011
@@ -294,21 +285,9 @@ def close_expired_once() -> dict[str, int]:
     }
 
 
-@router.post("/close-expired")
-async def close_expired(
-    x_service_secret: str = Header(default="", alias="X-Service-Secret"),
-) -> dict:
-    _verify_service_secret(x_service_secret)
-    counts = await asyncio.to_thread(close_expired_once)
-    total = counts["closed"] + counts["expired"]
-    return {
-        "closed": total,  # total windows closed; kept as an int for existing callers
-        "windows_closed_with_bids": counts["closed"],
-        "windows_expired": counts["expired"],
-        "bids_rejected": 0,
-        "skipped_another_run_in_progress": bool(counts["skipped"]),
-        "message": f"Closed {total} expired bid window(s).",
-    }
+# (removed) POST /marketplace/close-expired: a manual trigger guarded by the secret shared with
+# the borrower app. The maintenance loop (app/maintenance.py) closes windows on its own.
+
 
 # ── POST /marketplace/sync-requests ──────────────────────────────────────────
 # Phase 1 helpers ─────────────────────────────────────────────────────────────

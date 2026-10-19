@@ -186,18 +186,7 @@ def record_decision(
             "loan_id": pipeline_id, "outcome": "declined", "reason": result["reason"],
             "source": "credit_decision",
         })
-    if result["outcome"] in ("approved", "approved_with_conditions"):
-        # Late import: pipeline imports this module's siblings; avoid a cycle.
-        from ..api.pipeline import _notify_borrower_stage_advanced
-
-        # Async wrapper on purpose: the notifier schedules on the running
-        # loop. A sync background task runs in a worker thread with no loop,
-        # where it silently skips.
-        async def _notify() -> None:
-            _notify_borrower_stage_advanced(
-                pipeline_id, str(result["stage_id"]), result["deal_status"] == "completed")
-
-        background.add_task(_notify)
+    # The borrower hears about approvals from deal.progress_updated (db/033): no direct call.
     log.info("credit_decision_recorded", pipeline_id=pipeline_id, source=source,
              outcome=result["outcome"])
     return result

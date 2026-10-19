@@ -29,14 +29,12 @@ import asyncio
 import json
 from decimal import Decimal
 
-import httpx
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core import doa
-from ..core.config import settings
 from ..core.credit_decision import (
     CreditDecisionInput,
     has_decision_permission,
@@ -59,47 +57,6 @@ router = APIRouter(
     dependencies=[Depends(require_module("pipeline"))],
 )
 
-
-def _notify_borrower_stage_advanced(
-    pipeline_id: str,
-    stage_id:    str,
-    pipeline_complete: bool = False,
-) -> None:
-    """
-    Best-effort push to the Ficium App Vercel backend to notify the borrower
-    that their loan pipeline has moved forward. Fire-and-forget.
-
-    The Vercel endpoint writes a public.notification row + sends a Resend email.
-    """
-    vercel_url = getattr(settings, "vercel_app_url", "")
-    secret     = getattr(settings, "app_service_secret", "")
-    if not vercel_url or not secret:
-        return  # not configured — skip silently
-
-    async def _fire() -> None:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    f"{vercel_url}/api/internal",
-                    json={
-                        "action":            "pipeline-stage-advanced",
-                        "pipeline_id":       pipeline_id,
-                        "stage_id":          stage_id,
-                        "pipeline_complete": pipeline_complete,
-                    },
-                    headers={"X-Service-Secret": secret},
-                )
-        except Exception:  # noqa: BLE001
-            log.warning("borrower_pipeline_notify_failed", pipeline_id=pipeline_id)
-
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(_fire())
-        else:
-            loop.run_until_complete(_fire())
-    except RuntimeError:
-        pass  # no event loop in sync context — skip
 
 def _documents_outstanding(conn, pipeline_id: str, stage_id: str) -> int:
     """Mandatory checklist documents of this stage not yet verified or waived (db/027)."""
@@ -493,9 +450,7 @@ def _complete_stage(
             metadata={"pipeline_id": pipeline_id, "completed_stage_id": stage_id},
         )
         conn.commit()
-
-        # Notify borrower via Vercel (fire-and-forget, best-effort)
-        _notify_borrower_stage_advanced(pipeline_id, stage_id)
+        # The borrower hears about it from deal.progress_updated (db/033): no direct call.
 
         return {"status": "advanced", "next_stage_id": next_stage["id"], "pipeline_id": pipeline_id}
     else:
@@ -506,8 +461,6 @@ def _complete_stage(
             WHERE id = :pid
         """), {"pid": pipeline_id})
         conn.commit()
-
-        _notify_borrower_stage_advanced(pipeline_id, stage_id, pipeline_complete=True)
 
         return {"status": "completed", "pipeline_id": pipeline_id}
 

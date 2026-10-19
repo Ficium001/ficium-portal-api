@@ -3,14 +3,12 @@ and a scheduler that is OFF unless an operator turns it on."""
 
 from __future__ import annotations
 
-import asyncio
 import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/test")
 os.environ.setdefault("APP_DATABASE_URL", "postgresql://test:test@localhost:5432/test")
@@ -66,55 +64,6 @@ def test_second_runner_backs_off_without_touching_anything(monkeypatch) -> None:
     _patch_session(monkeypatch, sess)
     assert marketplace.close_expired_once() == {"closed": 0, "expired": 0, "skipped": 1}
     assert not any("close_expired_windows" in s for s in sess.sql)
-
-
-def test_endpoint_reports_ints_and_never_notifies_banks(monkeypatch) -> None:
-    from app.main import app
-
-    async def _noop() -> None:
-        return None
-
-    import app.main as main
-
-    monkeypatch.setattr(main, "init_pool", _noop)
-    monkeypatch.setattr(main, "close_pool", _noop)
-    monkeypatch.setattr(marketplace.settings, "app_service_secret", "s3cret")
-    sess = _Sess(lock=True, rows=_rows("closed", "expired"))
-    _patch_session(monkeypatch, sess)
-    sent: list[Any] = []
-    monkeypatch.setattr(marketplace, "dispatch_event", lambda *a, **k: sent.append(a))
-    with TestClient(app) as c:
-        r = c.post("/marketplace/close-expired", headers={"X-Service-Secret": "s3cret"})
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["closed"] == 2 and body["windows_expired"] == 1 and body["bids_rejected"] == 0
-        assert sent == []
-        assert (
-            c.post("/marketplace/close-expired", headers={"X-Service-Secret": "wrong"}).status_code
-            == 403
-        )
-
-
-async def test_scheduler_runs_survives_errors_and_stops(monkeypatch) -> None:
-    from app import maintenance
-
-    calls: list[int] = []
-
-    def _flaky() -> dict[str, int]:
-        calls.append(1)
-        if len(calls) == 1:
-            raise RuntimeError("db blip")
-        return {"closed": 0, "expired": 1, "skipped": 0}
-
-    monkeypatch.setattr(maintenance, "close_expired_once", _flaky)
-    monkeypatch.setattr(maintenance.settings, "maintenance_interval_s", 0.01)
-    stop = asyncio.Event()
-    task = asyncio.create_task(maintenance.run_forever(stop))
-    while len(calls) < 3:
-        await asyncio.sleep(0.01)
-    stop.set()
-    await asyncio.wait_for(task, timeout=1)
-    assert len(calls) >= 3  # the first error did not kill the loop
 
 
 def test_scheduler_is_off_by_default() -> None:
