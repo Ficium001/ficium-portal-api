@@ -247,50 +247,31 @@ class TestAuthBoundary:
 # ===========================================================================
 # Public endpoints — X-Service-Secret, no JWT
 # ===========================================================================
-class TestPublicEndpoints:
-    REQUEST_ID = str(uuid.uuid4())
-    CONSUMER_ID = str(uuid.uuid4())
+class TestNoDirectLinkToTheBorrowerApp:
+    """Everything with the borrower app goes through the integration contract (Oct 2026)."""
 
-    def test_market_intelligence_wrong_secret_returns_403(self, client):
-        r = client.get(
-            "/public/market-intelligence",
-            headers={"X-Service-Secret": "wrong"},
-        )
-        assert r.status_code == 403
+    def test_public_server_to_server_endpoints_are_gone(self, client):
+        rid = str(uuid.uuid4())
+        for method, path in [
+            ("GET", "/public/market-intelligence"),
+            ("GET", f"/public/requests/{rid}/bids"),
+            ("POST", "/public/requests/bids/bulk"),
+            ("POST", f"/public/requests/{rid}/accept-bid"),
+            ("GET", f"/public/requests/{rid}/pipeline"),
+            ("GET", "/marketplace/borrower/portfolio"),
+            ("POST", "/marketplace/close-expired"),
+            ("POST", "/marketplace/sync-requests"),
+        ]:
+            r = client.request(method, path, headers={"X-Service-Secret": "test-secret-1234"})
+            assert r.status_code in (401, 404, 405), (method, path, r.status_code)
 
-    def test_market_intelligence_no_secret_returns_403(self, client):
-        r = client.get("/public/market-intelligence")
-        assert r.status_code == 403
+    def test_no_setting_for_a_direct_link(self):
+        from app.core.config import Settings
 
-    def test_market_intelligence_valid_secret_returns_expected_shape(self, client):
-        with patch("app.api.public.service_session", side_effect=_mock_service_session):
-            r = client.get(
-                "/public/market-intelligence",
-                headers={"X-Service-Secret": "test-secret-1234"},
-            )
-        assert r.status_code == 200
-        body = r.json()
-        assert set(body.keys()) == {"marketRates", "acceptanceIntel", "competitiveness"}
-        assert isinstance(body["marketRates"], list)
-        assert isinstance(body["acceptanceIntel"], list)
-        assert isinstance(body["competitiveness"], list)
-
-    # ===========================================================================
-    # Members
-    # ===========================================================================
-    def test_direct_bid_endpoints_are_gone(self, client):
-        """No direct link: the borrower app reads its own copy of the bid events (ficium #89)."""
-        rid = self.REQUEST_ID
-        assert client.get(
-            f"/public/requests/{rid}/bids?consumer_id=x",
-            headers={"X-Service-Secret": "test-secret-1234"},
-        ).status_code in (404, 405)
-        assert client.post(
-            "/public/requests/bids/bulk",
-            json={"request_ids": [rid], "consumer_id": "x"},
-            headers={"X-Service-Secret": "test-secret-1234"},
-        ).status_code in (404, 405)
-
+        fields = set(Settings.model_fields)
+        for name in ("app_database_url", "app_service_secret", "app_supabase_url",
+                     "app_supabase_anon_key", "vercel_app_url"):
+            assert name not in fields, name
 
 class TestMembersEndpoints:
     def test_me_returns_200_or_404(self, auth_client):

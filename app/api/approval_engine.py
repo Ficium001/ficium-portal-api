@@ -593,11 +593,9 @@ def _after_facility_decision(conn: Session, instance_id: str) -> None:
     if r is None or r.status not in ("approved", "rejected"):
         return
     from ..core.webhooks import dispatch_event
-    from .pipeline import _notify_borrower_stage_advanced
 
     pid, iid = str(r.entity_id), str(r.institution_id)
     if r.status == "approved":
-        _notify_borrower_stage_advanced(pid, str(r.stage_id), r.deal_status == "completed")
         asyncio.create_task(dispatch_event(iid, "pipeline.stage_changed", {
             "loan_id": pid, "stage_id": str(r.stage_id), "new_status": "completed",
             "pipeline_completed": r.deal_status == "completed", "source": "credit_approval",

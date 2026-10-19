@@ -21,13 +21,6 @@ class Settings(BaseSettings):
     db_command_timeout:  float = 30.0
 
     # ── Cross-project: Ficium App database (marketplace pool) ──
-    # Ficium App's Supabase project (for verifying borrower session tokens via
-    # GoTrue introspection — see core/app_auth.py). Different signer than
-    # ficium-auth, so this is a separate trust path, not an extension of
-    # auth_jwks_url above. anon key only — never the service_role key.
-    app_supabase_url:      str = Field(default="", description="Ficium App Supabase project URL")
-    app_supabase_anon_key: str = Field(default="", description="Ficium App Supabase anon key")
-
     @field_validator("database_url", mode="before")
     @classmethod
     def normalize_db_url(cls, v: str) -> str:
@@ -50,7 +43,6 @@ class Settings(BaseSettings):
     # ── Server-to-server ──────────────────────────────────────
     # Shared secret for calls from the ficium client-app Vercel backend.
     # Set APP_SERVICE_SECRET to the same value in both services.
-    app_service_secret: str = Field(default="", description="X-Service-Secret for s2s calls")
 
     # ── Integration contract v1 (ficium-integration) ─────────────
     # Inbound: borrower -> institution events, verified with B2I keys.
@@ -97,8 +89,14 @@ class Settings(BaseSettings):
         return bool(self.integration_i2b_signing_key and self.integration_peer_url)
 
     # ── CORS ──────────────────────────────────────────────────
-    allowed_origins:      str = "https://ficium-portal.vercel.app,https://portal.ficium.net,https://ficium.vercel.app"
-    allowed_origin_regex: str = r"^https://(ficium-portal[a-z0-9.\-]*\.vercel\.app|ficium[a-z0-9.\-]*\.vercel\.app|[a-z0-9.\-]*\.ficium\.net)$"
+    # Portal front ends only. The borrower app is not an allowed browser origin: it reaches
+    # this side only through the integration contract, server to server.
+    allowed_origins:      str = "https://ficium-portal.vercel.app,https://portal.ficium.net"
+    # Portal deployments (incl. previews) and ficium.net. The old pattern also matched
+    # ficium*.vercel.app, i.e. the borrower app and its previews.
+    allowed_origin_regex: str = (
+        r"^https://(ficium-portal[a-z0-9.\-]*\.vercel\.app|[a-z0-9.\-]*\.ficium\.net)$"
+    )
 
     # ── Deployment ────────────────────────────────────────────
     deployment_model: str = "saas"

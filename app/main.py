@@ -25,7 +25,6 @@ from .api.auth_provision import router as auth_provision_router
 from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
 from .api.booking import router as booking_router
-from .api.borrower_portfolio import router as borrower_portfolio_router
 from .api.catalog import router as catalog_router
 from .api.deal_document_uploads import router as deal_document_uploads_router
 from .api.deal_documents import router as deal_documents_router
@@ -43,7 +42,6 @@ from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
 from .api.portal_badges import router as portal_badges_router
 from .api.product_limits import router as product_limits_router
-from .api.public import router as public_router
 from .api.request_chat import router as request_chat_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
@@ -167,7 +165,6 @@ app.include_router(approval_engine_router)  # configurable chains (inst:approval
 app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
-app.include_router(borrower_portfolio_router)  # borrower-facing facilities (App-authenticated)
 app.include_router(request_chat_router)  # per-lender request chat (proxies App DB)
 app.include_router(entitlements_router)  # module packaging (plat:billing)
 app.include_router(autobid_router)  # auto-bid rules engine (inst:autobid)
@@ -183,7 +180,6 @@ app.include_router(pipeline_router)
 app.include_router(notifications_router)
 app.include_router(product_limits_router)
 app.include_router(portal_badges_router)
-app.include_router(public_router)       # server-to-server, no JWT
 app.include_router(api_keys_router)     # institution API key management
 app.include_router(webhooks_router)     # webhook CRUD + delivery log
 app.include_router(v1_marketplace_router)  # /v1/ versioned public API

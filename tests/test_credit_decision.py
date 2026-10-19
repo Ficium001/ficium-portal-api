@@ -161,12 +161,13 @@ def _events(bg: BackgroundTasks) -> list[str]:
     return [t.args[1] for t in bg.tasks if len(t.args) > 1]
 
 
-def test_approval_audits_commits_and_notifies_borrower() -> None:
+def test_approval_audits_commits_and_fires_the_webhook() -> None:
     s = FakeSession(fn_result=_result())
     _, bg = _record(s)
     assert s.committed and any("audit.event" in q for q in s.sql)
     assert _events(bg) == ["deal.credit_decided"]
-    assert len(bg.tasks) == 2  # webhook + borrower notification
+    # The borrower is told by deal.progress_updated (db/033), not a direct call.
+    assert len(bg.tasks) == 1
 
 
 def test_decline_also_fires_deal_closed_and_no_borrower_advance() -> None:
