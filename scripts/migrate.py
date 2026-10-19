@@ -114,12 +114,15 @@ def run(conn: Conn, a: argparse.Namespace) -> int:
     pending, changed, orphaned = diff(conn)
     for name in changed:
         print(f"EDITED AFTER APPLY: {name} (fix forward with a new file)")
+        _annotate(f"EDITED AFTER APPLY: {name} (fix forward with a new file)")
     for name in orphaned:
         print(f"IN LEDGER, NOT IN REPO: {name}")
+        _annotate(f"IN LEDGER, NOT IN REPO: {name}")
 
     if a.check:
         for p in pending:
             print(f"NOT APPLIED: {p.name}")
+            _annotate(f"NOT APPLIED: {p.name}")
         bad = bool(pending or changed or orphaned)
         ok = f"migrations: {len(files())} files, all applied"
         print("migrations: drift found" if bad else ok)
@@ -142,5 +145,20 @@ def run(conn: Conn, a: argparse.Namespace) -> int:
     return 0
 
 
+def _annotate(msg: str) -> None:
+    # In GitHub Actions, surface the reason on the PR / check run itself.
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print("::error title=migrations::" + msg.replace("\n", " "))
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        rc = main()
+    except SystemExit:
+        raise
+    except Exception as e:  # connection / SQL errors: say what, not a bare traceback
+        _annotate(f"{type(e).__name__}: {e}")
+        raise
+    if rc:
+        _annotate("drift found; see step output (NOT APPLIED / EDITED / IN LEDGER lines)")
+    raise SystemExit(rc)
