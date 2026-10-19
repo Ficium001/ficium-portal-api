@@ -154,7 +154,9 @@ def _annotate(msg: str) -> None:
 if __name__ == "__main__":
     try:
         rc = main()
-    except SystemExit:
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            _annotate(e.code)
         raise
     except Exception as e:  # connection / SQL errors: say what, not a bare traceback
         _annotate(f"{type(e).__name__}: {e}")
