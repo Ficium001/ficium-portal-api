@@ -7,10 +7,13 @@
 #   Creates the auth_portal.auth_users entry so the user can log in via
 #   ficium-auth (which is what the portal login page uses).
 #
-# Security: no JWT required (user isn't logged in yet), but the endpoint
-# validates that the auth_user_id exists in auth.users AND that the
-# institution_id exists and is in 'registered' state before creating
-# the ficium-auth entry. This prevents abuse.
+# Security: no JWT required (user isn't logged in yet). It only ever creates
+# the FIRST login of a brand-new institution, as institution_admin, and only
+# when: the auth user exists; the caller is that institution's primary-admin
+# member (insert gated by RLS, migration 038); the institution is unapproved,
+# 'registered', and its contact email is the caller's; and no other login
+# exists for it. Role is never read from the request.
+# Until 2026-10-19 this accepted any institution id and any role.
 # =============================================================================
 
 from __future__ import annotations
@@ -55,7 +58,10 @@ async def provision_member(body: dict = Body(...)) -> dict:
     email          = body["email"].strip().lower()
     password       = body["password"]
     institution_id = body["institution_id"]
-    role           = body.get("role", "institution_admin")
+    # Never taken from the request. Self-registration only ever creates the
+    # primary admin of a brand-new, unapproved institution; every other
+    # member is provisioned through dual control (approvals.py).
+    role           = "institution_admin"
 
     if len(password) < 8:
         raise HTTPException(status_code=422, detail="Password must be at least 8 characters.")
@@ -72,23 +78,42 @@ async def provision_member(body: dict = Body(...)) -> dict:
                 detail="auth_user_id does not match a valid Supabase auth user.",
             )
 
-        # 2. Verify the institution exists in a registerable state
+        # 2. The caller must be the primary admin of an institution THEY just
+        #    registered: still unapproved, contact email = this user, and the
+        #    member row (RLS-gated at insert, migration 038) is theirs.
+        #    Previously any institution id + any role was accepted, which let
+        #    anyone mint a login inside an approved bank (critical, 2026-10-19).
         inst_row = conn.execute(
             text("""
-                SELECT id FROM institution.institution
-                WHERE id = :iid
-                  AND onboarding_stage IN ('registered', 'commercial_review',
-                                           'compliance_review', 'pending_approval',
-                                           'approved')
-                LIMIT 1
+                SELECT i.id
+                  FROM institution.institution i
+                  JOIN institution.member m
+                    ON m.institution_id = i.id
+                   AND m.auth_user_id   = :uid
+                   AND lower(m.email)   = :email
+                   AND m.is_primary_admin
+                 WHERE i.id = :iid
+                   AND i.approved = false
+                   AND i.onboarding_stage = 'registered'
+                   AND lower(i.primary_contact_email) = :email
+                 LIMIT 1
             """),
-            {"iid": institution_id},
+            {"iid": institution_id, "uid": auth_user_id, "email": email},
         ).fetchone()
         if inst_row is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Institution not found or not in a valid state.",
-            )
+            raise HTTPException(status_code=403, detail="Registration could not be verified.")
+
+        # 2b. First login for this institution only — never a second one.
+        taken = conn.execute(
+            text("""
+                SELECT 1 FROM auth_portal.auth_users
+                 WHERE institution_id = :iid AND lower(email) <> :email
+                 LIMIT 1
+            """),
+            {"iid": institution_id, "email": email},
+        ).fetchone()
+        if taken:
+            raise HTTPException(status_code=403, detail="Registration could not be verified.")
 
         # 3. Idempotency — skip if ficium-auth entry already exists
         existing = conn.execute(
