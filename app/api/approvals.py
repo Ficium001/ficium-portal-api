@@ -43,6 +43,8 @@ CATEGORY_MODULE: dict[str, str] = {
     "sla":      "inst:settings",
     "webhook":  "inst:webhooks",
     "document": "inst:documents",
+    # Switching four-eyes off: only admins see and approve it (db/044).
+    "four_eyes": "inst:settings",
 }
 
 

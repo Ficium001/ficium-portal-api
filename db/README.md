@@ -82,6 +82,7 @@ The table below is history; the ledger is the source of truth.
 | `041_member_changes_only_through_four_eyes.sql` | Primary admin cannot be edited/deactivated (trigger on `governance.action`); bank users lose direct UPDATE/DELETE on `institution.member`. Self-verifying | Yes | ✅ (applied Oct 19 2026) |
 | `042_benefits_through_four_eyes.sql` | Every benefit change goes through `governance.submit` (ordinary benefits and deactivations were direct writes); executor handles benefits itself (legacy one forced `is_guaranteed = true`); direct INSERT/UPDATE on `institution.benefit` revoked. Self-verifying | Yes | ✅ (applied Oct 19 2026) |
 | `043_password_reset_four_eyes.sql` | `user.reset_password` is a locked four-eyes action (was one admin, who saw the password). Temp passwords (reset and new user) are released once, only to the approving checker: `governance.action.credential_released_at` claimed in the same transaction as the hash write. Primary admin excluded. Self-verifying | Yes | ✅ (applied Oct 19 2026) |
+| `044_controls_approved_by_admins_only.sql` | Approving a `four_eyes.*` action requires an institution admin (040 allowed any non-maker). Verification SKIPPED at apply: every active MCB member is an admin, so the non-admin path is untested on live data until a non-admin test user exists | Yes | ✅ (applied Oct 19 2026, verification skipped) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
