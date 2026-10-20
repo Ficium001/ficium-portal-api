@@ -203,7 +203,17 @@ def _action(**payload: Any) -> SimpleNamespace:
     )
 
 
-def _provision(tenant: Recorder, svc: Recorder) -> Any:
+CHECKER = str(uuid.uuid4())
+
+
+def _provision(tenant: Recorder, svc: Recorder, *, claim: bool = True) -> Any:
+    """The caller is the approving checker, and the credential is unclaimed,
+    unless claim=False (db/043: released once, only to the checker)."""
+    tenant._script.append(("current_member_ctx", SimpleNamespace(id=CHECKER)))
+    if claim:
+        svc._script.insert(0, ("credential_released_at = now()",
+                               SimpleNamespace(payload={}, institution_id=INST)))
+
     @contextmanager
     def _svc():  # noqa: ANN202
         yield svc
@@ -223,8 +233,11 @@ def test_provision_creates_login_member_and_marks_action_in_one_privileged_sessi
         body["created"] is True and body["user_id"] == NEW_UID and len(body["temp_password"]) == 16
     )
     assert body["email"] == "new.user@example.com" and body["username"] == "new.user"
-    # the tenant session only READ the action; nothing of auth_portal went through it
-    assert len(tenant.calls) == 1 and "auth_portal" not in tenant.sqls()[0]
+    # the tenant session only READ (the action, who I am); no auth_portal through it
+    assert len(tenant.calls) == 2 and not any("auth_portal" in q for q in tenant.sqls())
+    # the credential was claimed for THIS checker, in the privileged session
+    claim = next(c for c in svc.calls if "credential_released_at = now()" in c[0])
+    assert claim[1]["me"] == CHECKER and claim[1]["cat"] == "user.create"
     # everything else, in one privileged session, in order
     order = [s.split("(")[0].split(" WHERE")[0].strip() for s in svc.sqls()]
     assert any("INSERT INTO auth_portal.auth_users" in s for s in svc.sqls())
@@ -247,7 +260,11 @@ def test_provision_never_links_a_login_that_belongs_to_another_institution() -> 
     )
     r = _provision(tenant, svc)
     assert r.status_code == 409
-    assert not any(s.startswith("INSERT") or s.startswith("UPDATE") for s in svc.sqls()), svc.sqls()
+    # Only the credential claim ran; the 409 rolls the whole service
+    # transaction back (service_session), claim included.
+    writes = [q for q in svc.sqls()
+              if q.startswith(("INSERT", "UPDATE")) and "credential_released_at" not in q]
+    assert writes == [], writes
 
 
 def test_provision_is_idempotent_inside_the_same_institution() -> None:
@@ -292,3 +309,61 @@ def test_provision_rejects_wrong_action_state_before_any_privileged_work(
     r = _provision(Recorder(script=[("FROM governance.action a", row)]), svc)
     assert r.status_code == code
     assert svc.calls == []
+
+
+def test_provision_refused_for_anyone_but_the_checker_or_a_second_time() -> None:
+    tenant = Recorder(script=[("FROM governance.action a", _action())])
+    svc = Recorder(script=[("INSERT INTO auth_portal.auth_users", SimpleNamespace(id=NEW_UID))])
+    r = _provision(tenant, svc, claim=False)
+    assert r.status_code == 409
+    assert not any("INSERT INTO auth_portal.auth_users" in q for q in svc.sqls())
+
+
+# ── password reset: four-eyes, released once to the checker (db/043) ─────────
+def test_reset_password_only_queues_four_eyes() -> None:
+    t = Recorder(script=[
+        ("FROM institution.member WHERE id",
+         SimpleNamespace(id=MEMBER, is_primary_admin=False, auth_user_id=AUTH_UID)),
+        ("FROM governance.action",
+         SimpleNamespace(id=ACTION, status="pending", control="four_eyes")),
+    ])
+    r = _install(t).post(f"/members/{MEMBER}/reset-password")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "pending_approval" and "temp_password" not in r.json()
+    assert not any("auth_portal" in q for q in t.sqls())
+    assert any(c[1].get("cat") == "user.reset_password" for c in t.calls)
+
+
+def _release(tenant: Recorder, svc: Recorder) -> Any:
+    tenant._script.append(("current_member_ctx", SimpleNamespace(id=CHECKER)))
+
+    @contextmanager
+    def _svc():  # noqa: ANN202
+        yield svc
+
+    client = _install(tenant)
+    with patch("app.api.approvals.service_session", _svc):
+        return client.post(f"/approvals/{ACTION}/release-password")
+
+
+def test_checker_releases_reset_password_once() -> None:
+    svc = Recorder(script=[
+        ("credential_released_at = now()",
+         SimpleNamespace(payload={"member_id": MEMBER}, institution_id=INST)),
+        ("FROM institution.member m",
+         SimpleNamespace(auth_user_id=AUTH_UID, email="a@b.mu", full_name="A B")),
+        ("UPDATE auth_portal.auth_users", SimpleNamespace(id=AUTH_UID)),
+    ])
+    r = _release(Recorder(), svc)
+    assert r.status_code == 200, r.text
+    assert len(r.json()["temp_password"]) == 16
+    claim = next(c for c in svc.calls if "credential_released_at = now()" in c[0])
+    assert claim[1] == {"aid": ACTION, "cat": "user.reset_password", "me": CHECKER}
+    assert any("INSERT INTO audit.event" in q for q in svc.sqls())
+
+
+def test_anyone_else_or_second_release_gets_nothing() -> None:
+    svc = Recorder()  # claim matches no row: not the checker, or already released
+    r = _release(Recorder(), svc)
+    assert r.status_code == 409
+    assert not any("auth_portal" in q for q in svc.sqls())

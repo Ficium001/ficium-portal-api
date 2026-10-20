@@ -5,8 +5,6 @@
 from __future__ import annotations
 
 import json
-import secrets
-import string
 
 from argon2 import PasswordHasher
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -370,13 +368,12 @@ async def reset_member_password(
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """
-    Generate a new temporary password for a member.
-    Returns the temp password in plaintext — admin must share it with the user.
-    Uses service_session for the auth_users UPDATE (outside institution RLS scope).
+    Request a password reset (four-eyes, platform-locked). Once a second person
+    approves, that checker releases the temporary password once via
+    POST /approvals/{action_id}/release-password. Until 2026-10-19 one admin
+    reset it directly and saw the password: a one-person account takeover.
     """
     _require_institution_admin(claims)
-
-    # 1. Resolve member via tenant_conn (institution-scoped, RLS enforced)
     row = conn.execute(
         text("SELECT id, is_primary_admin, auth_user_id FROM institution.member WHERE id = :mid"),
         {"mid": member_id},
@@ -384,32 +381,11 @@ async def reset_member_password(
     if row is None:
         raise HTTPException(status_code=404, detail="Member not found.")
     if row.is_primary_admin:
-        raise HTTPException(status_code=403, detail="Cannot reset primary admin password via this endpoint.")
+        raise HTTPException(status_code=403, detail="The primary admin's password cannot be reset here.")
     if not row.auth_user_id:
-        raise HTTPException(status_code=400, detail="Member has no auth account yet.")
-
-    alphabet = string.ascii_letters + string.digits + "!@#$%"
-    temp_password = "".join(secrets.choice(alphabet) for _ in range(16))
-    pw_hash = _hasher().hash(temp_password)
-
-    # 2. Update auth_users via service_session — bypasses RLS on auth_portal schema
-    with service_session() as svc:
-        updated = svc.execute(
-            text("UPDATE auth_portal.auth_users SET password_hash = :pw, must_change_password = true, updated_at = now() WHERE id = :uid RETURNING id"),
-            {"pw": pw_hash, "uid": str(row.auth_user_id)},
-        ).fetchone()
-        svc.commit()
-
-    if not updated:
-        raise HTTPException(status_code=404, detail="Auth user record not found.")
-
-    return {
-        "ok": True,
-        "member_id": member_id,
-        "temp_password": temp_password,
-        "message": "Share this temporary password with the user. They should change it on next login.",
-    }
-
+        raise HTTPException(status_code=400, detail="This user has not signed up yet.")
+    return {"member_id": member_id,
+            **_submit(conn, "user.reset_password", member_id, {"member_id": member_id})}
 
 @router.get("/{member_id}/audit")
 async def get_member_audit(
