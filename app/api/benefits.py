@@ -2,16 +2,20 @@
 # ficium-portal-api — Benefits router
 #
 # Module gate:  inst:benefits
-# Write model:  guaranteed benefits → institution.pending_actions (maker-checker)
-#               non-guaranteed      → direct (low commercial risk)
+# Write model:  every change → governance.submit (db/040, 042). The bank's
+#               Setup > Controls switch decides: four-eyes on → queued for a
+#               checker; off → applied at once, recorded as one-person control.
+#               (Until 2026-10-19 only "guaranteed" benefits had four-eyes;
+#               the rest, and every deactivation, were direct writes.)
 # Read model:   direct, institution-scoped via RLS
 #
 # Endpoints:
 #   GET  /benefits/categories          — Ficium-seeded categories (reference)
 #   GET  /benefits                     — institution's active benefits
-#   POST /benefits                     — create (guaranteed → pending, else direct)
-#   PUT  /benefits/{id}                — update (guaranteed → pending, else direct)
-#   DELETE /benefits/{id}              — deactivate (always direct — low risk)
+#   POST /benefits                     — create  (benefit.create)
+#   PUT  /benefits/{id}                — update  (benefit.update)
+#   DELETE /benefits/{id}              — deactivate (benefit.delete)
+#   Each returns {pending, status, action_id}.
 # =============================================================================
 
 from __future__ import annotations
@@ -147,6 +151,29 @@ def _payload(rec: dict) -> str:
     return json.dumps({k: rec.get(k) for k in _FIELDS | {"value_display"}}, default=str)
 
 
+def _submit(conn: Session, category: str, resource_id: str | None, payload: dict) -> dict:
+    """Send a benefit change through the four-eyes choke point and report
+    whether it was applied now (switch off) or queued for a checker."""
+    row = conn.execute(
+        text("""
+            SELECT a.id, a.status, a.control
+              FROM governance.action a
+             WHERE a.id = institution.submit_for_approval(
+                     :cat, 'benefit', CAST(:rid AS uuid), CAST(:payload AS jsonb))
+        """),
+        {"cat": category, "rid": resource_id, "payload": json.dumps(payload, default=str)},
+    ).fetchone()
+    conn.commit()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Submission returned no action.")
+    executed = row.control == "single" and row.status == "approved"
+    return {
+        "pending": not executed,
+        "status": "executed" if executed else "pending_approval",
+        "action_id": str(row.id),
+    }
+
+
 # ─── GET /benefits ─────────────────────────────────────────────────────────────
 
 @router.get("")
@@ -182,69 +209,12 @@ async def create_benefit(
     claims: dict = Depends(current_claims),
     conn:   Session = Depends(tenant_conn),
 ) -> dict:
-    """
-    Create a benefit.
-    Guaranteed benefits (is_guaranteed=true) route through maker-checker.
-    Non-guaranteed are created directly.
-    """
+    """Create a benefit (four-eyes per the bank's Controls switch)."""
     _require_module(claims)
-    institution_id = _institution_id(claims)
-    member_id      = claims.get("member_id") or claims.get("sub")
+    _institution_id(claims)
 
     rec = _normalise(conn, body)
-    is_guaranteed = bool(body.get("is_guaranteed", False))
-
-    if is_guaranteed:
-        # Route through maker-checker via submit_for_approval RPC.
-        # The DB function resolves maker_id from auth.uid() (JWT claims GUC).
-        result = conn.execute(
-            text("""
-                SELECT institution.submit_for_approval(
-                    :cat, :rtype, NULL, CAST(:payload AS jsonb)
-                ) AS action_id
-            """),
-            {"cat": "benefit.create", "rtype": "benefit", "payload": _payload(rec)},
-        ).fetchone()
-        conn.commit()
-        if result is None:
-            raise HTTPException(status_code=500, detail="submit_for_approval returned no action id.")
-        return {"pending": True, "action_id": str(result.action_id)}
-
-    # Non-guaranteed — direct insert
-    row = conn.execute(
-        text("""
-            INSERT INTO institution.benefit (
-                institution_id, product_id, cat_id,
-                title, description, value_display, value_amount, value_unit,
-                is_guaranteed, conditions, valid_from, valid_until,
-                is_active, created_by
-            ) VALUES (
-                :iid, :product_id, :cat_id,
-                :title, :description, :value_display, :value_amount, :value_unit,
-                false, :conditions, :valid_from, :valid_until,
-                true, :created_by
-            )
-            RETURNING *
-        """),
-        {
-            "iid":           institution_id,
-            "product_id":    rec["product_id"],
-            "cat_id":        rec["cat_id"],
-            "title":         rec["title"],
-            "description":   rec["description"],
-            "value_display": rec["value_display"],
-            "value_amount":  rec["value_amount"],
-            "value_unit":    rec["value_unit"],
-            "conditions":    rec["conditions"],
-            "valid_from":    rec["valid_from"],
-            "valid_until":   rec["valid_until"],
-            "created_by":    member_id,
-        },
-    ).fetchone()
-    conn.commit()
-    if row is None:
-        raise HTTPException(status_code=500, detail="Benefit record could not be created.")
-    return dict(row._mapping)
+    return _submit(conn, "benefit.create", None, json.loads(_payload(rec)))
 
 
 # ─── PUT /benefits/{id} ────────────────────────────────────────────────────────
@@ -256,10 +226,7 @@ async def update_benefit(
     claims:      dict = Depends(current_claims),
     conn:        Session = Depends(tenant_conn),
 ) -> dict:
-    """
-    Update a benefit.
-    Changing is_guaranteed=true always routes through maker-checker.
-    """
+    """Update a benefit (four-eyes per the bank's Controls switch)."""
     _require_module(claims)
     institution_id = _institution_id(claims)
 
@@ -275,51 +242,12 @@ async def update_benefit(
 
     current = dict(existing._mapping)
     rec = _normalise(conn, body, current)
-    is_guaranteed = bool(body.get("is_guaranteed", existing.is_guaranteed))
-
-    if is_guaranteed:
-        # The full record goes to the checker: benefit.update writes every
-        # field, so a partial body would have blanked the rest. payload_before
-        # is serialised with default=str (uuid/date values made json.dumps
-        # raise before: every guaranteed edit returned 500).
-        payload = json.loads(_payload(rec))
-        payload["benefit_id"] = benefit_id
-        payload["payload_before"] = json.loads(json.dumps(current, default=str))
-        result = conn.execute(
-            text("""
-                SELECT institution.submit_for_approval(
-                    :cat, :rtype, :rid, CAST(:payload AS jsonb)
-                ) AS action_id
-            """),
-            {"cat": "benefit.update", "rtype": "benefit", "rid": benefit_id,
-             "payload": json.dumps(payload)},
-        ).fetchone()
-        conn.commit()
-        if result is None:
-            raise HTTPException(status_code=500, detail="submit_for_approval returned no action id.")
-        return {"pending": True, "action_id": str(result.action_id)}
-
-    row = conn.execute(
-        text("""
-            UPDATE institution.benefit
-               SET product_id = :product_id, cat_id = :cat_id, title = :title,
-                   description = :description, value_display = :value_display,
-                   value_amount = :value_amount, value_unit = :value_unit,
-                   conditions = :conditions, valid_from = :valid_from,
-                   valid_until = :valid_until,
-                   is_active = COALESCE(:is_active, is_active), updated_at = now()
-             WHERE id = :id
-            RETURNING *
-        """),
-        {k: rec.get(k) for k in ("product_id", "cat_id", "title", "description",
-                                  "value_display", "value_amount", "value_unit",
-                                  "conditions", "valid_from", "valid_until", "is_active")}
-        | {"id": benefit_id},
-    ).fetchone()
-    conn.commit()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Benefit not found or no changes applied.")
-    return dict(row._mapping)
+    # The full record goes to the checker: benefit.update writes every field,
+    # so a partial body would blank the rest.
+    payload = json.loads(_payload(rec))
+    payload["benefit_id"] = benefit_id
+    payload["payload_before"] = json.loads(json.dumps(current, default=str))
+    return _submit(conn, "benefit.update", benefit_id, payload)
 
 
 # ─── DELETE /benefits/{id} (soft-delete via is_active=false) ──────────────────
@@ -330,20 +258,14 @@ async def deactivate_benefit(
     claims:     dict = Depends(current_claims),
     conn:       Session = Depends(tenant_conn),
 ) -> dict:
-    """Deactivate a benefit (soft delete — preserves bid_benefit snapshots)."""
+    """Deactivate a benefit (soft delete, keeps bid_benefit snapshots), four-eyes
+    per the bank's Controls switch."""
     _require_module(claims)
     institution_id = _institution_id(claims)
-
-    row = conn.execute(
-        text("""
-            UPDATE institution.benefit
-            SET is_active = false, updated_at = now()
-            WHERE id = :id AND institution_id = :iid
-            RETURNING id, is_active
-        """),
+    owned = conn.execute(
+        text("SELECT 1 FROM institution.benefit WHERE id = :id AND institution_id = :iid"),
         {"id": benefit_id, "iid": institution_id},
     ).fetchone()
-    if row is None:
+    if owned is None:
         raise HTTPException(status_code=404, detail="Benefit not found.")
-    conn.commit()
-    return {"ok": True, "id": benefit_id}
+    return _submit(conn, "benefit.delete", benefit_id, {"benefit_id": benefit_id})

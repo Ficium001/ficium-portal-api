@@ -373,7 +373,8 @@ class TestMarketplaceEndpoints:
     def test_submit_bid_valid_payload_reaches_db(self, auth_client):
         """Valid payload + institution context.
         Mock DB returns None for request lookup → 404 (request not found).
-        Confirms endpoint performs a request existence guard before inserting.
+        Confirms the endpoint checks the request exists before queueing a bid
+        for approval (bids never insert directly; db/040).
         """
         r = auth_client.post(
             "/marketplace/bids",

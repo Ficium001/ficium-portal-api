@@ -29,7 +29,32 @@ jobs:
           python-version: "3.14"
 
       - name: Install deps
-        run: pip install -r requirements-dev.txt
+        # The annotate plugin surfaces each failing test on the PR / check run.
+        run: pip install -r requirements-dev.txt pytest-github-actions-annotate-failures==0.3.0
+
+      - name: Require DB secrets (never skip silently)
+        # Until 2026-10-19 neither secret existed, so every test in this job
+        # was skipped and the job still reported green: the daily security
+        # sweep had never run. Missing secrets are now a hard failure.
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
+        run: |
+          missing=""
+          [ -n "$PORTAL_DB_DSN" ] || missing="$missing PORTAL_DB_DSN"
+          [ -n "$APP_DB_DSN" ]    || missing="$missing APP_DB_DSN"
+          if [ -n "$missing" ]; then
+            echo "::error title=integration::Repository secret(s) not set:$missing. Settings > Secrets and variables > Actions. Session pooler DSN, port 5432."
+            exit 1
+          fi
+
+      - name: Migrations applied and unedited (db/ vs ops.schema_migration)
+        # Fails if a db/*.sql file was merged but never applied, or edited
+        # after it was applied. Closes the class behind the Aug 2026 incident
+        # (008/009/010 merged, never run). Read-only.
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+        run: python scripts/migrate.py --check
 
       - name: Run integration suite
         env:
