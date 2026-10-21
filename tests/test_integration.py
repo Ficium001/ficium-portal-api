@@ -43,8 +43,10 @@ import pytest
 PORTAL_DSN = os.environ.get("PORTAL_DB_DSN")
 APP_DSN    = os.environ.get("APP_DB_DSN")
 
-# Known seed identity in the portal DB (the live MCB admin). These are not
-# secrets — just row identifiers used to drive RLS as a real member.
+# Test tenant, SEEDED INSIDE EVERY rolled-back transaction (see rolled_back_tx).
+# Until 2026-10-21 these pointed at live rows that no longer existed, so every
+# test that needed a member failed the first time the suite actually ran.
+# The suite must never depend on live data; nothing here persists.
 MCB_INSTITUTION_ID  = "31b3ee32-2864-4875-8920-cc5f27240971"
 MCB_ADMIN_AUTH_UID  = "4224540d-d59c-4584-8271-cb6ef24c472d"
 MCB_ADMIN_MEMBER_ID = "ecf86654-4ef7-4fb5-aa8b-5545a4ff1d10"
@@ -56,13 +58,53 @@ requires_app    = pytest.mark.skipif(not APP_DSN,    reason="APP_DB_DSN not set"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _seed_tenant(cur) -> None:
+    """The test bank + its primary admin (institution_admin group), as the
+    connection role, before any test switches to `authenticated`."""
+    cur.execute("""
+        INSERT INTO institution.institution
+          (id, name, legal_name, institution_type, country, approved,
+           onboarding_stage, primary_contact_email)
+        VALUES (%s,'ZZ_SEED_BANK','ZZ Seed Bank','bank','MU',true,'approved','seed@zz.mu')
+        ON CONFLICT (id) DO NOTHING
+    """, (MCB_INSTITUTION_ID,))
+    cur.execute("""
+        INSERT INTO institution.member
+          (id, institution_id, auth_user_id, email, full_name, role,
+           is_primary_admin, active, group_id)
+        VALUES (%s,%s,%s,'seed@zz.mu','Seed Admin','admin',true,true,
+                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin'))
+        ON CONFLICT (id) DO NOTHING
+    """, (MCB_ADMIN_MEMBER_ID, MCB_INSTITUTION_ID, MCB_ADMIN_AUTH_UID))
+
+
+def add_member(cur, *, admin: bool, modules_group: str | None = None) -> tuple[str, str]:
+    """Add a member to the seed bank (as the connection role). admin=True puts
+    them in institution_admin; otherwise a plain maker with no modules unless a
+    portal_admin group slug is given. Returns (member_id, auth_uid)."""
+    cur.execute("RESET ROLE")
+    member_id, auth_uid = str(uuid.uuid4()), str(uuid.uuid4())
+    slug = "institution_admin" if admin else modules_group
+    cur.execute("""
+        INSERT INTO institution.member
+          (id, institution_id, auth_user_id, email, full_name, role,
+           is_primary_admin, active, group_id)
+        VALUES (%s,%s,%s,%s,'ZZ','member',false,true,
+                (SELECT id FROM portal_admin.user_groups WHERE slug = %s))
+    """, (member_id, MCB_INSTITUTION_ID, auth_uid, f"zz-{member_id[:8]}@zz.mu", slug))
+    return member_id, auth_uid
+
+
 @contextmanager
 def rolled_back_tx(dsn: str):
-    """Yield a cursor in a transaction that is always rolled back."""
+    """Yield a cursor in a transaction that is always rolled back. On the
+    Portal DB the test tenant is seeded first."""
     conn = psycopg2.connect(dsn)
     try:
         conn.autocommit = False
         cur = conn.cursor()
+        if dsn == PORTAL_DSN:
+            _seed_tenant(cur)
         yield cur
     finally:
         conn.rollback()
@@ -189,19 +231,34 @@ class TestPortalTenantIsolation:
 @requires_portal
 class TestPortalBidding:
 
-    def test_institution_can_submit_own_bid(self):
+    def test_bank_user_cannot_insert_a_bid_directly(self):
+        """Bids are platform-locked to four-eyes (db/040): a bank user may not
+        write marketplace.bid at all, only submit bid.submit for approval."""
         with rolled_back_tx(PORTAL_DSN) as cur:
             req, _ = _seed_catalog_and_request(cur)
             become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
                                  institution_id=MCB_INSTITUTION_ID)
-            cur.execute("""
-                INSERT INTO marketplace.bid
-                  (request_id, institution_id, rate, rate_type, amount_offered,
-                   term_months, submitted_via, idempotency_key)
-                VALUES (%s,%s,7.5,'fixed',500000,36,'portal',%s)
-                RETURNING status
-            """, (req, MCB_INSTITUTION_ID, "zzbid-" + req))
-            assert cur.fetchone()[0] == "submitted"
+            with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute("""
+                    INSERT INTO marketplace.bid
+                      (request_id, institution_id, rate, rate_type, amount_offered,
+                       term_months, submitted_via, idempotency_key)
+                    VALUES (%s,%s,7.5,'fixed',500000,36,'portal',%s)
+                """, (req, MCB_INSTITUTION_ID, "zzbid-" + req))
+
+    def test_bid_submission_queues_for_a_second_person(self):
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            req, _ = _seed_catalog_and_request(cur)
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            action_id = scalar(cur, """
+                SELECT institution.submit_for_approval('bid.submit', 'request', %s, %s::jsonb)
+            """, (req, json.dumps({"request_id": req, "rate": 7.5, "rate_type": "fixed",
+                                   "amount_offered": 500000, "term_months": 36})))
+            assert scalar(cur, "SELECT status FROM governance.action WHERE id = %s",
+                          (action_id,)) == "pending"
+            assert scalar(cur, "SELECT count(*) FROM marketplace.bid WHERE request_id = %s",
+                          (req,)) == 0
 
     def test_cross_tenant_bid_blocked(self):
         """An institution must not be able to bid as a different institution."""
@@ -710,3 +767,103 @@ class TestAppConsumerIsolation:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ===========================================================================
+# PORTAL DB — four-eyes switch (db/040-044), incl. the non-admin paths
+# ===========================================================================
+def expect_refused(cur, sql: str, params: tuple, contains: str) -> None:
+    """Run a statement that MUST fail, inside a savepoint so the test's
+    transaction survives, and check the refusal reason."""
+    cur.execute("SAVEPOINT expect_refused")
+    try:
+        cur.execute(sql, params)
+    except psycopg2.Error as e:
+        cur.execute("ROLLBACK TO SAVEPOINT expect_refused")
+        assert contains.lower() in str(e).lower(), f"refused for the wrong reason: {e}"
+        return
+    cur.execute("ROLLBACK TO SAVEPOINT expect_refused")
+    raise AssertionError(f"expected refusal containing {contains!r}, but it succeeded")
+
+
+def _switch_off(cur, category: str, checker_uid: str) -> None:
+    """Seed admin requests switch-off; a second admin approves."""
+    become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID, institution_id=MCB_INSTITUTION_ID)
+    action_id = scalar(cur, """
+        SELECT institution.submit_for_approval('four_eyes.disable', 'four_eyes_policy',
+                                               NULL, %s::jsonb)
+    """, (json.dumps({"category": category}),))
+    become_authenticated(cur, sub=checker_uid, institution_id=MCB_INSTITUTION_ID)
+    cur.execute("SELECT institution.approve_action(%s, 'ok')", (action_id,))
+
+
+@requires_portal
+class TestFourEyesControls:
+
+    def test_locked_control_cannot_be_switched_off(self):
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID, institution_id=MCB_INSTITUTION_ID)
+            expect_refused(cur, """
+                SELECT institution.submit_for_approval('four_eyes.disable', 'four_eyes_policy',
+                                                       NULL, '{"category":"user.create"}'::jsonb)
+            """, (), "locked")
+
+    def test_non_admin_cannot_request_a_switch_off(self):
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            _, maker_uid = add_member(cur, admin=False)
+            become_authenticated(cur, sub=maker_uid, institution_id=MCB_INSTITUTION_ID)
+            expect_refused(cur, """
+                SELECT institution.submit_for_approval('four_eyes.disable', 'four_eyes_policy',
+                                                       NULL, '{"category":"benefit.create"}'::jsonb)
+            """, (), "only institution admins")
+
+    def test_non_admin_cannot_approve_a_switch_off(self):
+        """db/044: weakening a control needs an ADMIN checker, not any member."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            _, maker_uid = add_member(cur, admin=False)
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID, institution_id=MCB_INSTITUTION_ID)
+            action_id = scalar(cur, """
+                SELECT institution.submit_for_approval('four_eyes.disable', 'four_eyes_policy',
+                                                       NULL, '{"category":"benefit.create"}'::jsonb)
+            """)
+            become_authenticated(cur, sub=maker_uid, institution_id=MCB_INSTITUTION_ID)
+            expect_refused(cur, "SELECT institution.approve_action(%s, 'ok')",
+                           (action_id,), "only an institution admin")
+
+    def test_switched_off_action_runs_once_and_is_recorded_single(self):
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            _, checker_uid = add_member(cur, admin=True)
+            _switch_off(cur, "benefit.create", checker_uid)
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID, institution_id=MCB_INSTITUTION_ID)
+            action_id = scalar(cur, """
+                SELECT institution.submit_for_approval('benefit.create', 'benefit', NULL,
+                  jsonb_build_object('cat_id', (SELECT id FROM institution.benefit_cat
+                                                 WHERE code = 'reward' LIMIT 1),
+                                     'title', 'ZZ single', 'value_amount', 1, 'value_unit', 'mur'))
+            """)
+            cur.execute("SELECT status, control FROM governance.action WHERE id = %s", (action_id,))
+            assert cur.fetchone() == ("approved", "single")
+
+    def test_single_control_still_requires_the_screens_module(self):
+        """db/040: with four-eyes off, a maker WITHOUT the module is refused."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            _, checker_uid = add_member(cur, admin=True)
+            _, maker_uid = add_member(cur, admin=False)
+            _switch_off(cur, "benefit.create", checker_uid)
+            become_authenticated(cur, sub=maker_uid, institution_id=MCB_INSTITUTION_ID)
+            expect_refused(cur, """
+                SELECT institution.submit_for_approval('benefit.create', 'benefit', NULL,
+                  jsonb_build_object('cat_id', (SELECT id FROM institution.benefit_cat
+                                                 WHERE code = 'reward' LIMIT 1),
+                                     'title', 'ZZ refused', 'value_amount', 1, 'value_unit', 'mur'))
+            """, (), "you do not have access")
+
+    def test_bank_user_cannot_forge_an_approval(self):
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID, institution_id=MCB_INSTITUTION_ID)
+            action_id = scalar(cur, """
+                SELECT institution.submit_for_approval('benefit.delete', 'benefit', NULL,
+                                                       '{"benefit_id":"00000000-0000-0000-0000-000000000000"}'::jsonb)
+            """)
+            expect_refused(cur, "UPDATE governance.action SET status = 'approved' WHERE id = %s",
+                           (action_id,), "permission denied")
