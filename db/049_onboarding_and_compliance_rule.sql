@@ -7,13 +7,11 @@
 --     needed BOTH the BoM approval (banks) and the FSC licence (non-banks):
 --     nobody could ever become compliant. applies_to also used a different
 --     vocabulary (bank/mfi) from institution_type (commercial_bank/micro_credit).
---   * 5 onboarding files sit in storage with no institution.doc rows, so
---     compliance review never saw them (left in place; see README).
 -- This migration: the missing table; ONE rule for which documents an
 -- institution needs (institution.required_doc_types), used by the compliance
 -- view and the onboarding endpoint; applies_to in the institution_type
--- vocabulary. The regulator mapping below needs KJ's confirmation.
--- Bid enforcement of can_bid is deliberately NOT here (separate decision).
+-- vocabulary. Regulator mapping confirmed by KJ (2026-10-21).
+-- Bid enforcement of can_bid: db/050.
 
 begin;
 
@@ -31,7 +29,7 @@ create table if not exists institution.onboarding_pref (
 alter table institution.onboarding_pref enable row level security;
 revoke all on institution.onboarding_pref from public, anon, authenticated;
 
--- applies_to in the institution_type vocabulary. Mapping to CONFIRM:
+-- applies_to in the institution_type vocabulary (confirmed by KJ, 2026-10-21):
 --   BoM approval -> commercial banks; FSC licence -> non-bank financial
 --   institutions (micro-credit, leasing, insurance, fintech). Cooperatives:
 --   neither (Registrar of Cooperatives) until told otherwise.
