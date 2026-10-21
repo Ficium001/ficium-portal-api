@@ -510,9 +510,11 @@ class TestBenefitsModule:
                 (benefit_id,))
             assert n == 1
 
-            # As different institution — must NOT see it (RLS)
+            # As different institution — must NOT see it (RLS). The other bank
+            # is created by the SETUP role: bank users cannot create banks (038).
             other_uid = str(uuid.uuid4())
             other_iid = str(uuid.uuid4())
+            cur.execute("RESET ROLE")
             cur.execute("""
                 INSERT INTO institution.institution
                   (id, name, legal_name, institution_type, country, approved,
