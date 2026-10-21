@@ -43,6 +43,7 @@ from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
 from .api.portal_badges import router as portal_badges_router
 from .api.product_limits import router as product_limits_router
+from .api.registration import router as registration_router
 from .api.request_chat import router as request_chat_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
@@ -188,3 +189,4 @@ app.include_router(integration_router)     # contract v1 inbound events (signed,
 app.include_router(acceptance_router)      # contract v1 acceptance call (own key, OFF by default)
 app.include_router(deal_document_uploads_router)  # contract 1.5 borrower uploads (OFF by default)
 app.include_router(controls_router)        # four-eyes switches (Setup > Controls)
+app.include_router(registration_router)    # self-registration, one identity system
