@@ -348,9 +348,23 @@ class TestPortalBidding:
 
             cur.execute("SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
                         (req, bid_id, consumer_id, phase2))
-            with pytest.raises(psycopg2.Error):
-                cur.execute("SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
-                            (req, bid_id, consumer_id, phase2))
+            # Same bid again: a retried contract call, harmless (db/046).
+            again = scalar(cur, "SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
+                           (req, bid_id, consumer_id, phase2))
+            assert again["repeat"] is True
+            # A DIFFERENT bid after acceptance must be refused: before 046 it
+            # flipped the winner while the borrower's PII stayed with bank A.
+            cur.execute("""
+                INSERT INTO marketplace.bid
+                  (request_id, institution_id, rate, rate_type, amount_offered,
+                   term_months, submitted_via, idempotency_key)
+                VALUES (%s,%s,6.5,'fixed',500000,36,'portal',%s) RETURNING id
+            """, (req, MCB_INSTITUTION_ID, "zzdup2-" + req))
+            other_bid = str(cur.fetchone()[0])
+            expect_refused(cur, "SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
+                           (req, other_bid, consumer_id, phase2), "already accepted")
+            assert str(scalar(cur, "SELECT winning_bid_id FROM marketplace.request WHERE id = %s",
+                              (req,))) == bid_id
 
 
 # ===========================================================================
@@ -419,23 +433,19 @@ class TestPortalMakerChecker:
                   'group.create','group', gen_random_uuid(), %s::jsonb)
             """, (json.dumps({"slug": slug, "label": "ZZ",
                               "module_permissions": []}),))
-            # Force expires_at into the past
+            # Force expires_at into the past. As the SETUP role: bank users may
+            # not edit approval records at all (db/040), which is the point.
+            cur.execute("RESET ROLE")
             cur.execute(
                 "UPDATE governance.action SET expires_at = now() - interval '1 hour' WHERE id = %s",
                 (action_id,),
             )
-            # Approve as a different user — should fail
-            maker_uid = str(uuid.uuid4())
-            cur.execute("""
-                INSERT INTO institution.member
-                  (id, institution_id, auth_user_id, email, full_name, role,
-                   is_primary_admin, active)
-                VALUES (%s,%s,%s,'exp@z.mu','EX','member',false,true)
-            """, (str(uuid.uuid4()), MCB_INSTITUTION_ID, maker_uid))
-            become_authenticated(cur, sub=maker_uid,
+            # Approve as a different admin, who would otherwise be allowed
+            _, checker_uid = add_member(cur, admin=True)
+            become_authenticated(cur, sub=checker_uid,
                                  institution_id=MCB_INSTITUTION_ID)
-            with pytest.raises(psycopg2.Error):
-                cur.execute("SELECT institution.approve_action(%s, 'late')", (action_id,))
+            expect_refused(cur, "SELECT institution.approve_action(%s, 'late')",
+                           (action_id,), "expired")
 
 
 # ===========================================================================
