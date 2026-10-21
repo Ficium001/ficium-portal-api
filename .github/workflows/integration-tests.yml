@@ -29,7 +29,8 @@ jobs:
           python-version: "3.14"
 
       - name: Install deps
-        run: pip install -r requirements-dev.txt
+        # The annotate plugin surfaces each failing test on the PR / check run.
+        run: pip install -r requirements-dev.txt pytest-github-actions-annotate-failures==0.3.0
 
       - name: Require DB secrets (never skip silently)
         # Until 2026-10-19 neither secret existed, so every test in this job
