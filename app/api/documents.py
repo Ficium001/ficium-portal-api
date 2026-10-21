@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from ..core.db import service_session
 from ..core.roles import INSTITUTION_ADMIN_ROLES
-from ..core.storage import storage_signed_upload_url
+from ..core.storage import storage_signed_upload_url, storage_signed_url
 from ..deps import current_claims, tenant_conn
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -267,3 +267,26 @@ async def get_upload_url(
     object_name = f"{institution_id}/{body.get('doc_type_id', 'misc')}/{_uuid.uuid4()}.{ext}"
 
     return await storage_signed_upload_url(object_name)
+
+
+# ─── GET /documents/{doc_id}/download ──────────────────────────────────────────
+
+@router.get("/{doc_id}/download")
+async def download_document(
+    doc_id: str = Path(..., pattern=r"^[0-9a-fA-F-]{36}$"),
+    claims: dict = Depends(current_claims),
+    conn:   Session = Depends(tenant_conn),
+) -> dict:
+    """
+    A 5-minute signed link to one of the caller's own documents. The bucket is
+    private; screens used to link to its public URL, which never worked.
+    Tenant session: RLS decides visibility, so another bank's id is a 404.
+    """
+    _require_module(claims)
+    row = conn.execute(
+        text("SELECT storage_path, file_name FROM institution.doc WHERE id = :id"),
+        {"id": doc_id},
+    ).fetchone()
+    if row is None or not row.storage_path:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {"url": await storage_signed_url(row.storage_path, 300), "file_name": row.file_name}
