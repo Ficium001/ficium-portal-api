@@ -12,6 +12,8 @@
 #   * institution.institution   unapproved, 'registered', marketplace only
 #   * auth_portal.auth_users    the ficium-auth login (Argon2id)
 #   * institution.member        primary admin, institution_admin group
+# The username is the email: ficium-auth logs in by username, and registration
+# never set one before, so a self-registered bank could never sign in.
 # No Supabase Auth user is created; ids come from ficium-auth (db/047 moved the
 # last references to auth.users). Ficium staff approve the institution before
 # it can do anything (onboarding stages, compliance review).
@@ -52,7 +54,8 @@ def password_problem(pw: str) -> str | None:
 class RegisterBody(BaseModel):
     institution_name: str = Field(min_length=2, max_length=200)
     institution_type: str = Field(default="commercial_bank")
-    country:          str = Field(default="MU", min_length=2, max_length=2)
+    # ISO 3166 alpha-2 or alpha-3; the portal form sends alpha-3 (e.g. MUS).
+    country:          str = Field(default="MUS", min_length=2, max_length=3, pattern=r"^[A-Za-z]+$")
     reg_number:       str | None = Field(default=None, max_length=100)
     regulator:        str | None = Field(default=None, max_length=100)
     website:          str | None = Field(default=None, max_length=300)
@@ -98,7 +101,8 @@ async def register(request: Request, response: Response, body: RegisterBody) -> 
     with service_session() as conn:
         taken = conn.execute(
             text("""
-                SELECT 1 FROM auth_portal.auth_users WHERE lower(email) = :e
+                SELECT 1 FROM auth_portal.auth_users
+                 WHERE lower(email) = :e OR lower(username) = :e
                 UNION ALL
                 SELECT 1 FROM institution.member WHERE lower(email) = :e
                 LIMIT 1
@@ -133,9 +137,9 @@ async def register(request: Request, response: Response, body: RegisterBody) -> 
         conn.execute(
             text("""
                 INSERT INTO auth_portal.auth_users
-                    (id, email, role, institution_id, password_hash, is_active,
+                    (id, email, username, role, institution_id, password_hash, is_active,
                      created_at, updated_at)
-                VALUES (:id, :email, 'institution_admin', :iid, :pw, true, now(), now())
+                VALUES (:id, :email, :email, 'institution_admin', :iid, :pw, true, now(), now())
             """),
             {"id": login_id, "email": email, "iid": inst.id, "pw": pw_hash},
         )

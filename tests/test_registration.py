@@ -31,7 +31,7 @@ class Svc:
         q = " ".join(str(stmt).split())
         self.sql.append((q, params or {}))
         row = None
-        if "FROM auth_portal.auth_users WHERE lower(email)" in q:
+        if "lower(email) = :e" in q:
             row = (1,) if self.taken else None
         elif q.startswith("INSERT INTO institution.institution"):
             row = SimpleNamespace(id=uuid.uuid4())
@@ -70,6 +70,8 @@ def test_registers_institution_login_and_admin_in_one_session() -> None:
     login = next(p for q, p in svc.sql if q.startswith("INSERT INTO auth_portal.auth_users"))
     member = next(p for q, p in svc.sql if q.startswith("INSERT INTO institution.member"))
     assert login["id"] == member["uid"]                           # one identity
+    login_q = next(q for q, _ in svc.sql if q.startswith("INSERT INTO auth_portal.auth_users"))
+    assert ":email, :email" in login_q                            # username = email
     assert login["pw"].startswith("$argon2id$") and "Str0ng" not in login["pw"]
     assert not any("auth.users" in q.replace("auth_portal.auth_users", "") for q, _ in svc.sql)
 
@@ -82,7 +84,7 @@ def test_weak_passwords_rejected_before_any_write(pw: str) -> None:
 
 
 @pytest.mark.parametrize("field,value", [("institution_type", "bank"), ("email", "not-an-email"),
-                                         ("country", "MUS")])
+                                         ("country", "MAURITIUS")])
 def test_invalid_fields_rejected(field: str, value: str) -> None:
     svc = Svc()
     assert _post(svc, {**GOOD, field: value}).status_code == 422
