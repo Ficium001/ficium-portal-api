@@ -43,6 +43,8 @@ CATEGORY_MODULE: dict[str, str] = {
     "sla":      "inst:settings",
     "webhook":  "inst:webhooks",
     "document": "inst:documents",
+    # Switching four-eyes off: only admins see and approve it (db/044).
+    "four_eyes": "inst:settings",
 }
 
 
@@ -252,7 +254,17 @@ async def submit_for_approval(
             status_code=500,
             detail="submit_for_approval returned no action id.",
         )
-    return {"action_id": str(result.action_id)}
+    # Four-eyes may be switched off for this action (Setup > Controls). Then
+    # governance.submit has already executed it, as single control, audited.
+    state = conn.execute(
+        text("SELECT status, control FROM governance.action WHERE id = :aid"),
+        {"aid": result.action_id},
+    ).fetchone()
+    executed = state is not None and state.control == "single" and state.status == "approved"
+    return {
+        "action_id": str(result.action_id),
+        "status": "executed" if executed else "pending_approval",
+    }
 
 
 @router.post("/{action_id}/approve")
@@ -302,50 +314,22 @@ async def execute_user_update(
     conn: Session = Depends(tenant_conn),
 ) -> dict:
     """
-    Execute a user.update action after checker approval.
-    Applies field changes (full_name, email, member_role) to the member.
+    Kept for older portal builds. Since migration 040 the database applies a
+    user.update atomically when the checker approves (governance.execute), so
+    this only reports the result. It used to apply the change itself in a
+    second, browser-driven call, which could be skipped or replayed.
     """
     row = conn.execute(
-        text("SELECT id, category, status, payload FROM governance.action WHERE id = :aid"),
+        text("SELECT category, status, execution_status FROM governance.action WHERE id = :aid"),
         {"aid": action_id},
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Action not found.")
     if row.category != "user.update":
         raise HTTPException(status_code=400, detail="Not a user.update action.")
-    if row.status != "approved":
-        raise HTTPException(status_code=400, detail=f"Action not approved (status: {row.status}).")
-
-    payload     = row.payload
-    member_id   = payload.get("member_id")
-    field       = payload.get("field")
-    value       = payload.get("value")
-
-    if not member_id or not field or value is None:
-        raise HTTPException(status_code=400, detail="Invalid payload — missing member_id, field or value.")
-
-    allowed_fields = {"full_name", "email", "member_role"}
-    if field not in allowed_fields:
-        raise HTTPException(status_code=400, detail=f"Invalid field '{field}'.")
-
-    # Apply to institution.member. For field == "email" the login row (auth_portal.auth_users)
-    # follows in the same transaction via the trigger institution.sync_member_login_state;
-    # tenant sessions cannot touch auth_portal themselves (RLS, no policies).
-    try:
-        conn.execute(
-            text(f"UPDATE institution.member SET {field} = :value, updated_at = now() WHERE id = :mid"),
-            {"value": value, "mid": member_id},
-        )
-    except IntegrityError:
-        conn.rollback()
-        raise HTTPException(status_code=409, detail="That email is already used by another login.") from None
-
-    conn.execute(
-        text("UPDATE governance.action SET execution_status = 'executed', executed_at = now() WHERE id = :aid"),
-        {"aid": action_id},
-    )
-    conn.commit()
-    return {"ok": True, "field": field, "value": value}
+    if row.status != "approved" or row.execution_status != "executed":
+        raise HTTPException(status_code=409, detail="Not executed: the action is not approved.")
+    return {"ok": True}
 
 
 @router.post("/{action_id}/provision-user")
@@ -423,8 +407,13 @@ async def provision_user_from_action(
     member_params = {"iid": institution_id, "email": email, "full_name": full_name,
                      "cgid": custom_group_id, "mrole": member_role}
 
+    me = _my_member_id(conn)
     try:
         with service_session() as svc:
+            # Only the approving checker, once, in the same transaction as the
+            # login it creates (db/043). Before: anyone, including the maker,
+            # could call this first and receive the new user's password.
+            _claim_credential(svc, action_id, "user.create", me)
             # Idempotency: an existing login for this email is reused ONLY inside this institution.
             existing = svc.execute(
                 text("SELECT id, institution_id FROM auth_portal.auth_users WHERE email = :email LIMIT 1"),
@@ -473,4 +462,103 @@ async def provision_user_from_action(
         "full_name": full_name,
         "temp_password": temp_password,
         "message": "User provisioned. Share the temporary password with the user — they must change it on first login.",
+    }
+
+
+# ─── Credential release: once, only to the approving checker (db/043) ─────────
+
+_CLAIM_CREDENTIAL = text("""
+    UPDATE governance.action
+       SET credential_released_at = now(),
+           execution_status = 'executed', executed_at = now(), updated_at = now()
+     WHERE id = :aid
+       AND category = :cat
+       AND status = 'approved'
+       AND checker_id = :me
+       AND credential_released_at IS NULL
+    RETURNING payload, institution_id
+""")
+
+
+def _my_member_id(conn: Session) -> str:
+    row = conn.execute(text("SELECT (institution.current_member_ctx()).member_id AS id")).fetchone()
+    if row is None or row.id is None:
+        raise HTTPException(status_code=403, detail="Not an active member of this institution.")
+    return str(row.id)
+
+
+def _claim_credential(svc: Session, action_id: str, category: str, me: str):
+    """Claim the right to see a temporary password. Same transaction as the
+    password write (service_session commits both or neither)."""
+    claimed = svc.execute(_CLAIM_CREDENTIAL,
+                          {"aid": action_id, "cat": category, "me": me}).fetchone()
+    if claimed is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Only the person who approved this can see the password, and only once.",
+        )
+    return claimed
+
+
+def _temp_password() -> str:
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits + "!@#$%"
+    return "".join(secrets.choice(alphabet) for _ in range(16))
+
+
+@router.post("/{action_id}/release-password")
+async def release_reset_password(
+    action_id: str,
+    claims: dict = Depends(get_claims),
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    After a user.reset_password action is approved, the CHECKER who approved
+    it calls this once: a temporary password is set (user must change it at
+    next login) and returned exactly once. Nobody else, and never twice.
+    """
+    from argon2 import PasswordHasher
+
+    me = _my_member_id(conn)
+    temp = _temp_password()
+    with service_session() as svc:
+        claimed = _claim_credential(svc, action_id, "user.reset_password", me)
+        member = svc.execute(
+            text("""
+                SELECT m.auth_user_id, m.email, m.full_name
+                  FROM institution.member m
+                 WHERE m.id = CAST(:mid AS uuid) AND m.institution_id = :iid
+                   AND m.auth_user_id IS NOT NULL AND NOT m.is_primary_admin
+            """),
+            {"mid": (claimed.payload or {}).get("member_id"), "iid": claimed.institution_id},
+        ).fetchone()
+        if member is None:
+            raise HTTPException(status_code=404, detail="That user can no longer be reset.")
+        updated = svc.execute(
+            text("""
+                UPDATE auth_portal.auth_users
+                   SET password_hash = :pw, must_change_password = true, updated_at = now()
+                 WHERE id = :uid
+                RETURNING id
+            """),
+            {"pw": PasswordHasher().hash(temp), "uid": str(member.auth_user_id)},
+        ).fetchone()
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Login record not found.")
+        svc.execute(
+            text("""
+                INSERT INTO audit.event (actor_id, actor_type, institution_id, action,
+                                         resource_type, outcome, governance_action_id)
+                VALUES (CAST(:actor AS uuid), 'member', :iid, 'user.reset_password.released',
+                        'member', 'success', CAST(:aid AS uuid))
+            """),
+            {"actor": claims.get("sub"), "iid": claimed.institution_id, "aid": action_id},
+        )
+    return {
+        "ok": True,
+        "email": member.email,
+        "full_name": member.full_name,
+        "temp_password": temp,
+        "message": "Shown once. The user must change it at their next login.",
     }
