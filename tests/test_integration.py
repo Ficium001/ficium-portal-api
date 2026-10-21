@@ -345,13 +345,21 @@ class TestPortalBidding:
             """, (req, MCB_INSTITUTION_ID, "zzdup-" + req))
             bid_id = str(cur.fetchone()[0])
             phase2 = json.dumps({"full_name": "Test", "email": "t@t.mu"})
-            # A competing live bid, placed while the request is still open.
+            # A competing live bid from a SECOND bank (one bid per bank per
+            # request), placed while the request is still open.
+            bank_b = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.institution
+                  (id, name, legal_name, institution_type, country, approved,
+                   onboarding_stage, primary_contact_email)
+                VALUES (%s,'ZZ_BANK_B','ZZ Bank B','bank','MU',true,'approved','b@zz.mu')
+            """, (bank_b,))
             cur.execute("""
                 INSERT INTO marketplace.bid
                   (request_id, institution_id, rate, rate_type, amount_offered,
                    term_months, submitted_via, idempotency_key)
                 VALUES (%s,%s,6.5,'fixed',500000,36,'portal',%s) RETURNING id
-            """, (req, MCB_INSTITUTION_ID, "zzdup2-" + req))
+            """, (req, bank_b, "zzdup2-" + req))
             other_bid = str(cur.fetchone()[0])
 
             cur.execute("SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
@@ -450,131 +458,14 @@ class TestPortalMakerChecker:
 
 
 # ===========================================================================
-# PORTAL DB — pipeline stage flow
+# PORTAL DB — deal pipeline
 # ===========================================================================
-@requires_portal
-class TestPipelineFlow:
-
-    def _seed_pipeline(self, cur) -> tuple[str, str, str]:
-        """
-        Seed: accepted bid → loan_pipeline + first stage active.
-        Returns (pipeline_id, first_stage_id, institution_id).
-        """
-        req, prod = _seed_catalog_and_request(cur)
-        bid_id     = str(uuid.uuid4())
-        pipeline   = str(uuid.uuid4())
-        stage_def  = str(uuid.uuid4())
-        stage_inst = str(uuid.uuid4())
-
-        # Insert bid
-        cur.execute("""
-            INSERT INTO marketplace.bid
-              (id, request_id, institution_id, rate, rate_type, amount_offered,
-               term_months, submitted_via, status, idempotency_key)
-            VALUES (%s,%s,%s,7.5,'fixed',500000,36,'portal','accepted',%s)
-        """, (bid_id, req, MCB_INSTITUTION_ID, "zz-bid-" + bid_id))
-
-        # Stage definition
-        cur.execute("""
-            INSERT INTO institution.pipeline_stage_def
-              (id, institution_id, code, label, position, requires_maker_checker,
-               requires_documents, sla_hours, active)
-            VALUES (%s,%s,'CREDIT_CHECK','Credit Check',1,false,false,24,true)
-        """, (stage_def, MCB_INSTITUTION_ID))
-
-        # Pipeline
-        cur.execute("""
-            INSERT INTO marketplace.loan_pipeline
-              (id, institution_id, bid_id, request_id, status,
-               deal_amount, deal_rate, deal_term_months, current_stage_id)
-            VALUES (%s,%s,%s,%s,'active',500000,7.5,36,%s)
-        """, (pipeline, MCB_INSTITUTION_ID, bid_id, req, stage_inst))
-
-        # Stage instance (active)
-        cur.execute("""
-            INSERT INTO marketplace.pipeline_stage_instance
-              (id, pipeline_id, stage_def_id, position, label,
-               status, started_at)
-            VALUES (%s,%s,%s,1,'Credit Check','active',now())
-        """, (stage_inst, pipeline, stage_def))
-
-        return pipeline, stage_inst, MCB_INSTITUTION_ID
-
-    def test_pipeline_stage_advance_completes_and_closes(self):
-        """Advancing the only stage should close the pipeline."""
-        with rolled_back_tx(PORTAL_DSN) as cur:
-            pipeline, stage_inst, _ = self._seed_pipeline(cur)
-
-            # Mark stage completed directly (mimics _complete_stage)
-            cur.execute("""
-                UPDATE marketplace.pipeline_stage_instance
-                SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE id = %s
-            """, (stage_inst,))
-
-            # No next pending stage → pipeline should close
-            cur.execute("""
-                UPDATE marketplace.loan_pipeline
-                SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE id = %s
-            """, (pipeline,))
-
-            status = scalar(cur,
-                "SELECT status FROM marketplace.loan_pipeline WHERE id = %s",
-                (pipeline,))
-            assert status == "completed"
-
-    def test_pipeline_maker_checker_submit_then_approve(self):
-        """Stage with dual-control: submit → awaiting_approval → approve → completed."""
-        with rolled_back_tx(PORTAL_DSN) as cur:
-            req, prod = _seed_catalog_and_request(cur)
-            bid_id    = str(uuid.uuid4())
-            pipeline  = str(uuid.uuid4())
-            stage_def = str(uuid.uuid4())
-            stage_inst= str(uuid.uuid4())
-
-            cur.execute("""
-                INSERT INTO marketplace.bid
-                  (id, request_id, institution_id, rate, rate_type, amount_offered,
-                   term_months, submitted_via, status, idempotency_key)
-                VALUES (%s,%s,%s,7.5,'fixed',500000,36,'portal','accepted',%s)
-            """, (bid_id, req, MCB_INSTITUTION_ID, "zz-dc-" + bid_id))
-
-            cur.execute("""
-                INSERT INTO institution.pipeline_stage_def
-                  (id, institution_id, code, label, position, requires_maker_checker,
-                   requires_documents, sla_hours, active)
-                VALUES (%s,%s,'LEGAL_REVIEW','Legal Review',1,true,false,48,true)
-            """, (stage_def, MCB_INSTITUTION_ID))
-
-            cur.execute("""
-                INSERT INTO marketplace.loan_pipeline
-                  (id, institution_id, bid_id, request_id, status,
-                   deal_amount, deal_rate, deal_term_months, current_stage_id)
-                VALUES (%s,%s,%s,%s,'active',500000,7.5,36,%s)
-            """, (pipeline, MCB_INSTITUTION_ID, bid_id, req, stage_inst))
-
-            maker_uid = str(uuid.uuid4())
-            cur.execute("""
-                INSERT INTO institution.pipeline_stage_instance
-                  (id, pipeline_id, stage_def_id, position, label, status,
-                   started_at, submitted_by)
-                VALUES (%s,%s,%s,1,'Legal Review','awaiting_approval',now(),%s)
-            """, (stage_inst, pipeline, stage_def, maker_uid))
-
-            # Checker (different member) approves
-            checker_uid = str(uuid.uuid4())
-            cur.execute("""
-                UPDATE marketplace.pipeline_stage_instance
-                SET status = 'completed', approved_by = %s, approved_at = now(),
-                    completed_at = now(), updated_at = now()
-                WHERE id = %s AND submitted_by != %s
-            """, (checker_uid, stage_inst, checker_uid))
-
-            status = scalar(cur,
-                "SELECT status FROM marketplace.pipeline_stage_instance WHERE id = %s",
-                (stage_inst,))
-            assert status == "completed"
+# TestPipelineFlow was removed on 2026-10-21. Its two tests ran plain UPDATEs
+# as the superuser and asserted the UPDATE happened: they never called the
+# pipeline code, so they would pass even if deal-stage four-eyes were broken.
+# Real gap (not hidden by a fake test): deal-stage maker-checker is enforced
+# only in app/api/pipeline.py, not in the database, and has no live test. It
+# moves under governance.submit / Setup > Controls with the remaining modules.
 
 
 # ===========================================================================
@@ -586,13 +477,9 @@ class TestBenefitsModule:
     def test_benefit_crud_scoped_to_institution(self):
         """Benefits are always institution-scoped; another institution cannot see them."""
         with rolled_back_tx(PORTAL_DSN) as cur:
-            # Seed a benefit category
-            cat_id = str(uuid.uuid4())
-            cur.execute("""
-                INSERT INTO institution.benefit_category
-                  (id, code, label, sort_order)
-                VALUES (%s, 'ZZ_CAT', 'ZZ Category', 999)
-            """, (cat_id,))
+            # An existing benefit category (institution.benefit_cat)
+            cat_id = scalar(cur, "SELECT id FROM institution.benefit_cat WHERE code = 'reward'")
+            assert cat_id is not None, "benefit_cat 'reward' missing"
 
             # Seed a catalog product for FK
             fam_id  = str(uuid.uuid4())
