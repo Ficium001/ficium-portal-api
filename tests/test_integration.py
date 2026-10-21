@@ -345,6 +345,14 @@ class TestPortalBidding:
             """, (req, MCB_INSTITUTION_ID, "zzdup-" + req))
             bid_id = str(cur.fetchone()[0])
             phase2 = json.dumps({"full_name": "Test", "email": "t@t.mu"})
+            # A competing live bid, placed while the request is still open.
+            cur.execute("""
+                INSERT INTO marketplace.bid
+                  (request_id, institution_id, rate, rate_type, amount_offered,
+                   term_months, submitted_via, idempotency_key)
+                VALUES (%s,%s,6.5,'fixed',500000,36,'portal',%s) RETURNING id
+            """, (req, MCB_INSTITUTION_ID, "zzdup2-" + req))
+            other_bid = str(cur.fetchone()[0])
 
             cur.execute("SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
                         (req, bid_id, consumer_id, phase2))
@@ -354,13 +362,6 @@ class TestPortalBidding:
             assert again["repeat"] is True
             # A DIFFERENT bid after acceptance must be refused: before 046 it
             # flipped the winner while the borrower's PII stayed with bank A.
-            cur.execute("""
-                INSERT INTO marketplace.bid
-                  (request_id, institution_id, rate, rate_type, amount_offered,
-                   term_months, submitted_via, idempotency_key)
-                VALUES (%s,%s,6.5,'fixed',500000,36,'portal',%s) RETURNING id
-            """, (req, MCB_INSTITUTION_ID, "zzdup2-" + req))
-            other_bid = str(cur.fetchone()[0])
             expect_refused(cur, "SELECT marketplace.accept_bid(%s,%s,%s,%s::jsonb)",
                            (req, other_bid, consumer_id, phase2), "already accepted")
             assert str(scalar(cur, "SELECT winning_bid_id FROM marketplace.request WHERE id = %s",
