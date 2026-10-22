@@ -767,3 +767,111 @@ class TestFourEyesControls:
             """)
             expect_refused(cur, "UPDATE governance.action SET status = 'approved' WHERE id = %s",
                            (action_id,), "permission denied")
+
+
+# ===========================================================================
+# APP DB — Offers feed (App DB migration offers_v1, 2026-10-22)
+# Staff curate in admin.offer via admin.offer_* (role ficium_admin_app);
+# borrowers read public.offer_listing only, live rows only.
+# ===========================================================================
+_OFFER_FUNCS = (
+    "admin.offer_save(uuid,jsonb,text,integer)", "admin.offer_approve(uuid,text,text)",
+    "admin.offer_publish(uuid,text)", "admin.offer_withdraw(uuid,text,text)",
+    "admin.offer_reverify(uuid,text,timestamptz,text)",
+)
+
+
+def _offer_payload(**over) -> str:
+    d = {
+        "institution_name": "ZZ Test Bank", "category": "save", "product_type": "savings_plan",
+        "caption": "ZZ integration test offer caption", "headline": "Up to 4% p.a.",
+        "terms": "From MUR 1,000/month", "image_url": "https://zz.public.blob.vercel-storage.com/offers/zz.webp",
+        "image_alt": "ZZ test image", "expires_at": "2099-01-01T00:00:00Z",
+        "source_url": "https://zz.example/rates", "consent_ref": "ZZ-CONSENT-1",
+    }
+    d.update(over)
+    return json.dumps(d)
+
+
+def _published_offer(cur) -> str:
+    """Create, approve and publish an offer as the connection role (owner)."""
+    cur.execute("SELECT now() - interval '1 day'")
+    verified = cur.fetchone()[0].isoformat()
+    oid = scalar(cur, "SELECT (admin.offer_save(NULL, %s::jsonb, 'zz@ficium.net', NULL))->>'id'",
+                 (_offer_payload(verified_at=verified),))
+    cur.execute("SELECT admin.offer_approve(%s, 'zz@ficium.net', 'zz checked against sheet')", (oid,))
+    cur.execute("SELECT admin.offer_publish(%s, 'zz@ficium.net')", (oid,))
+    return oid
+
+
+@requires_app
+class TestAppOffers:
+
+    def test_borrower_sees_live_offers_only(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            live = _published_offer(cur)
+            stale = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.offer_listing (id, institution_name, category, product_type, caption,
+                  headline, terms, is_launch, published_at, verified_at, live_until)
+                VALUES (%s,'ZZ','save','savings_plan','zz stale caption','h','t',false,
+                        now()-interval '40 days', now()-interval '40 days', now()-interval '10 days')
+            """, (stale,))
+            become_authenticated(cur, sub=str(uuid.uuid4()), user_role="client", app_metadata={"role": "client"})
+            cur.execute("SELECT id::text FROM public.offer_listing WHERE id IN (%s, %s)", (live, stale))
+            assert {r[0] for r in cur.fetchall()} == {live}, "expired/unverified offer visible to borrower"
+
+    def test_borrower_cannot_write_or_reach_admin(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            oid = _published_offer(cur)
+            become_authenticated(cur, sub=str(uuid.uuid4()), user_role="client", app_metadata={"role": "client"})
+            expect_refused(cur, "UPDATE public.offer_listing SET headline = 'zz hacked' WHERE id = %s", (oid,), "permission denied")
+            expect_refused(cur, "DELETE FROM public.offer_listing WHERE id = %s", (oid,), "permission denied")
+            expect_refused(cur, "SELECT count(*) FROM admin.offer", (), "permission denied")
+            expect_refused(cur, "SELECT admin.offer_publish(%s, 'x@y.z')", (oid,), "permission denied")
+
+    def test_anon_reads_nothing(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            _published_offer(cur)
+            cur.execute("SET LOCAL ROLE anon")
+            expect_refused(cur, "SELECT count(*) FROM public.offer_listing", (), "permission denied")
+
+    def test_admin_app_role_is_functions_only(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            for f in _OFFER_FUNCS:
+                assert scalar(cur, "SELECT has_function_privilege('ficium_admin_app', %s, 'EXECUTE')", (f,)), f
+                for r in ("authenticated", "anon"):
+                    assert not scalar(cur, "SELECT has_function_privilege(%s, %s, 'EXECUTE')", (r, f)), (r, f)
+            for t, priv in (("admin.offer", "INSERT"), ("admin.offer", "UPDATE"), ("admin.offer", "DELETE"),
+                            ("admin.offer_change", "INSERT"), ("public.offer_listing", "SELECT"),
+                            ("public.offer_listing", "INSERT")):
+                assert not scalar(cur, "SELECT has_table_privilege('ficium_admin_app', %s, %s)", (t, priv)), (t, priv)
+
+    def test_change_log_is_append_only(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            _published_offer(cur)
+            expect_refused(cur, "DELETE FROM admin.offer_change", (), "append-only")
+            expect_refused(cur, "UPDATE admin.offer_change SET reason = 'zz'", (), "append-only")
+
+    def test_approval_requires_evidence(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            oid = scalar(cur, "SELECT (admin.offer_save(NULL, %s::jsonb, 'zz@ficium.net', NULL))->>'id'",
+                         (_offer_payload(source_url=None),))
+            expect_refused(cur, "SELECT admin.offer_approve(%s, 'zz@ficium.net', 'zz long enough reason')",
+                           (oid,), "source link is required")
+            cur.execute("SELECT now() - interval '45 days'")
+            old = cur.fetchone()[0].isoformat()
+            oid2 = scalar(cur, "SELECT (admin.offer_save(NULL, %s::jsonb, 'zz@ficium.net', NULL))->>'id'",
+                          (_offer_payload(verified_at=old),))
+            expect_refused(cur, "SELECT admin.offer_approve(%s, 'zz@ficium.net', 'zz long enough reason')",
+                           (oid2,), "verified within the last 30 days")
+
+    def test_publish_requires_approval_and_edits_need_current_version(self):
+        with rolled_back_tx(APP_DSN) as cur:
+            cur.execute("SELECT now() - interval '1 day'")
+            verified = cur.fetchone()[0].isoformat()
+            oid = scalar(cur, "SELECT (admin.offer_save(NULL, %s::jsonb, 'zz@ficium.net', NULL))->>'id'",
+                         (_offer_payload(verified_at=verified),))
+            expect_refused(cur, "SELECT admin.offer_publish(%s, 'zz@ficium.net')", (oid,), "only an approved offer")
+            expect_refused(cur, "SELECT admin.offer_save(%s, %s::jsonb, 'zz@ficium.net', 99)",
+                           (oid, _offer_payload(verified_at=verified)), "changed since you opened it")
