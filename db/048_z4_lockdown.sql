@@ -1,4 +1,4 @@
--- 048_z4_lockdown.sql   (NOT YET APPLIED: LAST step of Z4)
+-- 048_z4_lockdown.sql   (applied 2026-10-23, the last step of Z4)
 -- Apply only after ALL of these are live and verified:
 --   portal-api z4/one-identity (registration, onboarding, signed document
 --   links), ficium-portal z4/one-identity (no Supabase in the browser),
