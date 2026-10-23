@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 import json as _json
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy import text as _text  # noqa: F811 (alias for internal use)
 
@@ -520,3 +521,101 @@ async def admin_review_document(
             raise HTTPException(status_code=404, detail="Document not found.")
         conn.commit()
         return dict(row._mapping)
+
+
+# ─── Compliance waiver (db/051) ───────────────────────────────────────────────
+# Per-institution, time-limited waiver of the document gate (050). Ficium
+# admins only; reason required; expiry at most 180 days; audited. Approval and
+# suspension are never waivable.
+
+class WaiverBody(BaseModel):
+    reason:       str = Field(min_length=10, max_length=500)
+    waived_until: datetime
+
+
+def _compliance_row(conn, iid: str) -> dict:
+    row = conn.execute(
+        text("""
+            SELECT c.is_approved, c.is_compliant, c.missing_docs, c.can_bid, c.waived_until,
+                   w.reason, w.granted_at, w.granted_by, w.revoked_at
+              FROM institution.compliance c
+              LEFT JOIN institution.compliance_waiver w ON w.institution_id = c.institution_id
+             WHERE c.institution_id = CAST(:iid AS uuid)
+        """),
+        {"iid": iid},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Institution not found.")
+    d = dict(row._mapping)
+    for k in ("waived_until", "granted_at", "revoked_at"):
+        d[k] = d[k].isoformat() if d[k] else None
+    d["granted_by"] = str(d["granted_by"]) if d["granted_by"] else None
+    d["missing_docs"] = list(d["missing_docs"] or [])
+    return d
+
+
+def _audit_waiver(conn, actor: str, iid: str, action: str, meta: dict) -> None:
+    conn.execute(
+        text("""
+            INSERT INTO audit.event (actor_id, actor_type, institution_id, action,
+                                     resource_type, resource_id, outcome, metadata)
+            VALUES (CAST(:actor AS uuid), 'admin', CAST(:iid AS uuid), :action,
+                    'institution', CAST(:iid AS uuid), 'success', CAST(:meta AS jsonb))
+        """),
+        {"actor": actor, "iid": iid, "action": action, "meta": _json.dumps(meta, default=str)},
+    )
+
+
+@router.get("/institutions/{iid}/compliance")
+async def admin_get_compliance(iid: str, claims: dict = Depends(current_claims)) -> dict:
+    with service_session() as conn:
+        _require_admin(claims, conn)
+        return _compliance_row(conn, iid)
+
+
+@router.put("/institutions/{iid}/compliance-waiver")
+async def admin_grant_waiver(iid: str, body: WaiverBody,
+                             claims: dict = Depends(current_claims)) -> dict:
+    until = body.waived_until if body.waived_until.tzinfo else body.waived_until.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    if until <= now:
+        raise HTTPException(status_code=422, detail="The waiver must end in the future.")
+    if until > now + timedelta(days=180):
+        raise HTTPException(status_code=422, detail="A waiver can last at most 180 days.")
+    with service_session() as conn:
+        _require_admin(claims, conn)
+        _compliance_row(conn, iid)  # 404 if unknown
+        conn.execute(
+            text("""
+                INSERT INTO institution.compliance_waiver
+                  (institution_id, reason, waived_until, granted_by, granted_at)
+                VALUES (CAST(:iid AS uuid), :reason, :until, CAST(:by AS uuid), now())
+                ON CONFLICT (institution_id) DO UPDATE SET
+                  reason = excluded.reason, waived_until = excluded.waived_until,
+                  granted_by = excluded.granted_by, granted_at = now(),
+                  revoked_at = NULL, revoked_by = NULL
+            """),
+            {"iid": iid, "reason": body.reason.strip(), "until": until, "by": claims["sub"]},
+        )
+        _audit_waiver(conn, claims["sub"], iid, "compliance.waiver_granted",
+                      {"reason": body.reason.strip(), "waived_until": until.isoformat()})
+        return _compliance_row(conn, iid)
+
+
+@router.delete("/institutions/{iid}/compliance-waiver")
+async def admin_revoke_waiver(iid: str, claims: dict = Depends(current_claims)) -> dict:
+    with service_session() as conn:
+        _require_admin(claims, conn)
+        updated = conn.execute(
+            text("""
+                UPDATE institution.compliance_waiver
+                   SET revoked_at = now(), revoked_by = CAST(:by AS uuid)
+                 WHERE institution_id = CAST(:iid AS uuid) AND revoked_at IS NULL
+                RETURNING institution_id
+            """),
+            {"iid": iid, "by": claims["sub"]},
+        ).fetchone()
+        if updated is None:
+            raise HTTPException(status_code=404, detail="No active waiver for this institution.")
+        _audit_waiver(conn, claims["sub"], iid, "compliance.waiver_revoked", {})
+        return _compliance_row(conn, iid)
