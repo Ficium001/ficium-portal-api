@@ -206,8 +206,8 @@ Pipeline advance (LOS):
   → next stage: pending → in_progress (or pipeline completed)
   → dispatch_event(pipeline.stage_changed)
 
-Bid window close (cron):
-  POST /marketplace/close-expired  (GitHub Actions, every 30 min)
+Bid window close:
+  Maintenance loop (in-process, app/maintenance.py; needs MAINTENANCE_CLOSE_EXPIRED_ENABLED=true)
   → marketplace.close_expired_windows()
 ```
 

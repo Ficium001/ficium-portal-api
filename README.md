@@ -101,7 +101,6 @@ All endpoints accept `fic_live_*` API keys with the appropriate scope, or a port
 | `POST` | `/public/requests/bids/bulk` | Ficium App | Consumer bid list (bulk) |
 | `POST` | `/public/requests/{id}/accept-bid` | Vercel `accept-bid.ts` | Phase 2 PII reveal + atomic acceptance |
 | `POST` | `/marketplace/sync-requests` | pg_net (App DB) | Ingest new consumer requests |
-| `POST` | `/marketplace/close-expired` | GitHub Actions (every 30 min) | Close expired bid windows |
 | `GET`  | `/public/requests/{id}/pipeline` | Ficium App | Borrower-visible pipeline stages |
 
 ---
@@ -207,9 +206,10 @@ PUT /v1/pipeline/{loan_id}/stages/{stage_id}/advance  (API key — LOS)
   → activate next stage, or complete pipeline if last
   → fire webhook: pipeline.stage_changed
 
-POST /marketplace/close-expired  (GitHub Actions, every 30 min)
-  → marketplace.close_expired_windows()
-  → fire webhook: bid.rejected (institutions with open bids on expired requests)
+Maintenance loop (in-process, app/maintenance.py; needs MAINTENANCE_CLOSE_EXPIRED_ENABLED=true)
+  → marketplace.close_expired_windows()  (advisory lock: one closer across replicas)
+  → with live bids: request 'closed' (bids stay alive); none: 'expired'
+  → emits request.window_closed to the borrower side via the contract outbox
 ```
 
 ---
@@ -331,5 +331,4 @@ tests/
 
 **GitHub Actions workflows:**
 - `ci.yml` — ruff + mypy + pytest on every push
-- `close-bid-windows.yml` — `POST /marketplace/close-expired` every 30 min
 - `keepalive.yml` — `GET /health` every 5 min (prevent Railway cold start)

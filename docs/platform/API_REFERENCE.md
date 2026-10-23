@@ -33,7 +33,6 @@ Module-gated routes carry a `require_module(...)` dependency and return **403** 
 | `GET` | `/marketplace/bids/{bid_id}` | — | Single bid detail |
 | `GET` | `/marketplace/bids/{bid_id}/reveal` | — | Phase 2 borrower identity. Winning institution only, post-acceptance |
 | `POST` | `/marketplace/requests/{request_id}/reject` | — | Decline to bid, with a reason |
-| `POST` | `/marketplace/close-expired` | — | Sweep requests whose bid window has closed |
 | `POST` | `/marketplace/sync-requests` | — | Pull the next batch from the App DB. `?full_resync=true` resets the cursor to epoch |
 | `GET` | `/marketplace/sync-health` | — | Cursor position, last-run counts, `more_pending` |
 
