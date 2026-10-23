@@ -422,6 +422,25 @@ async def terminate_session(
         return {"ok": True}
 
 
+# ─── GET /admin/documents/{doc_id}/download ───────────────────────────────────
+# 5-minute signed link for compliance review (the bucket is private; the admin
+# screen used to link to a public URL that never worked).
+
+@router.get("/documents/{doc_id}/download")
+async def admin_download_document(doc_id: str, claims: dict = Depends(current_claims)) -> dict:
+    from ..core.storage import storage_signed_url
+
+    with service_session() as conn:
+        _require_admin(claims, conn)
+        row = conn.execute(
+            text("SELECT storage_path, file_name FROM institution.doc WHERE id = CAST(:id AS uuid)"),
+            {"id": doc_id},
+        ).fetchone()
+    if row is None or not row.storage_path:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {"url": await storage_signed_url(row.storage_path, 300), "file_name": row.file_name}
+
+
 # ─── GET /admin/documents ─────────────────────────────────────────────────────
 # All institution documents across all institutions — for Ficium admin review.
 # Service session: bypasses RLS (admin sees everything).

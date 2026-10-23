@@ -76,6 +76,20 @@ def _seed_tenant(cur) -> None:
                 (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin'))
         ON CONFLICT (id) DO NOTHING
     """, (MCB_ADMIN_MEMBER_ID, MCB_INSTITUTION_ID, MCB_ADMIN_AUTH_UID))
+    make_compliant(cur, MCB_INSTITUTION_ID)
+
+
+def make_compliant(cur, institution_id: str) -> None:
+    """Give a test bank an approved, in-date document for every mandatory type,
+    so the no-compliance-no-bids guard (db/050) lets it bid."""
+    cur.execute("""
+        INSERT INTO institution.doc
+          (institution_id, doc_type_id, storage_path, file_name, mime_type, status, uploaded_at)
+        SELECT %s, dt.id, 'zz/' || dt.code || '.pdf', dt.code || '.pdf', 'application/pdf',
+               'approved', now()
+          FROM institution.doc_type dt
+         WHERE dt.is_mandatory
+    """, (institution_id,))
 
 
 def add_member(cur, *, admin: bool, modules_group: str | None = None) -> tuple[str, str]:
@@ -354,6 +368,7 @@ class TestPortalBidding:
                    onboarding_stage, primary_contact_email)
                 VALUES (%s,'ZZ_BANK_B','ZZ Bank B','bank','MU',true,'approved','b@zz.mu')
             """, (bank_b,))
+            make_compliant(cur, bank_b)
             cur.execute("""
                 INSERT INTO marketplace.bid
                   (request_id, institution_id, rate, rate_type, amount_offered,
@@ -897,3 +912,25 @@ class TestAppOffers:
                            "only an approved offer")
             expect_refused(cur, "SELECT admin.offer_save(%s, %s::jsonb, %s, 99)",
                            (oid, payload, _ZZ), "changed since you opened it")
+
+
+@requires_portal
+class TestComplianceGate:
+
+    def test_bank_without_approved_documents_cannot_bid(self):
+        """db/050: no approved, in-date required documents, no bids, on every path."""
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            req, _ = _seed_catalog_and_request(cur)
+            bare = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.institution
+                  (id, name, legal_name, institution_type, country, approved,
+                   onboarding_stage, primary_contact_email)
+                VALUES (%s,'ZZ_BARE','ZZ Bare','commercial_bank','MU',true,'approved','x@zz.mu')
+            """, (bare,))
+            expect_refused(cur, """
+                INSERT INTO marketplace.bid
+                  (request_id, institution_id, rate, rate_type, amount_offered,
+                   term_months, submitted_via, idempotency_key)
+                VALUES (%s,%s,7.0,'fixed',500000,36,'portal',%s)
+            """, (req, bare, "zzbare-" + req), "cannot bid yet")
