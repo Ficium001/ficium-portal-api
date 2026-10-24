@@ -934,3 +934,20 @@ class TestComplianceGate:
                    term_months, submitted_via, idempotency_key)
                 VALUES (%s,%s,7.0,'fixed',500000,36,'portal',%s)
             """, (req, bare, "zzbare-" + req), "cannot bid yet")
+
+
+@requires_portal
+def test_no_definer_function_executable_by_anon() -> None:
+    """Security audit 2026-10-24 / db/053: Postgres grants EXECUTE to PUBLIC on every
+    new function, so a new SECURITY DEFINER function is callable with the public anon
+    key unless its migration revokes it. Fails until it does."""
+    with rolled_back_tx(PORTAL_DSN or "") as cur:
+        cur.execute("""
+        SELECT n.nspname || '.' || p.proname
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE p.prosecdef AND has_function_privilege('anon', p.oid, 'EXECUTE')
+           AND n.nspname NOT IN ('pg_catalog','information_schema','auth','storage','realtime',
+                                 'extensions','graphql','graphql_public','pgsodium','vault','net',
+                                 'cron','supabase_functions','pgbouncer')""")
+        leaked = [r[0] for r in cur.fetchall()]
+    assert not leaked, f"REVOKE EXECUTE ... FROM public, anon on: {leaked}"
