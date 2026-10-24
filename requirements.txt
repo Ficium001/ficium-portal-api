@@ -1,17 +1,17 @@
-fastapi==0.143.2
+fastapi==0.157.0
 uvicorn[standard]==0.54.0
 psycopg2-binary==2.9.13
-sqlalchemy[asyncio]==2.0.54
+sqlalchemy[asyncio]==2.0.55
 asyncpg==0.32.0
 pydantic==2.14.1
-pydantic-settings==2.16.0
+pydantic-settings==2.16.1
 python-jose[cryptography]==3.5.0
 httpx==0.28.1
 structlog==26.1.0
 argon2-cffi==25.1.0
 slowapi==0.1.10
 reportlab==5.0.1
-pypdf==6.20.1
+pypdf==6.21.2
 docxtpl==0.20.2
 python-multipart==0.0.32
 ficium-contract @ https://github.com/Ficium001/ficium-integration/archive/refs/tags/v1.9.1.tar.gz
