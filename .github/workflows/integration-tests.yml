@@ -62,3 +62,8 @@ jobs:
           APP_SERVICE_SECRET: integration-test-secret
           APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
         run: pytest tests/test_integration.py -v --tb=short
+
+      - name: Golden path (one deal end to end on MCB's live setup, rolled back)
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+        run: pytest tests/test_golden_path.py -v -s --tb=short
