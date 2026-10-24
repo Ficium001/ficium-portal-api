@@ -275,6 +275,23 @@ def test_golden_path(journey: Journey) -> None:
     _person(j, "approver", "bank_officer_approver")
     _person(j, "admin", "institution_admin")
     request_id, anon_id = str(uuid.uuid4()), str(uuid.uuid4())
+    if not j.sql(
+        "SELECT can_bid FROM institution.compliance WHERE institution_id = CAST(:i AS uuid)",
+        {"i": MCB},
+    )[0][0]:
+        # Reported separately by test_mcb_can_bid_today. Here MCB gets its documents
+        # (inside the rolled-back transaction) so the rest of the journey is tested.
+        j.say("0. MCB has no approved compliance documents: adding them for this run only")
+        j.sql(
+            """INSERT INTO institution.doc
+                   (institution_id, doc_type_id, storage_path, file_name, mime_type, status, uploaded_at)
+                 SELECT CAST(:i AS uuid), dt.id, 'golden/' || dt.code || '.pdf', dt.code || '.pdf',
+                        'application/pdf', 'approved', now()
+                   FROM institution.doc_type dt
+                  WHERE dt.code = ANY (SELECT unnest(missing_docs) FROM institution.compliance
+                                        WHERE institution_id = CAST(:i AS uuid))""",
+            {"i": MCB},
+        )
 
     # 1 ── Borrower publishes a request (signed contract event) ───────────────
     j.say("1. Borrower publishes a personal loan request")
@@ -673,4 +690,24 @@ def _approve_stage(j: Journey, pipeline_id: str, stage_id: str, stage: dict[str,
 def _now(days: int = 0, minutes: int = 0) -> str:
     # Inside one transaction now() is frozen at its start, so "just now" in the
     # past keeps the request inside its bid window.
-    return (datetime.now(UTC) + timedelta(days=days, minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    at = datetime.now(UTC) + timedelta(days=days, minutes=minutes)
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_mcb_can_bid_today() -> None:
+    """Go-live check: the pilot bank passes the no-documents-no-bids gate (db/050)."""
+    conn = psycopg2.connect(PORTAL_DSN or "")
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT can_bid, missing_docs, waived_until FROM institution.compliance "
+            "WHERE institution_id = %s",
+            (MCB,),
+        )
+        can_bid, missing, waived = cur.fetchone()
+        assert can_bid, (
+            f"MCB cannot bid: missing approved documents {missing}, "
+            f"no waiver ({waived}). Upload them or grant a time-limited waiver."
+        )
+    finally:
+        conn.close()
