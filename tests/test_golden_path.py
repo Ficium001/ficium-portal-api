@@ -45,7 +45,7 @@ import httpx
 import psycopg2
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from tests.test_integration import PORTAL_DSN, requires_portal
@@ -150,55 +150,47 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Iterator[Journey]:
     engine = create_engine(_sqlalchemy_dsn(PORTAL_DSN or ""), pool_size=1, max_overflow=0)
     conn = engine.connect()
     outer = conn.begin()
-    current: dict[str, Any] = {"ctx": None}
+    # The API nests sessions (a service session inside a tenant one). In production
+    # each is its own pooled connection; here they share one, so each session sets
+    # the role/claims it needs on entry and restores the outer one on exit.
+    stack: list[str | None] = [None]
 
-    def _apply_ctx(session: Session) -> None:
-        ctx = session.info.get("ctx")
-        if ctx == current["ctx"]:
-            return
-        raw = session.connection()
+    def _apply(ctx: str | None) -> None:
         if ctx is None:  # service session: privileged, no claims
-            raw.exec_driver_sql("SET LOCAL ROLE NONE")
-            raw.exec_driver_sql("SELECT set_config('request.jwt.claims', '', true)")
+            conn.exec_driver_sql("SET LOCAL ROLE NONE")
+            conn.exec_driver_sql("SELECT set_config('request.jwt.claims', '', true)")
         else:
-            raw.exec_driver_sql(
+            conn.exec_driver_sql(
                 "SELECT set_config('request.jwt.claims', %s, true), "
                 "set_config('role', 'authenticated', true)",
                 (ctx,),
             )
-        current["ctx"] = ctx
 
-    def _session(ctx: str | None) -> Session:
+    @contextmanager
+    def _scoped(ctx: str | None) -> Iterator[Session]:
         s = Session(bind=conn, join_transaction_mode="create_savepoint", autoflush=False)
-        s.info["ctx"] = ctx
-        event.listen(s, "do_orm_execute", lambda st: _apply_ctx(st.session))
-        return s
+        stack.append(ctx)
+        _apply(ctx)
+        try:
+            yield s
+            s.commit()
+        except Exception:
+            s.rollback()
+            raise
+        finally:
+            s.close()
+            stack.pop()
+            _apply(stack[-1])
 
     @contextmanager
     def tenant_session(claims: dict[str, Any]) -> Iterator[Session]:
-        s = _session(json.dumps(claims, separators=(",", ":")))
-        try:
+        with _scoped(json.dumps(claims, separators=(",", ":"))) as s:
             yield s
-            s.commit()
-        except Exception:
-            s.rollback()
-            raise
-        finally:
-            s.close()
-            current["ctx"] = "?"  # force re-apply for whoever runs next
 
     @contextmanager
     def service_session() -> Iterator[Session]:
-        s = _session(None)
-        try:
+        with _scoped(None) as s:
             yield s
-            s.commit()
-        except Exception:
-            s.rollback()
-            raise
-        finally:
-            s.close()
-            current["ctx"] = "?"
 
     for name, mod in list(sys.modules.items()):
         if name == "app" or name.startswith("app."):
@@ -206,7 +198,11 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Iterator[Journey]:
                 monkeypatch.setattr(mod, "tenant_session", tenant_session)
             if getattr(mod, "service_session", None) is dbmod.service_session:
                 monkeypatch.setattr(mod, "service_session", service_session)
-    monkeypatch.setattr(dbmod, "_SessionLocal", lambda: _session(None))
+    monkeypatch.setattr(
+        dbmod,
+        "_SessionLocal",
+        lambda: Session(bind=conn, join_transaction_mode="create_savepoint"),
+    )
 
     # Nothing leaves the test.
     outbound: list[dict[str, Any]] = []
