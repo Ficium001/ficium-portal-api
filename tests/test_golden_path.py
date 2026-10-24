@@ -283,7 +283,7 @@ def test_golden_path(journey: Journey) -> None:
         "type": "request.published",
         "version": 1,
         "source": "borrower",
-        "occurred_at": _now(),
+        "occurred_at": _now(minutes=-10),
         "aggregate_id": request_id,
         "sequence": 1,
         "data": {
@@ -306,7 +306,7 @@ def test_golden_path(journey: Journey) -> None:
                 "risk_tier": "B",
                 "age": 34,
             },
-            "created_at": _now(),
+            "created_at": _now(minutes=-10),
         },
     }
     fc.validate_event(env)
@@ -670,5 +670,7 @@ def _approve_stage(j: Journey, pipeline_id: str, stage_id: str, stage: dict[str,
     raise AssertionError("7: credit approval never completed")
 
 
-def _now(days: int = 0) -> str:
-    return (datetime.now(UTC) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _now(days: int = 0, minutes: int = 0) -> str:
+    # Inside one transaction now() is frozen at its start, so "just now" in the
+    # past keeps the request inside its bid window.
+    return (datetime.now(UTC) + timedelta(days=days, minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
