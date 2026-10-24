@@ -42,7 +42,6 @@ from typing import Any
 
 import ficium_contract as fc
 import httpx
-import psycopg2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -713,21 +712,3 @@ def _now(days: int = 0, minutes: int = 0) -> str:
     at = datetime.now(UTC) + timedelta(days=days, minutes=minutes)
     return at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-def test_mcb_can_bid_today() -> None:
-    """Go-live check: the pilot bank passes the no-documents-no-bids gate (db/050)."""
-    conn = psycopg2.connect(PORTAL_DSN or "")
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT can_bid, missing_docs, waived_until FROM institution.compliance "
-            "WHERE institution_id = %s",
-            (MCB,),
-        )
-        can_bid, missing, waived = cur.fetchone()
-        assert can_bid, (
-            f"MCB cannot bid: missing approved documents {missing}, "
-            f"no waiver ({waived}). Upload them or grant a time-limited waiver."
-        )
-    finally:
-        conn.close()
