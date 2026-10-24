@@ -90,6 +90,7 @@ The table below is history; the ledger is the source of truth.
 | `049_onboarding_and_compliance_rule.sql` | Creates the never-existing onboarding prefs table (`institution.onboarding_pref`); one rule for required documents (`institution.required_doc_types`) used by the compliance view (which ignored `applies_to`, so nobody could ever be compliant); `applies_to` in the `institution_type` vocabulary. Regulator mapping confirmed by KJ | Yes | ✅ (applied Oct 23 2026) |
 | `050_no_compliance_no_bids.sql` | Bank-grade gate: one BEFORE INSERT guard on `marketplace.bid` refuses bids unless `institution.compliance.can_bid` (covers four-eyes, autobid, API and any future path) | Yes | ✅ (applied Oct 23 2026) |
 | `051_compliance_waiver.sql` | Per-institution, time-limited (max 180 days) waiver of the document gate; Ficium admins only, reason required, audited by the API. `can_bid` = approved and (documents complete or active waiver); approval/suspension never waivable | Yes | ✅ (applied Oct 23 2026) |
+| `052_leasing_maps_to_vehicle_loan.sql` | Borrower-app Vehicle Loan is app type `leasing`, which fell through to `personal_loan` in `catalog.product_id_for_app_type()`. Adds `leasing → vehicle_loan`; self-verifying (aborts if any of 19 other mappings moves). Existing mis-filed request left as is | Yes | ✅ (applied Oct 24 2026) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
