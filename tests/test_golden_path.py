@@ -253,7 +253,7 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Iterator[Journey]:
         return j_holder["j"].people[who]
 
     m.app.dependency_overrides[deps.current_claims] = current_claims
-    client = TestClient(m.app, raise_server_exceptions=False)
+    client = TestClient(m.app, raise_server_exceptions=True)
     j = Journey(client, conn, outbound)
     j.webhooks = webhook_events
     j_holder["j"] = j
