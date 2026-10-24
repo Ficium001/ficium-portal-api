@@ -144,25 +144,6 @@ async def get_my_group(
     return None
 
 
-@router.get("/my-group-debug")
-async def get_my_group_debug(
-    claims: dict = Depends(current_claims),
-    conn: Session = Depends(tenant_conn),
-) -> dict:
-    """Temporary: returns raw member row to confirm sub + active state."""
-    sub = claims.get("sub")
-    row = conn.execute(
-        text("""
-            SELECT id, auth_user_id, active, group_id, custom_group_id, is_primary_admin
-            FROM institution.member
-            WHERE auth_user_id = :uid
-            LIMIT 1
-        """),
-        {"uid": sub},
-    ).fetchone()
-    return {"sub": sub, "member": dict(row._mapping) if row else None}
-
-
 @router.get("")
 async def list_members(
     include_inactive: bool = False,
