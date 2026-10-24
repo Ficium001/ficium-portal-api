@@ -179,7 +179,6 @@ Module-gated routes carry a `require_module(...)` dependency and return **403** 
 |---|---|---|---|
 | `GET` | `/members/me` | — | Caller's member record and role |
 | `GET` | `/members/my-group` | — | Caller's group and module permissions |
-| `GET` | `/members/my-group-debug` | — | Group resolution diagnostics |
 | `GET` | `/members` | — | Institution members |
 | `GET` | `/members/pending` | — | Member changes awaiting approval |
 | `GET` | `/members/{member_id}` | — | Single member |

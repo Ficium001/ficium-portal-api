@@ -112,7 +112,6 @@ DESC = {
     "get_my_institution": "Caller's institution profile",
     "get_my_role": "Caller's member record and role",
     "get_my_group": "Caller's group and module permissions",
-    "get_my_group_debug": "Group resolution diagnostics",
     "list_members": "Institution members",
     "list_pending_member_actions": "Member changes awaiting approval",
     "get_member": "Single member",
