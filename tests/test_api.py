@@ -690,3 +690,45 @@ class TestDelegationEndpoints:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ===========================================================================
+# Approval Engine — who may vote vs who may configure
+# ===========================================================================
+class TestApprovalVotingVsConfiguration:
+    """Voting is governed by the engine (approvals_cast: eligibility, maker recusal,
+    delegation); inst:approvals is for configuring chains. A checker assigned by role
+    must be able to vote without configuration rights (found by the golden path)."""
+
+    _CHECKER = {"user_role": "institution_checker", "module_permissions": ["inst:pipeline"]}
+
+    def _client(self, fetchone=None):
+        app.dependency_overrides[current_claims] = _claims_override(
+            institution_claims(**self._CHECKER)
+        )
+        app.dependency_overrides[tenant_conn] = _conn_override(fetchone=fetchone)
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_checker_without_module_can_vote(self):
+        row = type("R", (), {"status": "in_progress"})()
+        client = self._client(fetchone=row)
+        try:
+            r = client.post(
+                f"/approval-engine/instances/{uuid.uuid4()}/actions",
+                json={"stage_instance_id": str(uuid.uuid4()), "action": "approve"},
+            )
+            assert r.status_code == 200, r.text
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_checker_without_module_cannot_configure(self):
+        client = self._client()
+        try:
+            r = client.post(
+                "/approval-engine/doa-rules",
+                json={"entity_type": "facility", "priority": 1, "template_id": str(uuid.uuid4())},
+            )
+            assert r.status_code == 403
+            assert client.get("/approval-engine/templates").status_code == 403
+        finally:
+            app.dependency_overrides.clear()

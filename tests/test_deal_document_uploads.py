@@ -306,7 +306,7 @@ def test_complete_registers_as_borrower_upload(env):
     act = next(q for q in qs if "deal_document_act" in q)
     assert "'receive', NULL" in act  # no staff actor: four-eyes leaves any officer free to verify
     assert any("uploaded_via = 'borrower'" in q for q in qs)
-    assert any("'borrower', CAST(:i AS uuid)" in q for q in qs)
+    assert any("'consumer', CAST(:i AS uuid)" in q for q in qs)  # audit.event vocabulary
     assert st["committed"]
 
 
