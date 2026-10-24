@@ -290,7 +290,7 @@ async def complete_upload(upload_id: str, request: Request) -> JSONResponse:
                 INSERT INTO audit.event
                     (id, occurred_at, actor_id, actor_type, institution_id, action,
                      resource_type, resource_id, outcome, metadata)
-                VALUES (gen_random_uuid(), now(), NULL, 'borrower', CAST(:i AS uuid),
+                VALUES (gen_random_uuid(), now(), NULL, 'consumer', CAST(:i AS uuid),
                         'deal_document.receive', 'deal_document', CAST(:d AS uuid), 'success',
                         CAST(:meta AS jsonb))
             """), {"i": str(up.institution_id), "d": str(up.deal_document_id),

@@ -90,6 +90,29 @@ def _require_module(claims: dict) -> None:
             status_code=403, detail=f"Requires module permission '{MODULE_KEY}'."
         )
 
+def _require_module_or_participant(conn: Session, claims: dict, instance_id: str) -> None:
+    """Approval-chain admins, or the people in this decision: its maker, anyone who
+    acted on it, or anyone eligible at one of its stages."""
+    role = claims.get("user_role", "")
+    if role in INSTITUTION_ADMIN_ROLES or MODULE_KEY in claims.get("module_permissions", []):
+        return
+    involved = conn.execute(text("""
+        SELECT EXISTS (
+          SELECT 1 FROM institution.approval_instance i
+           WHERE i.id = :id AND (
+             i.entity_maker_id = :uid
+             OR EXISTS (SELECT 1 FROM institution.approval_stage_instance si
+                          JOIN institution.approval_action a ON a.stage_instance_id = si.id
+                         WHERE si.instance_id = i.id
+                           AND :uid IN (a.actor_id, a.acting_as))
+             OR EXISTS (SELECT 1 FROM institution.approval_stage_instance si
+                         WHERE si.instance_id = i.id
+                           AND institution.approvals_is_eligible(si.id, :uid))))
+    """), {"id": instance_id, "uid": claims["sub"]}).scalar()
+    if not involved:
+        raise HTTPException(status_code=403, detail=f"Requires module permission '{MODULE_KEY}'.")
+
+
 
 def _require_admin(claims: dict) -> None:
     # Shared with documents.py, institutions.py, marketplace.py — see
@@ -517,7 +540,8 @@ async def route_entity(
 async def my_inbox(
     conn: Session = Depends(tenant_conn), claims: dict = Depends(get_claims)
 ) -> list[dict]:
-    _require_module(claims)
+    # No module gate: the list is filtered to stages the caller is eligible for
+    # (approvals_is_eligible), so an approver needs no configuration rights to see it.
     rows = conn.execute(text("""
         WITH active AS (
           SELECT si.id AS stage_instance_id, si.instance_id, si.started_at, si.due_at,
@@ -555,7 +579,9 @@ async def cast_action(
     conn: Session = Depends(tenant_conn),
     claims: dict = Depends(get_claims),
 ) -> dict:
-    _require_module(claims)
+    # No module gate: approvals_cast enforces who may act (eligibility for the stage,
+    # maker recusal, valid delegation). inst:approvals is for configuring chains, not
+    # for voting; requiring it locked out approvers assigned by role (golden path).
     action = body.get("action")
     if action in ("reject", "recuse") and not (body.get("comment") or "").strip():
         raise HTTPException(status_code=422, detail="A comment is required for this action.")
@@ -630,7 +656,7 @@ async def instance_timeline(
     conn: Session = Depends(tenant_conn),
     claims: dict = Depends(get_claims),
 ) -> dict:
-    _require_module(claims)
+    _require_module_or_participant(conn, claims, instance_id)
     inst = conn.execute(text("""
         SELECT i.*, t.name AS template_name, r.priority AS rule_priority, r.conditions
         FROM institution.approval_instance i
