@@ -192,16 +192,9 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Iterator[Journey]:
         with _scoped(None) as s:
             yield s
 
-    for name, mod in list(sys.modules.items()):
-        if name == "app" or name.startswith("app."):
-            if getattr(mod, "tenant_session", None) is dbmod.tenant_session:
-                monkeypatch.setattr(mod, "tenant_session", tenant_session)
-            if getattr(mod, "service_session", None) is dbmod.service_session:
-                monkeypatch.setattr(mod, "service_session", service_session)
-    monkeypatch.setattr(
-        dbmod,
-        "_SessionLocal",
-        lambda: Session(bind=conn, join_transaction_mode="create_savepoint"),
+    _replace_everywhere(
+        monkeypatch,
+        {dbmod.tenant_session: tenant_session, dbmod.service_session: service_session},
     )
 
     # Nothing leaves the test.
@@ -230,7 +223,7 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Iterator[Journey]:
     ) -> None:
         webhook_events.append((institution_id, event_type))
 
-    monkeypatch.setattr(webhooks, "dispatch_event", _dispatch)
+    _replace_everywhere(monkeypatch, {webhooks.dispatch_event: _dispatch})
 
     monkeypatch.setenv("PORTAL_SUPABASE_URL", "https://storage.golden.test")
     monkeypatch.setenv("PORTAL_SUPABASE_SERVICE_KEY", "golden")
@@ -260,6 +253,21 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Iterator[Journey]:
         outer.rollback()
         conn.close()
         engine.dispose()
+
+
+def _replace_everywhere(mp: pytest.MonkeyPatch, swaps: dict[Any, Any]) -> None:
+    """Swap functions in every app module that imported them by name. Originals are
+    matched by identity, so this must see them all before anything is replaced."""
+    targets = [
+        (mod, attr, swaps[val])
+        for name, mod in list(sys.modules.items())
+        if name == "app" or name.startswith("app.")
+        for attr, val in list(vars(mod).items())
+        if any(val is k for k in swaps)
+    ]
+    assert targets, "nothing to patch"
+    for mod, attr, new in targets:
+        mp.setattr(mod, attr, new)
 
 
 def _sqlalchemy_dsn(dsn: str) -> str:
