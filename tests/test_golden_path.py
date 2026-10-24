@@ -42,6 +42,7 @@ from typing import Any
 
 import ficium_contract as fc
 import httpx
+import psycopg2
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
@@ -82,13 +83,23 @@ class Journey:
     def as_(self, who: str) -> dict[str, str]:
         return {"Authorization": f"Bearer golden:{who}"}
 
+    def committed(self) -> None:
+        """Fire deferred triggers, as the commit at the end of a real request would
+        (e.g. the borrower-event publishers are DEFERRABLE INITIALLY DEFERRED)."""
+        self.sql("SET CONSTRAINTS ALL IMMEDIATE")
+        self.sql("SET CONSTRAINTS ALL DEFERRED")
+
     def call(self, who: str, method: str, url: str, **kw: Any) -> httpx.Response:
-        return self.c.request(method, url, headers=self.as_(who), **kw)
+        r = self.c.request(method, url, headers=self.as_(who), **kw)
+        self.committed()
+        return r
 
     def signed(self, url: str, body: dict[str, Any], key: bytes, **headers: str) -> httpx.Response:
         raw = json.dumps(body, separators=(",", ":")).encode()
         h = {"Content-Type": "application/json", fc.SIGNATURE_HEADER: fc.sign(raw, key), **headers}
-        return self.c.post(url, content=raw, headers=h)
+        r = self.c.post(url, content=raw, headers=h)
+        self.committed()
+        return r
 
 
 def _person(
@@ -284,7 +295,8 @@ def test_golden_path(journey: Journey) -> None:
         j.say("0. MCB has no approved compliance documents: adding them for this run only")
         j.sql(
             """INSERT INTO institution.doc
-                   (institution_id, doc_type_id, storage_path, file_name, mime_type, status, uploaded_at)
+                   (institution_id, doc_type_id, storage_path, file_name, mime_type,
+                    status, uploaded_at)
                  SELECT CAST(:i AS uuid), dt.id, 'golden/' || dt.code || '.pdf', dt.code || '.pdf',
                         'application/pdf', 'approved', now()
                    FROM institution.doc_type dt
@@ -394,7 +406,10 @@ def test_golden_path(journey: Journey) -> None:
                        WHERE type = 'bid.placed' AND envelope->'data'->>'request_id' = :r""",
             {"r": request_id},
         )
-    assert out, "4: no bid.placed event queued for the borrower app"
+    errs = j.sql(
+        "SELECT stage, error FROM integration.emit_error WHERE aggregate_id = :a", {"a": bid_id}
+    )
+    assert out, f"4: no bid.placed event queued for the borrower app (publisher errors: {errs})"
     offer = out[-1][0]
     fc.validate_event(offer)
     assert "MCB" not in json.dumps(offer["data"].get("phase1", {})), offer
@@ -602,6 +617,7 @@ def _borrower_upload(j: Journey, pipeline_id: str, anon_id: str, requirement_id:
         content=PDF,
         headers={"Content-Type": "application/pdf", fc.SIGNATURE_HEADER: fc.sign(PDF, ACCEPT_KEY)},
     )
+    j.committed()
     ok(r, "borrower upload content")
     done = {
         "upload_id": up["upload_id"],
