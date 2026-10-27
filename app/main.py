@@ -36,6 +36,7 @@ from .api.esign import router as esign_router
 from .api.groups import router as groups_router
 from .api.institutions import router as institutions_router
 from .api.integration import router as integration_router
+from .api.internal_admin import router as internal_admin_router
 from .api.marketplace import router as marketplace_router
 from .api.members import router as members_router
 from .api.notifications import router as notifications_router
@@ -190,5 +191,6 @@ app.include_router(integration_router)     # contract v1 inbound events (signed,
 app.include_router(acceptance_router)      # contract v1 acceptance call (own key, OFF by default)
 app.include_router(deal_document_uploads_router)  # contract 1.5 borrower uploads (OFF by default)
 app.include_router(controls_router)        # four-eyes switches (Setup > Controls)
+app.include_router(internal_admin_router)  # admin site channel: signed + staff MFA token, API only
 app.include_router(registration_router)    # self-registration, one identity system
 app.include_router(onboarding_router)      # onboarding submit (documents + prefs + stage)
