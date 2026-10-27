@@ -786,51 +786,40 @@ class TestFourEyesControls:
 
 
 # ===========================================================================
-# APP DB — Offers feed (App DB migration offers_v1, 2026-10-22)
-# Staff curate in admin.offer via admin.offer_* (role ficium_admin_app);
-# borrowers read public.offer_listing only, live rows only.
+# APP DB — Offers feed. Design as of 2026-10-25 (admin_legacy_retire_v1):
+# the admin DB (Neon) is the master for offers; its outbox worker calls ONE
+# function here, admin.sync_apply, as role ficium_admin_sync. Borrowers read
+# public.offer_listing only, live rows only. The old App DB write path
+# (admin.offer_*, role ficium_admin_app) is gone and must stay gone.
 # ===========================================================================
-_OFFER_FUNCS = (
+_SYNC_ROLE = "ficium_admin_sync"
+_SYNC_APPLY = "admin.sync_apply(uuid,text,text,text,bigint,jsonb)"
+_SYNC_HELPERS = (
+    "admin._sync_offer_upsert(jsonb)",
+    "admin._sync_kyc(uuid,jsonb)",
+    "admin._sync_config(jsonb)",
+)
+_RETIRED_FUNCS = (
     "admin.offer_save(uuid,jsonb,text,integer)",
     "admin.offer_approve(uuid,text,text)",
     "admin.offer_publish(uuid,text)",
     "admin.offer_withdraw(uuid,text,text)",
     "admin.offer_reverify(uuid,text,timestamptz,text)",
 )
-_ZZ = "zz@ficium.net"
-_SAVE = "SELECT (admin.offer_save(NULL, %s::jsonb, 'zz@ficium.net', NULL))->>'id'"
-_APPROVE = "SELECT admin.offer_approve(%s, 'zz@ficium.net', 'zz long enough reason')"
 _CLIENT = {"role": "client"}
 
 
-def _offer_payload(**over) -> str:
-    d = {
-        "institution_name": "ZZ Test Bank",
-        "category": "save",
-        "product_type": "savings_plan",
-        "caption": "ZZ integration test offer caption",
-        "headline": "Up to 4% p.a.",
-        "terms": "From MUR 1,000/month",
-        "image_url": "https://zz.public.blob.vercel-storage.com/offers/zz.webp",
-        "image_alt": "ZZ test image",
-        "expires_at": "2099-01-01T00:00:00Z",
-        "source_url": "https://zz.example/rates",
-        "consent_ref": "ZZ-CONSENT-1",
-    }
-    d.update(over)
-    return json.dumps(d)
-
-
-def _days_ago(cur, days: int) -> str:
-    cur.execute("SELECT now() - make_interval(days => %s)", (days,))
-    return cur.fetchone()[0].isoformat()
-
-
-def _published_offer(cur) -> str:
-    """Create, approve and publish an offer as the connection role (owner)."""
-    oid = scalar(cur, _SAVE, (_offer_payload(verified_at=_days_ago(cur, 1)),))
-    cur.execute(_APPROVE, (oid,))
-    cur.execute("SELECT admin.offer_publish(%s, %s)", (oid, _ZZ))
+def _insert_listing(cur, *, live_until_sql: str) -> str:
+    """Insert a listing as the connection role (owner), bypassing the sync path."""
+    oid = str(uuid.uuid4())
+    cur.execute(f"""
+        INSERT INTO public.offer_listing
+          (id, institution_name, category, product_type, caption, headline, terms,
+           is_launch, published_at, verified_at, live_until)
+        VALUES (%s, 'ZZ Test Bank', 'save', 'savings_plan', 'zz integration caption',
+                'h', 't', false, now() - interval '5 days', now() - interval '1 day',
+                {live_until_sql})
+    """, (oid,))
     return oid
 
 
@@ -839,79 +828,71 @@ class TestAppOffers:
 
     def test_borrower_sees_live_offers_only(self):
         with rolled_back_tx(APP_DSN) as cur:
-            live = _published_offer(cur)
-            stale = str(uuid.uuid4())
-            cur.execute("""
-                INSERT INTO public.offer_listing
-                  (id, institution_name, category, product_type, caption, headline,
-                   terms, is_launch, published_at, verified_at, live_until)
-                VALUES (%s, 'ZZ', 'save', 'savings_plan', 'zz stale caption', 'h', 't',
-                        false, now() - interval '40 days', now() - interval '40 days',
-                        now() - interval '10 days')
-            """, (stale,))
+            live = _insert_listing(cur, live_until_sql="now() + interval '10 days'")
+            stale = _insert_listing(cur, live_until_sql="now() - interval '10 days'")
             become_authenticated(cur, sub=str(uuid.uuid4()), user_role="client",
                                  app_metadata=_CLIENT)
             cur.execute("SELECT id::text FROM public.offer_listing WHERE id IN (%s, %s)",
                         (live, stale))
             seen = {r[0] for r in cur.fetchall()}
-            assert seen == {live}, "expired/unverified offer visible to borrower"
+            assert seen == {live}, "expired offer visible to borrower"
 
     def test_borrower_cannot_write_or_reach_admin(self):
         with rolled_back_tx(APP_DSN) as cur:
-            oid = _published_offer(cur)
+            oid = _insert_listing(cur, live_until_sql="now() + interval '10 days'")
             become_authenticated(cur, sub=str(uuid.uuid4()), user_role="client",
                                  app_metadata=_CLIENT)
             denied = "permission denied"
             expect_refused(cur, "UPDATE public.offer_listing SET headline = 'zz' WHERE id = %s",
                            (oid,), denied)
             expect_refused(cur, "DELETE FROM public.offer_listing WHERE id = %s", (oid,), denied)
-            expect_refused(cur, "SELECT count(*) FROM admin.offer", (), denied)
-            expect_refused(cur, "SELECT admin.offer_publish(%s, 'x@y.z')", (oid,), denied)
+            expect_refused(cur, "SELECT count(*) FROM admin.sync_log", (), denied)
+            expect_refused(cur, "SELECT count(*) FROM admin.sync_state", (), denied)
+            expect_refused(
+                cur, "SELECT admin.sync_apply(%s, 'x', 'x', 'x', 1, '{}'::jsonb)",
+                (str(uuid.uuid4()),), denied)
 
     def test_anon_reads_nothing(self):
         with rolled_back_tx(APP_DSN) as cur:
-            _published_offer(cur)
+            _insert_listing(cur, live_until_sql="now() + interval '10 days'")
             cur.execute("SET LOCAL ROLE anon")
             expect_refused(cur, "SELECT count(*) FROM public.offer_listing", (),
                            "permission denied")
 
-    def test_admin_app_role_is_functions_only(self):
+    def test_old_app_db_write_path_is_retired(self):
+        """admin_legacy_retire_v1: nothing on the App DB may edit offers except
+        admin.sync_apply. If any of this reappears, the single audited path is bypassed."""
+        with rolled_back_tx(APP_DSN) as cur:
+            for f in _RETIRED_FUNCS:
+                assert scalar(cur, "SELECT to_regprocedure(%s)", (f,)) is None, f
+            for t in ("admin.offer", "admin.offer_change"):
+                assert scalar(cur, "SELECT to_regclass(%s)", (t,)) is None, t
+            assert not scalar(cur, "SELECT EXISTS (SELECT 1 FROM pg_roles "
+                                   "WHERE rolname = 'ficium_admin_app')")
+
+    def test_sync_role_can_only_apply(self):
         with rolled_back_tx(APP_DSN) as cur:
             fn_priv = "SELECT has_function_privilege(%s, %s, 'EXECUTE')"
-            for f in _OFFER_FUNCS:
-                assert scalar(cur, fn_priv, ("ficium_admin_app", f)), f
-                for r in ("authenticated", "anon"):
-                    assert not scalar(cur, fn_priv, (r, f)), (r, f)
-            forbidden = (
-                ("admin.offer", "INSERT"), ("admin.offer", "UPDATE"),
-                ("admin.offer", "DELETE"), ("admin.offer_change", "INSERT"),
-                ("public.offer_listing", "SELECT"), ("public.offer_listing", "INSERT"),
-            )
-            tbl_priv = "SELECT has_table_privilege('ficium_admin_app', %s, %s)"
-            for t, priv in forbidden:
-                assert not scalar(cur, tbl_priv, (t, priv)), (t, priv)
+            assert scalar(cur, fn_priv, (_SYNC_ROLE, _SYNC_APPLY)), "sync role cannot apply"
+            for r in ("authenticated", "anon"):
+                assert not scalar(cur, fn_priv, (r, _SYNC_APPLY)), r
+            for h in _SYNC_HELPERS:  # internals: not even the sync role calls them directly
+                for r in (_SYNC_ROLE, "authenticated", "anon"):
+                    assert not scalar(cur, fn_priv, (r, h)), (r, h)
+            tbl_priv = f"SELECT has_table_privilege('{_SYNC_ROLE}', %s, %s)"
+            for t in ("public.offer_listing", "admin.sync_log", "admin.sync_state"):
+                for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    assert not scalar(cur, tbl_priv, (t, priv)), (t, priv)
 
-    def test_change_log_is_append_only(self):
+    def test_sync_log_is_append_only(self):
         with rolled_back_tx(APP_DSN) as cur:
-            _published_offer(cur)
-            expect_refused(cur, "DELETE FROM admin.offer_change", (), "append-only")
-            expect_refused(cur, "UPDATE admin.offer_change SET reason = 'zz'", (), "append-only")
-
-    def test_approval_requires_evidence(self):
-        with rolled_back_tx(APP_DSN) as cur:
-            oid = scalar(cur, _SAVE, (_offer_payload(source_url=None),))
-            expect_refused(cur, _APPROVE, (oid,), "source link is required")
-            oid2 = scalar(cur, _SAVE, (_offer_payload(verified_at=_days_ago(cur, 45)),))
-            expect_refused(cur, _APPROVE, (oid2,), "verified within the last 30 days")
-
-    def test_publish_requires_approval_and_edits_need_current_version(self):
-        with rolled_back_tx(APP_DSN) as cur:
-            payload = _offer_payload(verified_at=_days_ago(cur, 1))
-            oid = scalar(cur, _SAVE, (payload,))
-            expect_refused(cur, "SELECT admin.offer_publish(%s, %s)", (oid, _ZZ),
-                           "only an approved offer")
-            expect_refused(cur, "SELECT admin.offer_save(%s, %s::jsonb, %s, 99)",
-                           (oid, payload, _ZZ), "changed since you opened it")
+            cur.execute("""
+                INSERT INTO admin.sync_log
+                  (event_id, topic, aggregate_type, aggregate_id, aggregate_version, outcome)
+                VALUES (%s, 'zz.test', 'zz', 'zz', 1, 'applied')
+            """, (str(uuid.uuid4()),))
+            expect_refused(cur, "DELETE FROM admin.sync_log", (), "append-only")
+            expect_refused(cur, "UPDATE admin.sync_log SET topic = 'zz'", (), "append-only")
 
 
 @requires_portal
