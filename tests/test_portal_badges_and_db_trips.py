@@ -163,3 +163,12 @@ def test_tenant_session_sets_claims_and_role_in_one_statement() -> None:
     assert len(seen) == 1
     assert "set_config('role', 'authenticated', true)" in seen[0]
     assert "request.jwt.claims" in seen[0]
+
+
+def test_own_pending_items_do_not_count_as_needing_me() -> None:
+    mine = {"action_status": "pending", "is_mine": True}
+    theirs = {"action_status": "pending", "is_mine": False}
+    queues = {"bids": [mine, theirs, theirs], "internal": [mine]}
+    with client(["pipeline"], pending=queues) as (c, _):
+        body = c.get("/portal/badges").json()
+    assert body["pending_bid_actions"] == 2 and body["pending_internal"] == 0

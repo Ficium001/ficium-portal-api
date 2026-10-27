@@ -70,7 +70,9 @@ async def badges(
         return r.get("status") == "submitted"
 
     def pending(r: dict) -> bool:
-        return r.get("action_status") == "pending"
+        # Only what THIS user may decide: four-eyes bars approving your own, so
+        # your own submissions are waiting on someone else, not on you.
+        return r.get("action_status") == "pending" and not r.get("is_mine")
 
     return {
         "open_requests": await _count(
