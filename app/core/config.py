@@ -74,6 +74,22 @@ class Settings(BaseSettings):
         raw = self.integration_acceptance_verify_keys.split(",")
         return [k.strip().encode() for k in raw if k.strip()]
 
+    # ── Admin command channel (/internal/admin/v1). The admin site signs every call with
+    #    ADMIN_PORTAL_SIGNING_KEY; these are the verify keys (comma-separated: rotation).
+    #    Empty = channel OFF (503). The caller must also present a ficium-auth staff token
+    #    with MFA from the Ficium platform institution.
+    admin_command_verify_keys: str = Field(default="", description="admin site signing key(s)")
+    platform_institution_id: str = "00000000-0000-0000-0000-000000000001"
+    admin_staff_roles: str = "super_admin,ficium_staff"
+
+    @property
+    def admin_command_keys(self) -> list[bytes]:
+        return [k.strip().encode() for k in self.admin_command_verify_keys.split(",") if k.strip()]
+
+    @property
+    def admin_staff_role_set(self) -> frozenset[str]:
+        return frozenset(r.strip().lower() for r in self.admin_staff_roles.split(",") if r.strip())
+
     # ── Scheduled maintenance inside the API (replaces the GitHub cron, which had no secret and
     #    only ran every 3-4 h). OFF by default: turning it on is an operator decision.
     maintenance_close_expired_enabled: bool = False
