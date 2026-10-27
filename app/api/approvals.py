@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -79,6 +79,91 @@ def _check_action_permission(
         )
 
 
+# Visibility map for the queue screens: action-category prefix -> module key.
+# (Deliberately not CATEGORY_MODULE above: that one also guards approve/reject
+# and carries four_eyes; the list screens have always used this narrower set.)
+_QUEUE_CATEGORY_MODULE: dict[str, str] = {
+    "bid":      "inst:bid_approval",
+    "benefit":  "inst:benefits",
+    "user":     "inst:team",
+    "group":    "inst:team",
+    "api_key":  "inst:settings",
+    "webhook":  "inst:webhooks",
+    "document": "inst:documents",
+    "product":  "inst:products",
+    "sla":      "inst:settings",
+}
+
+# An approval is expired when it is still 'pending' past expires_at. The sweep
+# (db/054, pg_cron every 5 min) writes that down, but reads never wait for it:
+# this expression is the single definition of the state the screens show.
+_EFFECTIVE_STATUS = (
+    "CASE WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at <= now() "
+    "THEN 'expired' ELSE status END"
+)
+_QUEUE_STATES = ("pending", "expired", "approved", "rejected")
+
+
+def _queue_visibility(claims: dict, scope: str | None) -> tuple[bool, list[str]]:
+    """Who sees what: (is_super, permitted category prefixes). Validates scope."""
+    if scope is not None and scope not in ("bids", "internal"):
+        raise HTTPException(status_code=422, detail="scope must be 'bids' or 'internal'.")
+    perms: list[str] = claims.get("module_permissions", [])
+    is_super = claims.get("user_role", "") in INSTITUTION_ADMIN_ROLES
+    prefixes = [p for p, m in _QUEUE_CATEGORY_MODULE.items() if is_super or m in perms]
+    return is_super, prefixes
+
+
+def _maybe_my_member_id(conn: Session) -> str | None:
+    """Caller's member id, or None. The queue is readable without it; it only
+    powers the 'initiated by you' marker."""
+    try:
+        row = conn.execute(
+            text("SELECT (institution.current_member_ctx()).member_id AS id")).fetchone()
+    except Exception:
+        return None
+    return str(row.id) if row is not None and row.id is not None else None
+
+
+_SCOPE_SQL = """
+  AND (
+    :is_super
+    OR split_part(category, '.', 1) = ANY(:prefixes)
+  )
+  AND (
+    :scope IS NULL
+    OR (:scope = 'bids'     AND split_part(category, '.', 1) =  'bid')
+    OR (:scope = 'internal' AND split_part(category, '.', 1) <> 'bid')
+  )
+"""
+
+_ROW_COLUMNS = """
+    id,
+    category          AS action_category,
+    {status}          AS action_status,
+    scope, label, risk, institution_id, maker_id, maker_role,
+    resource_type, resource_id, resource_label, payload, payload_before,
+    checker_id, checker_role, checker_note, checked_at,
+    execution_status, executed_at, execution_error, expires_at,
+    created_at        AS initiated_at,
+    created_at, updated_at
+"""
+
+
+def _serialise_action(row, me: str | None) -> dict:
+    r = _row_to_dict(row)
+    for k in ("id", "institution_id", "maker_id", "checker_id", "resource_id"):
+        if r.get(k) is not None:
+            r[k] = str(r[k])
+    for k in ("checked_at", "executed_at", "expires_at", "initiated_at", "created_at", "updated_at"):
+        if r.get(k) is not None:
+            r[k] = r[k].isoformat()
+    # Four-eyes: you can never approve your own. The UI uses this to keep your
+    # own submissions out of "needs you" and to show them as waiting on others.
+    r["is_mine"] = me is not None and r.get("maker_id") == me
+    return r
+
+
 @router.get("/pending")
 async def list_pending_actions(
     scope:  str | None = None,
@@ -100,94 +185,98 @@ async def list_pending_actions(
     could drift apart. Filtering here keeps the partition authoritative in one
     place and cuts each response to what its caller actually renders.
     """
-    # Map action-category prefix → required module permission
-    CATEGORY_MODULE: dict[str, str] = {
-        "bid":         "inst:bid_approval",
-        "benefit":     "inst:benefits",
-        "user":        "inst:team",
-        "group":       "inst:team",
-        "api_key":     "inst:settings",
-        "webhook":     "inst:webhooks",
-        "document":    "inst:documents",
-        "product":     "inst:products",
-        "sla":         "inst:settings",
-    }
-
-    perms: list[str] = claims.get("module_permissions", [])
-    # super_admin bypass — if role is super_admin see everything
-    is_super = claims.get("user_role", "") in INSTITUTION_ADMIN_ROLES
-
-    # Build the set of permitted category prefixes
-    allowed_prefixes: list[str] = []
-    for prefix, module in CATEGORY_MODULE.items():
-        if is_super or module in perms:
-            allowed_prefixes.append(prefix)
-
+    is_super, allowed_prefixes = _queue_visibility(claims, scope)
     if not allowed_prefixes and not is_super:
         return []
 
-    if scope is not None and scope not in ("bids", "internal"):
-        raise HTTPException(status_code=422, detail="scope must be 'bids' or 'internal'.")
-
-    # Filter by split_part(category, '.', 1) IN (allowed_prefixes)
     rows = conn.execute(
-        text("""
-            SELECT
-                id,
-                category          AS action_category,
-                status            AS action_status,
-                scope,
-                label,
-                risk,
-                institution_id,
-                maker_id,
-                maker_role,
-                resource_type,
-                resource_id,
-                resource_label,
-                payload,
-                payload_before,
-                checker_id,
-                checker_role,
-                checker_note,
-                checked_at,
-                execution_status,
-                executed_at,
-                execution_error,
-                expires_at,
-                created_at        AS initiated_at,
-                created_at,
-                updated_at
+        text(
+            "SELECT " + _ROW_COLUMNS.format(status="status") + """
             FROM governance.action
             WHERE status = 'pending'
-              AND (
-                :is_super
-                OR split_part(category, '.', 1) = ANY(:prefixes)
-              )
-              AND (
-                :scope IS NULL
-                OR (:scope = 'bids'     AND split_part(category, '.', 1) =  'bid')
-                OR (:scope = 'internal' AND split_part(category, '.', 1) <> 'bid')
-              )
+              AND (expires_at IS NULL OR expires_at > now())
+            """ + _SCOPE_SQL + """
             ORDER BY expires_at ASC NULLS LAST
-        """),
-        {
-            "is_super": is_super,
-            "prefixes": allowed_prefixes,
-            "scope":    scope,
-        }
+            """
+        ),
+        {"is_super": is_super, "prefixes": allowed_prefixes, "scope": scope},
     ).fetchall()
-    result = []
-    for row in rows:
-        r = _row_to_dict(row)
-        for k in ("id", "institution_id", "maker_id", "checker_id", "resource_id"):
-            if r.get(k) is not None:
-                r[k] = str(r[k])
-        for k in ("checked_at", "executed_at", "expires_at", "initiated_at", "created_at", "updated_at"):
-            if r.get(k) is not None:
-                r[k] = r[k].isoformat()
-        result.append(r)
-    return result
+    me = _maybe_my_member_id(conn)
+    return [_serialise_action(row, me) for row in rows]
+
+
+@router.get("/queue")
+async def list_queue(
+    state:  str,
+    scope:  str | None = None,
+    limit:  int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    conn:   Session = Depends(tenant_conn),
+    claims: dict    = Depends(get_claims),
+) -> dict:
+    """
+    One lifecycle state of the approval queue: pending | expired | approved |
+    rejected. Same visibility rules as /pending. `action_status` is the
+    EFFECTIVE state, so a pending row past its expiry is reported as expired
+    even if the sweep has not run yet.
+
+    pending sorts soonest-expiry first (what to do next); the three finished
+    states sort newest decision first. Paged with limit/offset; `total` is the
+    full count for that state.
+    """
+    if state not in _QUEUE_STATES:
+        raise HTTPException(
+            status_code=422, detail=f"state must be one of {', '.join(_QUEUE_STATES)}.")
+    is_super, prefixes = _queue_visibility(claims, scope)
+    if not prefixes and not is_super:
+        return {"items": [], "total": 0}
+
+    params = {"is_super": is_super, "prefixes": prefixes, "scope": scope, "state": state}
+    where = f"WHERE ({_EFFECTIVE_STATUS}) = :state " + _SCOPE_SQL
+    total = conn.execute(
+        text("SELECT count(*) AS n FROM governance.action " + where), params).scalar_one()
+    order = ("expires_at ASC NULLS LAST" if state == "pending"
+             else "COALESCE(checked_at, expires_at, updated_at) DESC, id")
+    rows = conn.execute(
+        text(
+            "SELECT " + _ROW_COLUMNS.format(status=_EFFECTIVE_STATUS)
+            + " FROM governance.action " + where
+            + f" ORDER BY {order} LIMIT :limit OFFSET :offset"
+        ),
+        {**params, "limit": limit, "offset": offset},
+    ).fetchall()
+    me = _maybe_my_member_id(conn)
+    return {"items": [_serialise_action(row, me) for row in rows], "total": total}
+
+
+@router.get("/queue/counts")
+async def queue_counts(
+    scope:  str | None = None,
+    conn:   Session = Depends(tenant_conn),
+    claims: dict    = Depends(get_claims),
+) -> dict[str, int]:
+    """Counts for the four tabs, plus `needs_me`: pending items the caller did
+    not initiate (the only ones they are allowed to decide)."""
+    is_super, prefixes = _queue_visibility(claims, scope)
+    zero = {s: 0 for s in _QUEUE_STATES} | {"needs_me": 0}
+    if not prefixes and not is_super:
+        return zero
+    me = _maybe_my_member_id(conn)
+    rows = conn.execute(
+        text(
+            f"SELECT ({_EFFECTIVE_STATUS}) AS state, count(*) AS n, "
+            "count(*) FILTER (WHERE maker_id IS DISTINCT FROM CAST(:me AS uuid)) AS not_mine "
+            "FROM governance.action WHERE true " + _SCOPE_SQL + " GROUP BY 1"
+        ),
+        {"is_super": is_super, "prefixes": prefixes, "scope": scope, "me": me},
+    ).fetchall()
+    out = dict(zero)
+    for r in rows:
+        if r.state in _QUEUE_STATES:
+            out[r.state] = int(r.n)
+        if r.state == "pending":
+            out["needs_me"] = int(r.not_mine)
+    return out
 
 
 @router.post("/submit")
