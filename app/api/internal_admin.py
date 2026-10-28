@@ -7,6 +7,10 @@ endpoints here, both POST with a JSON body:
     POST /internal/admin/v1/query     read-only ops (one row set per call)
     POST /internal/admin/v1/commands  changes; idempotent by command_id
 
+Ops: compliance.overview, documents.list, document.download, institutions.list,
+entitlements.catalog (queries); document.review (one person); waiver.grant,
+waiver.revoke, institution.approve, institution.suspend, entitlement.set (four-eyes).
+
 Every call must pass BOTH checks, so neither a leaked signing key nor a stolen
 staff token is enough on its own:
 
@@ -48,7 +52,10 @@ router = APIRouter(prefix="/internal/admin/v1", tags=["internal-admin"], include
 
 MAX_BODY = 64_000
 ACTOR_HEADER = "X-Ficium-Actor"
-FOUR_EYES_OPS = frozenset({"waiver.grant", "waiver.revoke"})
+FOUR_EYES_OPS = frozenset({
+    "waiver.grant", "waiver.revoke",
+    "institution.approve", "institution.suspend", "entitlement.set",
+})
 MAX_WAIVER_DAYS = 180
 
 
@@ -204,9 +211,38 @@ async def _q_document_download(conn: Session, args: dict, actor: str) -> dict:
     return {"url": await storage_signed_url(row.storage_path, 300), "file_name": row.file_name}
 
 
+def _q_institutions_list(conn: Session, args: dict, actor: str) -> list[dict]:
+    rows = conn.execute(text("""
+        SELECT i.id AS institution_id, i.name, i.legal_name, i.institution_type, i.country,
+               i.onboarding_stage, i.approved, i.approved_at, i.suspended_at, i.suspension_reason,
+               i.primary_contact_name, i.primary_contact_email, i.created_at,
+               (SELECT count(*) FROM institution.member m
+                 WHERE m.institution_id = i.id AND m.deactivated_at IS NULL) AS active_members,
+               COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                          'module_code', e.module_code, 'status', e.status, 'plan_tier', e.plan_tier,
+                          'valid_to', e.valid_to) ORDER BY e.module_code)
+                   FROM entitlements.institution_entitlement e
+                  WHERE e.institution_id = i.id), '[]'::jsonb) AS entitlements
+          FROM institution.institution i
+         ORDER BY i.approved, i.name
+         LIMIT 500
+    """)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def _q_entitlements_catalog(conn: Session, args: dict, actor: str) -> list[dict]:
+    rows = conn.execute(text("""
+        SELECT module_code, name, description, billing_model
+          FROM entitlements.module WHERE status = 'active' ORDER BY module_code
+    """)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
 SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "compliance.overview": _q_compliance_overview,
     "documents.list": _q_documents_list,
+    "institutions.list": _q_institutions_list,
+    "entitlements.catalog": _q_entitlements_catalog,
 }
 
 
@@ -317,10 +353,110 @@ def _c_waiver_revoke(conn: Session, args: dict, ctx: dict) -> dict:
     return _compliance(conn, iid)
 
 
+def _institution_row(conn: Session, iid: str) -> dict:
+    row = conn.execute(text("""
+        SELECT id AS institution_id, name, approved, onboarding_stage, approved_at,
+               suspended_at, suspension_reason
+          FROM institution.institution WHERE id = CAST(:iid AS uuid)
+    """), {"iid": iid}).fetchone()
+    if row is None:
+        raise ChannelError(404, "not_found", "Institution not found.")
+    return dict(row._mapping)
+
+
+def _c_institution_approve(conn: Session, args: dict, ctx: dict) -> dict:
+    iid = _uuid(args.get("institution_id"), "institution_id")
+    before = _institution_row(conn, iid)
+    if before["approved"] and before["onboarding_stage"] == "approved":
+        raise ChannelError(409, "already_approved", "This bank is already approved.")
+    conn.execute(text("""
+        UPDATE institution.institution
+           SET approved = true, onboarding_stage = 'approved',
+               approved_at = COALESCE(approved_at, now()), approved_by = CAST(:by AS uuid),
+               suspended_at = NULL, suspended_by = NULL, suspension_reason = NULL,
+               updated_at = now()
+         WHERE id = CAST(:iid AS uuid)
+    """), {"iid": iid, "by": ctx["checker"]})
+    _audit(conn, ctx["checker"], "institution.approved", "institution", iid, iid,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "before": before})
+    return _institution_row(conn, iid)
+
+
+def _c_institution_suspend(conn: Session, args: dict, ctx: dict) -> dict:
+    iid = _uuid(args.get("institution_id"), "institution_id")
+    reason = _reason(args.get("reason"))
+    before = _institution_row(conn, iid)
+    if before["onboarding_stage"] == "suspended":
+        raise ChannelError(409, "already_suspended", "This bank is already suspended.")
+    conn.execute(text("""
+        UPDATE institution.institution
+           SET approved = false, onboarding_stage = 'suspended', suspended_at = now(),
+               suspended_by = CAST(:by AS uuid), suspension_reason = :reason, updated_at = now()
+         WHERE id = CAST(:iid AS uuid)
+    """), {"iid": iid, "by": ctx["checker"], "reason": reason})
+    _audit(conn, ctx["checker"], "institution.suspended", "institution", iid, iid,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "reason": reason,
+            "before": before})
+    return _institution_row(conn, iid)
+
+
+ENTITLEMENT_STATUSES = frozenset({"active", "trial", "suspended", "expired"})
+PLAN_TIERS = frozenset({"trial", "standard", "professional", "enterprise"})
+
+
+def _c_entitlement_set(conn: Session, args: dict, ctx: dict) -> dict:
+    iid = _uuid(args.get("institution_id"), "institution_id")
+    code = str(args.get("module_code") or "")
+    status = args.get("status")
+    tier = args.get("plan_tier", "standard")
+    if status not in ENTITLEMENT_STATUSES:
+        raise ChannelError(422, "invalid_field", "status is not valid")
+    if tier not in PLAN_TIERS:
+        raise ChannelError(422, "invalid_field", "plan_tier is not valid")
+    valid_to = args.get("valid_to")
+    if valid_to is not None:
+        try:
+            valid_to = datetime.fromisoformat(str(valid_to).replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ChannelError(422, "invalid_field", "valid_to must be an ISO timestamp") from e
+        if valid_to.tzinfo is None:
+            valid_to = valid_to.replace(tzinfo=UTC)
+        if valid_to <= datetime.now(UTC):
+            raise ChannelError(422, "invalid_field", "valid_to must be in the future")
+    _institution_row(conn, iid)
+    if conn.execute(text("SELECT 1 FROM entitlements.module WHERE module_code = :c AND status = 'active'"),
+                    {"c": code}).fetchone() is None:
+        raise ChannelError(422, "invalid_field", "Unknown or retired module.")
+    before = conn.execute(text("""
+        SELECT status, plan_tier, valid_to FROM entitlements.institution_entitlement
+         WHERE institution_id = CAST(:iid AS uuid) AND module_code = :c
+    """), {"iid": iid, "c": code}).fetchone()
+    row = conn.execute(text("""
+        INSERT INTO entitlements.institution_entitlement
+          (institution_id, module_code, plan_tier, status, valid_to, created_by)
+        VALUES (CAST(:iid AS uuid), :c, :tier, :status, :valid_to, CAST(:by AS uuid))
+        ON CONFLICT (institution_id, module_code) DO UPDATE SET
+          plan_tier = excluded.plan_tier, status = excluded.status,
+          valid_to = excluded.valid_to, updated_at = now()
+        RETURNING institution_id, module_code, plan_tier, status, valid_from, valid_to
+    """), {"iid": iid, "c": code, "tier": tier, "status": status, "valid_to": valid_to,
+           "by": ctx["checker"]}).fetchone()
+    if row is None:  # pragma: no cover - an upsert always returns its row
+        raise ChannelError(500, "entitlement_not_saved")
+    out = dict(row._mapping)
+    _audit(conn, ctx["checker"], "entitlement.set", "institution", iid, iid,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "module_code": code,
+            "before": dict(before._mapping) if before else None, "after": out})
+    return out
+
+
 COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "document.review": _c_document_review,
     "waiver.grant": _c_waiver_grant,
     "waiver.revoke": _c_waiver_revoke,
+    "institution.approve": _c_institution_approve,
+    "institution.suspend": _c_institution_suspend,
+    "entitlement.set": _c_entitlement_set,
 }
 
 
