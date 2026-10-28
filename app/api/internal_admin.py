@@ -8,7 +8,7 @@ endpoints here, both POST with a JSON body:
     POST /internal/admin/v1/commands  changes; idempotent by command_id
 
 Ops: compliance.overview, documents.list, document.download, institutions.list,
-entitlements.catalog (queries); document.review (one person); waiver.grant,
+entitlements.catalog, groups.list, audit.search (queries); document.review (one person); waiver.grant,
 waiver.revoke, institution.approve, institution.suspend, entitlement.set (four-eyes).
 
 Every call must pass BOTH checks, so neither a leaked signing key nor a stolen
@@ -238,11 +238,61 @@ def _q_entitlements_catalog(conn: Session, args: dict, actor: str) -> list[dict]
     return [dict(r._mapping) for r in rows]
 
 
+def _q_groups_list(conn: Session, args: dict, actor: str) -> list[dict]:
+    """Platform role templates for bank users (read-only: system groups change by migration)."""
+    rows = conn.execute(text("""
+        SELECT g.id, g.slug, g.label, g.description, g.user_type, g.is_system,
+               (SELECT count(*) FROM institution.member m
+                 WHERE m.group_id = g.id AND m.deactivated_at IS NULL) AS active_members,
+               COALESCE((SELECT jsonb_agg(jsonb_build_object('key', k, 'label', COALESCE(cm.label, k))
+                                          ORDER BY k)
+                           FROM unnest(g.module_permissions) k
+                           LEFT JOIN catalog.module cm ON cm.key = k), '[]'::jsonb) AS modules
+          FROM portal_admin.user_groups g
+         ORDER BY g.user_type, g.slug
+    """)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def _q_audit_search(conn: Session, args: dict, actor: str) -> list[dict]:
+    """The portal's own audit trail, newest first, paged by (occurred_at, id)."""
+    iid = _uuid(args["institution_id"], "institution_id") if args.get("institution_id") else None
+    prefix = args.get("action_prefix")
+    if prefix is not None and (not isinstance(prefix, str) or not prefix
+                               or len(prefix) > 64 or not prefix.replace(".", "").replace("_", "").isalnum()):
+        raise ChannelError(422, "invalid_field", "action_prefix is not valid")
+    before = args.get("before")
+    if before is not None:
+        try:
+            before = datetime.fromisoformat(str(before).replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ChannelError(422, "invalid_field", "before must be an ISO timestamp") from e
+    try:
+        limit = max(1, min(int(args.get("limit", 100)), 200))
+    except (TypeError, ValueError) as e:
+        raise ChannelError(422, "invalid_field", "limit must be a number") from e
+    rows = conn.execute(text("""
+        SELECT e.id, e.occurred_at, e.actor_type, e.actor_email, e.actor_role, e.actor_ip,
+               e.institution_id, i.name AS institution_name, e.action, e.resource_type,
+               e.resource_label, e.outcome, e.outcome_note, e.metadata
+          FROM audit.event e
+          LEFT JOIN institution.institution i ON i.id = e.institution_id
+         WHERE (CAST(:iid AS uuid) IS NULL OR e.institution_id = CAST(:iid AS uuid))
+           AND (CAST(:prefix AS text) IS NULL OR e.action LIKE :prefix || '%')
+           AND (CAST(:before AS timestamptz) IS NULL OR e.occurred_at < CAST(:before AS timestamptz))
+         ORDER BY e.occurred_at DESC, e.id DESC
+         LIMIT :limit
+    """), {"iid": iid, "prefix": prefix, "before": before, "limit": limit}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
 SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "compliance.overview": _q_compliance_overview,
     "documents.list": _q_documents_list,
     "institutions.list": _q_institutions_list,
     "entitlements.catalog": _q_entitlements_catalog,
+    "groups.list": _q_groups_list,
+    "audit.search": _q_audit_search,
 }
 
 
