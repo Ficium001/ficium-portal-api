@@ -507,3 +507,63 @@ def test_entitlement_set_upserts_and_audits_before_after() -> None:
     assert r.json()["data"]["status"] == "trial"
     meta = json.loads(next(p for q, p in conn.sql if "INSERT INTO audit.event" in q)["meta"])
     assert meta["module_code"] == "AUTOBID" and "after" in meta and meta["before"] is None
+
+
+# ── read-only: groups and audit ───────────────────────────────────────────────
+
+
+def _q(conn: FakeConn, body: dict):
+    @contextmanager
+    def svc():
+        yield conn
+
+    with (
+        patch.object(settings, "admin_command_verify_keys", KEY.decode()),
+        patch.object(internal_admin, "service_session", svc),
+        patch.object(internal_admin, "verify_token", AsyncMock(return_value=staff())),
+    ):
+        return call(TestClient(app, raise_server_exceptions=False), "query", body)
+
+
+def test_groups_list_is_read_only_and_has_no_command() -> None:
+    conn = FakeConn()
+    assert _q(conn, {"op": "groups.list"}).status_code == 200
+    assert any("FROM portal_admin.user_groups" in q for q, _ in conn.sql)
+    assert "group.set_modules" not in internal_admin.COMMANDS
+    assert not any(op.startswith("group.") for op in internal_admin.COMMANDS)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"action_prefix": "x'; drop"},
+        {"action_prefix": ""},
+        {"before": "yesterday"},
+        {"limit": "lots"},
+        {"institution_id": "nope"},
+    ],
+)
+def test_audit_search_validates_filters(args: dict) -> None:
+    conn = FakeConn()
+    r = _q(conn, {"op": "audit.search", "args": args})
+    assert r.status_code == 422
+    assert not any("FROM audit.event" in q for q, _ in conn.sql)
+
+
+def test_audit_search_clamps_limit_and_passes_filters() -> None:
+    conn = FakeConn()
+    r = _q(
+        conn,
+        {
+            "op": "audit.search",
+            "args": {
+                "institution_id": INST,
+                "action_prefix": "compliance.",
+                "limit": 5000,
+                "before": "2026-10-27T10:00:00Z",
+            },
+        },
+    )
+    assert r.status_code == 200
+    p = next(p for q, p in conn.sql if "FROM audit.event" in q)
+    assert p["limit"] == 200 and p["iid"] == INST and p["prefix"] == "compliance."
