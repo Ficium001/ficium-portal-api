@@ -93,3 +93,11 @@ def test_non_admin_cannot_grant() -> None:
 def test_revoke_active_waiver_and_404_when_none() -> None:
     assert _call(Svc(active=True), "delete").status_code == 200
     assert _call(Svc(active=False), "delete").status_code == 404
+
+
+@pytest.fixture(autouse=True)
+def _legacy_admin_on(monkeypatch):
+    """These tests cover the retired /admin/* routes, which are off by default."""
+    from app.core.config import settings as _s
+
+    monkeypatch.setattr(_s, "legacy_admin_enabled", True)
