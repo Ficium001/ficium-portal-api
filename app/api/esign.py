@@ -12,8 +12,11 @@
 #                     before the token resolves; every state transition
 #                     still runs through SECURITY DEFINER functions).
 #
-# Email: Resend if RESEND_API_KEY is set; otherwise the signing link / OTP
-# is logged (structlog) so dev + staging work without a mail provider.
+# Email: Resend. In production a missing RESEND_API_KEY or a failed send is an
+# error the caller sees (502): the envelope is not created / the code is not
+# considered sent. Only outside production (settings.env != "production") is the
+# message logged instead, so dev works without a mail provider. A signing link
+# or one-time code is never written to production logs.
 # Storage: Supabase Storage REST, same pattern as documents.py
 # (PORTAL_SUPABASE_URL + PORTAL_SUPABASE_SERVICE_KEY), bucket
 # `institution-docs` under esign/.
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html as _html
 import io
 import json
 import os
@@ -35,6 +39,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
+from ..core.config import settings
 from ..core.db import service_session
 from ..core.storage import storage_download as _storage_download
 from ..core.storage import storage_signed_url as _storage_signed_url
@@ -101,22 +106,46 @@ def _new_token() -> tuple[str, str]:
     return raw, hashlib.sha256(raw.encode()).hexdigest()
 
 
+class EmailNotSent(Exception):
+    """The message did not leave: no provider configured, refused, or unreachable."""
+
+
+def _e(v: Any) -> str:
+    """Escape caller-supplied text for an email body (names, titles)."""
+    return _html.escape(str(v), quote=True)
+
+
 async def _send_email(to: str, subject: str, html: str) -> None:
     api_key = os.environ.get("RESEND_API_KEY")
     if not api_key:
+        if settings.env == "production":
+            log.error("esign_email_not_configured", to_domain=to.rsplit("@", 1)[-1])
+            raise EmailNotSent("email is not configured")
         log.warning("esign_email_dev_mode", to=to, subject=subject, body=html)
         return
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "from": os.environ.get("ESIGN_EMAIL_FROM", "Ficium <no-reply@ficium.net>"),
-                "to": [to], "subject": subject, "html": html,
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "from": os.environ.get("ESIGN_EMAIL_FROM", "Ficium <no-reply@ficium.net>"),
+                    "to": [to], "subject": subject, "html": html,
+                },
+            )
+    except httpx.HTTPError as e:
+        log.error("esign_email_unreachable", error=type(e).__name__)
+        raise EmailNotSent("email provider unreachable") from e
     if resp.status_code not in (200, 201):
-        log.error("esign_email_failed", to=to, status=resp.status_code)
+        log.error("esign_email_failed", status=resp.status_code, detail=resp.text[:300])
+        raise EmailNotSent(f"email provider refused ({resp.status_code})")
+
+
+def _email_failed(what: str) -> HTTPException:
+    return HTTPException(
+        status_code=502,
+        detail=f"{what} could not be emailed, so nothing was sent. Try again shortly.",
+    )
 
 
 # ── institution side ─────────────────────────────────────────────────────────
@@ -179,22 +208,29 @@ async def create_envelope(
     conn.execute(text(
         "SELECT institution.esign_append_event(:id, NULL, 'sent', CAST(:d AS jsonb))"
     ), {"id": env_id, "d": json.dumps({"to": body["borrower_email"]})})
-    conn.commit()
 
+    # Email first, commit after: an envelope is only 'sent' if both emails left.
+    # On failure the transaction is rolled back and the officer gets a 502.
     base = os.environ.get("CLIENT_APP_URL", "https://app.ficium.net")
     ttl = int(body.get("expires_hours") or 72)
-    await _send_email(
-        body["borrower_email"], f"Action required: sign {body['title']}",
-        f"<p>Dear {body['borrower_name']},</p>"
-        f"<p>Please review and sign: <a href='{base}/sign/{b_raw}'>{body['title']}</a>."
-        f" This link expires in {ttl} hours.</p>",
-    )
-    await _send_email(
-        body["countersigner_email"], f"Countersignature pending: {body['title']}",
-        f"<p>Dear {body['countersigner_name']},</p>"
-        f"<p>Your countersignature will be required once the borrower signs: "
-        f"<a href='{base}/sign/{c_raw}'>{body['title']}</a>.</p>",
-    )
+    title = _e(body["title"])
+    try:
+        await _send_email(
+            body["borrower_email"], f"Action required: sign {body['title']}",
+            f"<p>Dear {_e(body['borrower_name'])},</p>"
+            f"<p>Please review and sign: <a href='{base}/sign/{b_raw}'>{title}</a>."
+            f" This link expires in {ttl} hours.</p>",
+        )
+        await _send_email(
+            body["countersigner_email"], f"Countersignature pending: {body['title']}",
+            f"<p>Dear {_e(body['countersigner_name'])},</p>"
+            f"<p>Your countersignature will be required once the borrower signs: "
+            f"<a href='{base}/sign/{c_raw}'>{title}</a>.</p>",
+        )
+    except EmailNotSent as e:
+        conn.rollback()
+        raise _email_failed("The signing request") from e
+    conn.commit()
     return {"envelope_id": env_id}
 
 
@@ -318,11 +354,14 @@ async def request_otp(token: str, conn: Session = Depends(service_conn)) -> dict
         "SELECT institution.esign_append_event(:e, :s, 'otp_sent', '{}')"
     ), {"e": s.envelope_id, "s": s.id})
     conn.commit()
-    await _send_email(
-        s.email, "Your Ficium signing code",
-        f"<p>Dear {s.display_name},</p><p>Your one-time signing code is "
-        f"<strong>{otp}</strong>. It expires in {OTP_TTL_MIN} minutes.</p>",
-    )
+    try:
+        await _send_email(
+            s.email, "Your Ficium signing code",
+            f"<p>Dear {_e(s.display_name)},</p><p>Your one-time signing code is "
+            f"<strong>{otp}</strong>. It expires in {OTP_TTL_MIN} minutes.</p>",
+        )
+    except EmailNotSent as e:
+        raise _email_failed("Your signing code") from e
     return {"ok": True}
 
 
