@@ -454,45 +454,7 @@ def test_golden_path(journey: Journey) -> None:
 
     # 7 ── Work the deal through MCB's own stages ────────────────────────────
     j.say("7. Deal opens on MCB's template; working every stage")
-    for _ in range(30):
-        deal = ok(j.call("officer", "GET", f"/pipelines/{pipeline_id}"), "open deal")
-        if deal.get("status") != "active":
-            break
-        stage = _active_stage(deal)
-        assert stage, f"7: deal is active but no stage is active: {deal.get('stages')}"
-        sid, label = str(stage["id"]), stage.get("label") or stage.get("stage_label")
-        j.say(f"   stage {stage.get('position')}: {label} [{stage.get('status')}]")
-        _satisfy_documents(j, pipeline_id, sid, anon_id)
-        if stage.get("status") == "awaiting_approval":
-            _approve_stage(j, pipeline_id, sid, stage)
-            continue
-        r = j.call(
-            "officer",
-            "POST",
-            f"/pipelines/{pipeline_id}/stages/{sid}/advance",
-            json={"notes": "done"},
-        )
-        if r.status_code == 409 and "credit system" in r.text:
-            ok(
-                j.call(
-                    "admin",
-                    "POST",
-                    f"/pipelines/{pipeline_id}/credit-decision",
-                    json={"outcome": "approved", "external_reference": "GOLDEN-CR-1"},
-                ),
-                f"credit decision: {label}",
-            )
-            continue
-        res = ok(r, f"advance '{label}'")
-        if res.get("status") in ("awaiting_approval", "pending_approval") or res.get(
-            "approval_instance_id"
-        ):
-            _approve_stage(j, pipeline_id, sid, stage)
-    else:
-        raise AssertionError("7: the deal never finished (30 steps)")
-    assert deal["status"] == "completed", (
-        f"7: deal ended '{deal['status']}': {deal.get('closed_reason')}"
-    )
+    work_deal(j, pipeline_id, anon_id)
 
     # 8 ── Booked in the core system ─────────────────────────────────────────
     j.say("8. Officer records the booking from the core banking system")
@@ -537,6 +499,50 @@ def test_golden_path(journey: Journey) -> None:
 # --------------------------------------------------------------------------
 # Stage helpers
 # --------------------------------------------------------------------------
+def work_deal(j: Journey, pipeline_id: str, anon_id: str) -> dict[str, Any]:
+    """Every stage of the deal, the way the bank's setup says, until it completes."""
+    for _ in range(30):
+        deal = ok(j.call("officer", "GET", f"/pipelines/{pipeline_id}"), "open deal")
+        if deal.get("status") != "active":
+            break
+        stage = _active_stage(deal)
+        assert stage, f"7: deal is active but no stage is active: {deal.get('stages')}"
+        sid, label = str(stage["id"]), stage.get("label") or stage.get("stage_label")
+        j.say(f"   stage {stage.get('position')}: {label} [{stage.get('status')}]")
+        _satisfy_documents(j, pipeline_id, sid, anon_id)
+        if stage.get("status") == "awaiting_approval":
+            _approve_stage(j, pipeline_id, sid, stage)
+            continue
+        r = j.call(
+            "officer",
+            "POST",
+            f"/pipelines/{pipeline_id}/stages/{sid}/advance",
+            json={"notes": "done"},
+        )
+        if r.status_code == 409 and "credit system" in r.text:
+            ok(
+                j.call(
+                    "admin",
+                    "POST",
+                    f"/pipelines/{pipeline_id}/credit-decision",
+                    json={"outcome": "approved", "external_reference": "GOLDEN-CR-1"},
+                ),
+                f"credit decision: {label}",
+            )
+            continue
+        res = ok(r, f"advance '{label}'")
+        if res.get("status") in ("awaiting_approval", "pending_approval") or res.get(
+            "approval_instance_id"
+        ):
+            _approve_stage(j, pipeline_id, sid, stage)
+    else:
+        raise AssertionError("7: the deal never finished (30 steps)")
+    assert deal["status"] == "completed", (
+        f"7: deal ended '{deal['status']}': {deal.get('closed_reason')}"
+    )
+    return deal
+
+
 def _active_stage(deal: dict[str, Any]) -> dict[str, Any] | None:
     for s in deal.get("stages") or []:
         if s.get("status") in ("active", "awaiting_approval"):
@@ -711,4 +717,3 @@ def _now(days: int = 0, minutes: int = 0) -> str:
     # past keeps the request inside its bid window.
     at = datetime.now(UTC) + timedelta(days=days, minutes=minutes)
     return at.strftime("%Y-%m-%dT%H:%M:%SZ")
-
