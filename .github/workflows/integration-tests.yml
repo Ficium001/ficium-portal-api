@@ -18,6 +18,12 @@ on:
   schedule:
     - cron: "0 6 * * *"     # daily 06:00 UTC regression sweep
 
+# These tests share the live databases (rolled back, but locks are real while they
+# run): two runs at once block each other on the same rows and time out. Queue them.
+concurrency:
+  group: live-db-tests
+  cancel-in-progress: false
+
 jobs:
   integration:
     runs-on: ubuntu-latest
