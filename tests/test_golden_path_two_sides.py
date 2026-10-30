@@ -304,3 +304,11 @@ def test_golden_path_two_sides(journey: Journey, app_side: AppSide) -> None:  # 
     assert progress, "6: the borrower's tracker is empty after a completed, booked deal"
     j.say(f"   borrower tracker: {json.dumps(progress)[:300]}")
     j.say(f"   App DB applied {len(app.applied)} events: {app.applied}")
+    # On CI this becomes a check-run annotation: proof the journey ran (a skip writes nothing).
+    print(
+        "::notice title=Golden path, both sides::"
+        f"request {request_id[:8]} bid {bid_id[:8]} deal {pipeline_id[:8]}; "
+        f"App DB applied {len(app.applied)} events "
+        f"({', '.join(sorted({t for t, _ in app.applied}))}); "
+        f"borrower tracker {'present' if progress else 'EMPTY'}"
+    )

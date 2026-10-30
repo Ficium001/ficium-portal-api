@@ -72,7 +72,10 @@ jobs:
         env:
           PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
           APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
-        run: pytest tests/test_golden_path_two_sides.py -v -s --tb=short
+        # A skip would look green: fail unless the journey actually ran.
+        run: |
+          pytest tests/test_golden_path_two_sides.py -v -s --tb=short --junitxml=two_sides.xml
+          python -c "import xml.etree.ElementTree as E; s=E.parse('two_sides.xml').getroot().find('testsuite') or E.parse('two_sides.xml').getroot(); n,k=int(s.get('tests')),int(s.get('skipped')); print(f'ran {n-k} of {n}'); exit(0 if n>0 and k==0 else 1)"
 
   go-live-readiness:
     # Live configuration the pilot needs (e.g. MCB's compliance documents).
