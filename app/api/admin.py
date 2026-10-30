@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy import text as _text  # noqa: F811 (alias for internal use)
 
+from ..core.config import settings
 from ..core.db import _session_or_raise, service_session
 from ..deps import current_claims
 
@@ -44,6 +45,18 @@ def _is_active_admin(claims: dict) -> str:
     return str(row.id)
 
 
+RETIRED = (
+    "The platform admin has moved to the Ficium Portal Admin site. "
+    "These routes are retired (LEGACY_ADMIN_ENABLED is off)."
+)
+
+
+def require_legacy_admin_enabled() -> None:
+    """Runs before every /admin/* route, before any token or database work."""
+    if not settings.legacy_admin_enabled:
+        raise HTTPException(status_code=410, detail=RETIRED)
+
+
 async def require_admin_dep(claims: dict = Depends(current_claims)) -> str:
     """
     Router-level admin guard — runs BEFORE every handler on the guarded
@@ -62,7 +75,7 @@ async def require_admin_dep(claims: dict = Depends(current_claims)) -> str:
 router = APIRouter(
     prefix="/admin",
     tags=["admin"],
-    dependencies=[Depends(require_admin_dep)],
+    dependencies=[Depends(require_legacy_admin_enabled), Depends(require_admin_dep)],
 )
 
 # Unguarded router for the handful of /admin/* routes that intentionally
@@ -94,6 +107,8 @@ def _require_admin(claims: dict, conn) -> str:
 
 @public_router.get("/me")  # unguarded: returns null (not 403) for non-admins by design
 async def admin_me(claims: dict = Depends(current_claims)) -> dict | None:
+    if not settings.legacy_admin_enabled:
+        return None  # nobody is a platform admin in this portal any more
     sub = claims.get("sub")
     with service_session() as conn:
         row = conn.execute(

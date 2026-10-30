@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     integration_peer_url: str = Field(default="", description="Borrower side inbound events URL")
     integration_dispatch_interval_s: float = 10.0
 
+    # The old platform admin (/admin/* here, and the admin pages in ficium-portal) is retired:
+    # platform staff use the Ficium Portal Admin site, which reaches this API only through
+    # /internal/admin/v1 (signed + staff MFA token, four-eyes in its own database). The old
+    # routes were single-actor and did not require MFA, so they could bypass those controls.
+    # OFF = every /admin/* route answers 410 and /admin/me answers null. Emergency use only.
+    legacy_admin_enabled: bool = False
+
     # Step 5: the synchronous acceptance call (POST /integration/v1/acceptances). OFF by default.
     # It has its OWN key, separate from the event keys, so a leaked event key cannot accept bids.
     integration_acceptance_enabled: bool = False

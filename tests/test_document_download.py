@@ -87,3 +87,11 @@ def test_admin_review_link() -> None:
 
 def test_non_admin_cannot_use_the_review_link() -> None:
     assert _admin_get(Conn(admin=False)).status_code == 403
+
+
+@pytest.fixture(autouse=True)
+def _legacy_admin_on(monkeypatch):
+    """These tests cover the retired /admin/* routes, which are off by default."""
+    from app.core.config import settings as _s
+
+    monkeypatch.setattr(_s, "legacy_admin_enabled", True)

@@ -732,3 +732,11 @@ class TestApprovalVotingVsConfiguration:
             assert client.get("/approval-engine/templates").status_code == 403
         finally:
             app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _legacy_admin_on(monkeypatch):
+    """These tests cover the retired /admin/* routes, which are off by default."""
+    from app.core.config import settings as _s
+
+    monkeypatch.setattr(_s, "legacy_admin_enabled", True)
