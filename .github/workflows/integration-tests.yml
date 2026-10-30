@@ -68,6 +68,12 @@ jobs:
           PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
         run: pytest tests/test_golden_path.py -v -s --tb=short
 
+      - name: Golden path, both sides (App DB's own SQL + portal API, both rolled back)
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
+        run: pytest tests/test_golden_path_two_sides.py -v -s --tb=short
+
   go-live-readiness:
     # Live configuration the pilot needs (e.g. MCB's compliance documents).
     # Red here means "fix the setup", not "the code is broken".
