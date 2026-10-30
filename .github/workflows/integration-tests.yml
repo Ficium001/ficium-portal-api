@@ -18,6 +18,12 @@ on:
   schedule:
     - cron: "0 6 * * *"     # daily 06:00 UTC regression sweep
 
+# These tests share the live databases (rolled back, but locks are real while they
+# run): two runs at once block each other on the same rows and time out. Queue them.
+concurrency:
+  group: live-db-tests
+  cancel-in-progress: false
+
 jobs:
   integration:
     runs-on: ubuntu-latest
@@ -67,6 +73,15 @@ jobs:
         env:
           PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
         run: pytest tests/test_golden_path.py -v -s --tb=short
+
+      - name: Golden path, both sides (App DB's own SQL + portal API, both rolled back)
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
+        # A skip would look green: fail unless the journey actually ran.
+        run: |
+          pytest tests/test_golden_path_two_sides.py -v -s --tb=short --junitxml=two_sides.xml
+          python -c "import xml.etree.ElementTree as E; s=E.parse('two_sides.xml').getroot().find('testsuite') or E.parse('two_sides.xml').getroot(); n,k=int(s.get('tests')),int(s.get('skipped')); print(f'ran {n-k} of {n}'); exit(0 if n>0 and k==0 else 1)"
 
   go-live-readiness:
     # Live configuration the pilot needs (e.g. MCB's compliance documents).
