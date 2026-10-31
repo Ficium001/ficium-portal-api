@@ -95,6 +95,7 @@ The table below is history; the ledger is the source of truth.
 | `054_expire_stale_approvals.sql` | Expired approvals: sweep writes audit rows, partial index, pg_cron every 5 min (pg_cron installed on Portal DB), backfills rows stuck `pending` past `expires_at`. Reads also derive the expired state in SQL, so they never depend on the sweep | Yes | ✅ (applied Oct 27 2026) |
 | `055_admin_command_channel.sql` | Admin site -> portal-api over HTTPS only: append-only `integration.admin_command_log` (idempotency by command_id, maker/checker), `institution.doc.reviewed_by_staff` (reviewer as ficium-auth user). No new DB login for the admin site | Yes | ✅ (applied Oct 27 2026) |
 | `056_deal_always_created.sql` | An accepted bid always has a deal: accept_bid() no longer swallows deal-creation errors (the acceptance rolls back instead), one template resolver (`deal_template_for`, empty templates don't count), first ACTIVE stage activated, BEFORE INSERT guard on `marketplace.bid` refuses bids a licensed bank couldn't turn into a deal, repeat acceptance returns the existing deal id | Yes | ✅ (applied Oct 31 2026) |
+| `057_revoke_deal_guard_execute.sql` | Revoke EXECUTE on 056's `guard_bid_deal_template()` from public/anon/authenticated (053 rule, caught by CI) | Yes | ✅ (applied Oct 31 2026) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
