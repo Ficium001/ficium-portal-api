@@ -11,6 +11,7 @@ Read-only on both databases. Flags only drift that misleads someone:
   R5  the deal completed at the bank, the borrower's tracker has nothing
   R6  the App's winning bid is missing or differs from the portal's accepted bid
   R7  a bid is still live on a request that is no longer taking bids
+  R8  a bid was accepted (borrower identity released) but the bank has no deal for it
 
 Known, already-decided cases go in scripts/reconcile_acknowledged.json as
 {"<rule>:<id>": "<who decided what, when>"} so they stop alerting but stay visible.
@@ -89,6 +90,13 @@ def find(app: dict[str, Any], portal: dict[str, Any]) -> list[tuple[str, str, st
                     ("R6", rid, f"App winning bid {got or 'missing'}, portal accepted {want}")
                 )
 
+    # R8: only for banks licensed for deals ("pipeline" module); unlicensed banks get no deal
+    # by design (db/056). Bids without the flag (older callers, tests) are treated as unlicensed.
+    pipe_bids = {p.get("bid_id") for p in portal["pipelines"]}
+    for b in portal["bids"]:
+        if b["status"] == "accepted" and b.get("deal_licensed") and b["id"] not in pipe_bids:
+            out.append(("R8", b["id"], "bid accepted, identity released, but the bank has no deal"))
+
     for b in portal["bids"]:
         req = p_req.get(b["request_id"])
         if b["status"] in BID_LIVE and req and req["status"] not in PORTAL_OPEN:
@@ -110,10 +118,14 @@ def main() -> int:
     portal = {
         "requests": _rows(portal_dsn, "SELECT id::text, status::text FROM marketplace.request"),
         "bids": _rows(
-            portal_dsn, "SELECT id::text, request_id::text, status::text FROM marketplace.bid"
+            portal_dsn,
+            "SELECT b.id::text, b.request_id::text, b.status::text, "
+            "coalesce(i.modules, '[]'::jsonb) ? 'pipeline' AS deal_licensed "
+            "FROM marketplace.bid b JOIN institution.institution i ON i.id = b.institution_id",
         ),
         "pipelines": _rows(
-            portal_dsn, "SELECT request_id::text, status::text FROM marketplace.loan_pipeline"
+            portal_dsn,
+            "SELECT request_id::text, bid_id::text, status::text FROM marketplace.loan_pipeline",
         ),
     }
     ack_file = Path(__file__).with_name("reconcile_acknowledged.json")

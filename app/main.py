@@ -75,7 +75,18 @@ async def lifespan(app: FastAPI):
     maintenance_task: asyncio.Task[None] | None = None
     if settings.maintenance_close_expired_enabled:
         maintenance_task = asyncio.create_task(maintenance.run_forever(stop))
+    # Origination stops at the bid without these: borrowers get 503 on accept, uploads are off.
+    # Loud on every boot in production so a missing env var can't hide.
+    if settings.env == "production":
+        if not settings.integration_acceptance_enabled:
+            log.warning("origination_blocked", reason="INTEGRATION_ACCEPTANCE_ENABLED is off: "
+                        "no borrower can accept a bid")
+        if not settings.integration_documents_enabled:
+            log.warning("origination_degraded", reason="INTEGRATION_DOCUMENTS_ENABLED is off: "
+                        "borrowers cannot upload deal documents")
     log.info("portal_api_ready", integration_outbound=settings.integration_outbound_enabled,
+             integration_acceptance=settings.integration_acceptance_enabled,
+             integration_documents=settings.integration_documents_enabled,
              maintenance_close_expired=settings.maintenance_close_expired_enabled,
              integration_inbound=bool(settings.integration_inbound_keys))
     yield
