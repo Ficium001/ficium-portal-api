@@ -83,3 +83,18 @@ def test_one_sided_and_status_disagreements() -> None:
         ("R2", "q"),
         ("R3", "r"),
     ]
+
+
+def test_accepted_bid_without_a_deal_is_flagged() -> None:
+    """R8: the bank has the borrower's identity but nothing to work on (db/056 closes the cause)."""
+    app = _app(("r1", "accepted", "b1"), ("r2", "accepted", "b2"), ("r3", "accepted", "b3"))
+    portal = {
+        "requests": [{"id": r, "status": "accepted"} for r in ("r1", "r2", "r3")],
+        "bids": [
+            {"id": "b1", "request_id": "r1", "status": "accepted", "deal_licensed": True},
+            {"id": "b2", "request_id": "r2", "status": "accepted", "deal_licensed": True},
+            {"id": "b3", "request_id": "r3", "status": "accepted", "deal_licensed": False},
+        ],
+        "pipelines": [{"request_id": "r1", "bid_id": "b1", "status": "active"}],
+    }
+    assert rules(reconcile.find(app, portal)) == [("R8", "b2")]
