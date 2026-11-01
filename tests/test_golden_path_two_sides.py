@@ -144,10 +144,21 @@ def test_golden_path_two_sides(journey: Journey, app_side: AppSide) -> None:  # 
     # 1 ── A borrower in the App DB creates a request ────────────────────────────
     j.say("1. App DB: a KYC-verified borrower creates a personal loan request")
     client_id, request_id = str(uuid.uuid4()), str(uuid.uuid4())
+    # A real borrower always has a login: bid_acceptances.client_id references auth.users,
+    # and the App DB writes that row when the acceptance completes (ficium #119). The signup
+    # trigger on auth.users creates the clients row, so the insert below completes it.
+    app.sql(
+        """INSERT INTO auth.users (id, email, aud, role)
+           VALUES (CAST(:c AS uuid), :e, 'authenticated', 'authenticated')""",
+        {"c": client_id, "e": f"two.sides.{client_id[:8]}@example.com"},
+    )
     app.sql(
         """INSERT INTO public.clients (id, email, full_name, user_type, kyc_status, phone)
            VALUES (CAST(:c AS uuid), :e, 'Two Sides Borrower', 'individual', 'verified',
-                   '+230 5555 0001')""",
+                   '+230 5555 0001')
+           ON CONFLICT (id) DO UPDATE SET full_name = excluded.full_name,
+             user_type = excluded.user_type, kyc_status = excluded.kyc_status,
+             phone = excluded.phone""",
         {"c": client_id, "e": f"two.sides.{client_id[:8]}@example.com"},
     )
     app.sql(

@@ -34,6 +34,7 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import ficium_contract as fc
@@ -41,6 +42,7 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from ..core.config import settings
@@ -55,6 +57,7 @@ ACTOR_HEADER = "X-Ficium-Actor"
 FOUR_EYES_OPS = frozenset({
     "waiver.grant", "waiver.revoke",
     "institution.approve", "institution.suspend", "entitlement.set",
+    "commission.set", "commission.end",
 })
 MAX_WAIVER_DAYS = 180
 
@@ -286,6 +289,31 @@ def _q_audit_search(conn: Session, args: dict, actor: str) -> list[dict]:
     return [dict(r._mapping) for r in rows]
 
 
+def _q_commission_rules(conn: Session, args: dict, actor: str) -> list[dict]:
+    rows = conn.execute(text("""
+        SELECT r.id AS rule_id, r.institution_id, i.name AS institution_name, r.product_code,
+               p.name AS product_name, r.rate, r.basis, r.effective_from, r.ended_on, r.reason,
+               r.set_by, r.approved_by, r.created_at,
+               (r.effective_from <= (now() AT TIME ZONE 'Indian/Mauritius')::date
+                AND (r.ended_on IS NULL
+                     OR r.ended_on > (now() AT TIME ZONE 'Indian/Mauritius')::date)) AS in_force
+          FROM billing.commission_rule r
+          LEFT JOIN institution.institution i ON i.id = r.institution_id
+          LEFT JOIN catalog.product p ON p.code = r.product_code
+         ORDER BY (r.ended_on IS NULL) DESC, i.name NULLS FIRST, r.product_code NULLS FIRST,
+                  r.effective_from DESC
+         LIMIT 1000
+    """)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def _q_products_list(conn: Session, args: dict, actor: str) -> list[dict]:
+    rows = conn.execute(text(
+        "SELECT code AS product_code, name FROM catalog.product ORDER BY name"
+    )).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
 SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "compliance.overview": _q_compliance_overview,
     "documents.list": _q_documents_list,
@@ -293,6 +321,8 @@ SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "entitlements.catalog": _q_entitlements_catalog,
     "groups.list": _q_groups_list,
     "audit.search": _q_audit_search,
+    "commission.rules": _q_commission_rules,
+    "products.list": _q_products_list,
 }
 
 
@@ -500,6 +530,94 @@ def _c_entitlement_set(conn: Session, args: dict, ctx: dict) -> dict:
     return out
 
 
+# ── Commission schedule (db/058) ─────────────────────────────────────────────
+# The rules and their invariants live in billing.set_commission_rule() /
+# billing.end_commission_rule(); this validates shape first so the common
+# mistakes get a clear message, then maps the functions' COMMISSION_* errors.
+
+COMMISSION_MAX_RATE = Decimal("0.05")
+_COMMISSION_ERRORS = {
+    "COMMISSION_FOUR_EYES": (403, "four_eyes", "The person who asked for this cannot approve it."),
+    "COMMISSION_RATE_INVALID": (422, "invalid_field", "rate must be between 0 and 5%."),
+    "COMMISSION_DATE_IN_PAST": (422, "invalid_field", "The date must be today or later."),
+    "COMMISSION_UNKNOWN_INSTITUTION": (422, "invalid_field", "Unknown institution."),
+    "COMMISSION_UNKNOWN_PRODUCT": (422, "invalid_field", "Unknown product."),
+    "COMMISSION_LATER_RULE_EXISTS": (409, "later_rule_exists",
+                                     "A rule for this scope already starts on or after that date."),
+    "COMMISSION_RULE_NOT_OPEN": (404, "not_found", "No open rule with that id."),
+    "COMMISSION_DEFAULT_CANNOT_END": (422, "default_cannot_end",
+                                      "The platform default can be replaced, not ended."),
+}
+
+
+def _commission_db(conn: Session, sql: str, params: dict) -> dict:
+    try:
+        row = conn.execute(text(sql), params).fetchone()
+    except DBAPIError as e:
+        msg = str(getattr(e, "orig", e))
+        for key, (status, code, detail) in _COMMISSION_ERRORS.items():
+            if key in msg:
+                raise ChannelError(status, code, detail) from e
+        raise
+    if row is None:  # pragma: no cover - the functions always return a row or raise
+        raise ChannelError(500, "commission_not_saved")
+    return dict(row._mapping)
+
+
+def _date(v: Any, field: str) -> date:
+    try:
+        return date.fromisoformat(str(v))
+    except ValueError as e:
+        raise ChannelError(422, "invalid_field", f"{field} must be YYYY-MM-DD") from e
+
+
+def _c_commission_set(conn: Session, args: dict, ctx: dict) -> dict:
+    iid = args.get("institution_id")
+    iid = None if iid in (None, "") else _uuid(iid, "institution_id")
+    product = args.get("product_code")
+    if product in (None, ""):
+        product = None
+    elif not isinstance(product, str) or not product.replace("_", "").isalnum() or len(product) > 40:
+        raise ChannelError(422, "invalid_field", "product_code is not valid")
+    try:
+        rate = Decimal(str(args.get("rate")))
+    except InvalidOperation as e:
+        raise ChannelError(422, "invalid_field", "rate must be a decimal fraction") from e
+    if not rate.is_finite() or rate < 0 or rate > COMMISSION_MAX_RATE \
+            or rate.as_tuple().exponent < -4:  # type: ignore[operator]
+        raise ChannelError(422, "invalid_field",
+                           "rate must be a fraction between 0 and 0.05 with at most 4 decimals")
+    start = _date(args.get("effective_from"), "effective_from")
+    reason = _reason(args.get("reason"))
+    out = _commission_db(conn, """
+        SELECT * FROM billing.set_commission_rule(
+          CAST(:iid AS uuid), :product, CAST(:rate AS numeric), CAST(:start AS date), :reason,
+          CAST(:cmd AS uuid), CAST(:maker AS uuid), CAST(:checker AS uuid))
+    """, {"iid": iid, "product": product, "rate": str(rate), "start": start.isoformat(),
+          "reason": reason, "cmd": ctx["command_id"], "maker": ctx["maker"], "checker": ctx["checker"]})
+    _audit(conn, ctx["checker"], "commission.set", "commission_rule", str(out["id"]), iid,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "product_code": product,
+            "rate": str(rate), "effective_from": start.isoformat(), "reason": reason})
+    return out
+
+
+def _c_commission_end(conn: Session, args: dict, ctx: dict) -> dict:
+    rid = _uuid(args.get("rule_id"), "rule_id")
+    ended_on = _date(args.get("ended_on"), "ended_on")
+    reason = _reason(args.get("reason"))
+    out = _commission_db(conn, """
+        SELECT * FROM billing.end_commission_rule(
+          CAST(:rid AS uuid), CAST(:ended AS date), CAST(:cmd AS uuid),
+          CAST(:maker AS uuid), CAST(:checker AS uuid))
+    """, {"rid": rid, "ended": ended_on.isoformat(), "cmd": ctx["command_id"],
+          "maker": ctx["maker"], "checker": ctx["checker"]})
+    _audit(conn, ctx["checker"], "commission.ended", "commission_rule", rid,
+           str(out["institution_id"]) if out.get("institution_id") else None,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"],
+            "ended_on": ended_on.isoformat(), "reason": reason})
+    return out
+
+
 COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "document.review": _c_document_review,
     "waiver.grant": _c_waiver_grant,
@@ -507,6 +625,8 @@ COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "institution.approve": _c_institution_approve,
     "institution.suspend": _c_institution_suspend,
     "entitlement.set": _c_entitlement_set,
+    "commission.set": _c_commission_set,
+    "commission.end": _c_commission_end,
 }
 
 
