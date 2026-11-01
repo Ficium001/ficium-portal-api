@@ -567,3 +567,127 @@ def test_audit_search_clamps_limit_and_passes_filters() -> None:
     assert r.status_code == 200
     p = next(p for q, p in conn.sql if "FROM audit.event" in q)
     assert p["limit"] == 200 and p["iid"] == INST and p["prefix"] == "compliance."
+
+
+# ── commission schedule (db/058) ─────────────────────────────────────────────
+
+
+class CommConn(FakeConn):
+    """FakeConn plus billing.set/end_commission_rule; `fail` makes the function raise."""
+
+    def __init__(self, fail: str | None = None) -> None:
+        super().__init__()
+        self.fail = fail
+
+    def execute(self, stmt: Any, params: dict | None = None) -> _Res:
+        q, p = str(stmt), params or {}
+        if "billing.set_commission_rule" in q or "billing.end_commission_rule" in q:
+            self.sql.append((q, p))
+            if self.fail:
+                from sqlalchemy.exc import DBAPIError
+
+                raise DBAPIError(q, p, Exception(f"ERROR: P0001: {self.fail}"))
+            row = {"id": str(uuid.uuid4()), "institution_id": p.get("iid"),
+                   "product_code": p.get("product"), "rate": p.get("rate"),
+                   "effective_from": p.get("start"), "ended_on": p.get("ended")}
+            return _Res([SimpleNamespace(_mapping=row)])
+        return super().execute(stmt, params)
+
+
+def _today() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
+def commission(**over: Any) -> dict:
+    a = {"institution_id": INST, "product_code": "home_loan", "rate": "0.0045",
+         "effective_from": _today(), "reason": "MCB mortgage rate agreed in pilot"}
+    a.update(over)
+    return a
+
+
+def test_commission_set_is_four_eyes() -> None:
+    conn = CommConn()
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", commission(), maker=CHECKER))
+    assert r.status_code == 403 and r.json()["error"] == "four_eyes"
+    assert not any("billing." in q for q, _ in conn.sql)
+
+
+def test_commission_set_calls_the_schedule_and_audits() -> None:
+    conn = CommConn()
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", commission()))
+    assert r.status_code == 200, r.text
+    sent = next(p for q, p in conn.sql if "billing.set_commission_rule" in q)
+    assert sent["rate"] == "0.0045" and sent["maker"] == MAKER and sent["checker"] == CHECKER
+    assert conn.actions() == ["commission.set"]
+
+
+def test_commission_platform_default_scope_is_allowed() -> None:
+    conn = CommConn()
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        args = commission(institution_id=None, product_code=None, rate="0.009")
+        r = call(c, "commands", cmd("commission.set", args))
+    assert r.status_code == 200, r.text
+    sent = next(p for q, p in conn.sql if "billing.set_commission_rule" in q)
+    assert sent["iid"] is None and sent["product"] is None
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"rate": "0.06"},          # above 5%
+        {"rate": "-0.001"},
+        {"rate": "0.00125"},       # more than 4 decimals
+        {"rate": "abc"},
+        {"rate": "NaN"},
+        {"effective_from": "01/11/2026"},
+        {"reason": "short"},
+        {"product_code": "home loan; drop"},
+        {"institution_id": "not-a-uuid"},
+    ],
+)
+def test_commission_set_validation(over: dict) -> None:
+    conn = CommConn()
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", commission(**over)))
+    assert r.status_code == 422, r.text
+    assert not any("billing." in q for q, _ in conn.sql)
+
+
+@pytest.mark.parametrize(
+    "fail,status,code",
+    [
+        ("COMMISSION_LATER_RULE_EXISTS", 409, "later_rule_exists"),
+        ("COMMISSION_DATE_IN_PAST", 422, "invalid_field"),
+        ("COMMISSION_UNKNOWN_PRODUCT", 422, "invalid_field"),
+    ],
+)
+def test_commission_db_refusals_are_mapped_and_recorded(fail: str, status: int, code: str) -> None:
+    conn = CommConn(fail=fail)
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", commission()))
+    assert r.status_code == status and r.json()["error"] == code
+    assert len(conn.log) == 1  # refusal stored, so a retry gets the same answer
+    assert conn.actions() == []
+
+
+def test_commission_default_cannot_be_ended() -> None:
+    conn = CommConn(fail="COMMISSION_DEFAULT_CANNOT_END")
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        args = {"rule_id": str(uuid.uuid4()), "ended_on": _today(),
+                "reason": "Trying to end the default"}
+        r = call(c, "commands", cmd("commission.end", args))
+    assert r.status_code == 422 and r.json()["error"] == "default_cannot_end"
+
+
+def test_commission_end_calls_the_schedule() -> None:
+    conn = CommConn()
+    rid = str(uuid.uuid4())
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.end", {
+            "rule_id": rid, "ended_on": _today(), "reason": "Pilot pricing ends this month"}))
+    assert r.status_code == 200, r.text
+    sent = next(p for q, p in conn.sql if "billing.end_commission_rule" in q)
+    assert sent["rid"] == rid
+    assert conn.actions() == ["commission.ended"]
