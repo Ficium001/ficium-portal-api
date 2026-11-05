@@ -32,7 +32,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: Install deps
         # The annotate plugin surfaces each failing test on the PR / check run.
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15"
       - run: pip install -r requirements-dev.txt
       - name: Pilot bank is ready
         env:
