@@ -10,7 +10,7 @@ Read-only on both databases. Flags only drift that misleads someone:
   R4  the bank declined/cancelled the deal, the borrower still sees "accepted"
   R5  the deal completed at the bank, the borrower's tracker has nothing
   R6  the App's winning bid is missing or differs from the portal's accepted bid
-  R7  a bid is still live on a request that is no longer taking bids
+  R7  a bid is still live on a request that ended without acceptance
   R8  a bid was accepted (borrower identity released) but the bank has no deal for it
 
 Known, already-decided cases go in scripts/reconcile_acknowledged.json as
@@ -35,6 +35,9 @@ PORTAL_OPEN = {"bidding", "open"}
 PIPE_CLOSED_BAD = {"declined", "cancelled", "withdrawn"}
 PIPE_DONE = {"completed", "booked", "disbursed"}
 BID_LIVE = {"submitted", "pending_approval"}
+# A request that ended without acceptance. 'closed' is NOT here: the window shut with offers
+# and the borrower is still choosing, so live bids there are correct (db/059).
+PORTAL_ENDED = {"expired", "cancelled", "withdrawn"}
 
 
 def _dsn(v: str) -> str:
@@ -99,7 +102,7 @@ def find(app: dict[str, Any], portal: dict[str, Any]) -> list[tuple[str, str, st
 
     for b in portal["bids"]:
         req = p_req.get(b["request_id"])
-        if b["status"] in BID_LIVE and req and req["status"] not in PORTAL_OPEN:
+        if b["status"] in BID_LIVE and req and req["status"] in PORTAL_ENDED:
             out.append(("R7", b["id"], f"bid still '{b['status']}' on a '{req['status']}' request"))
     return out
 

@@ -98,3 +98,13 @@ def test_accepted_bid_without_a_deal_is_flagged() -> None:
         "pipelines": [{"request_id": "r1", "bid_id": "b1", "status": "active"}],
     }
     assert rules(reconcile.find(app, portal)) == [("R8", "b2")]
+
+
+def test_live_bids_while_borrower_chooses_are_not_drift() -> None:
+    """R7: 'closed' means the window shut with offers; the borrower is still choosing (db/059)."""
+    app = _app(("r1", "closed", None), ("r2", "expired", None))
+    portal = _portal(
+        [("r1", "closed"), ("r2", "cancelled")],
+        bids=[("b1", "r1", "submitted"), ("b2", "r2", "under_review"), ("b3", "r2", "submitted")],
+    )
+    assert rules(reconcile.find(app, portal)) == [("R7", "b3")]
