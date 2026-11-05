@@ -7,7 +7,8 @@ Read-only on both databases. Flags only drift that misleads someone:
   R1  request exists on one side only
   R2  accepted on one side, not the other
   R3  open for bids on one side, finished on the other
-  R4  the bank declined/cancelled the deal, the borrower still sees "accepted"
+  R4  the bank declined/cancelled the deal, the borrower still sees "accepted" (or sees
+      "deal_declined" while the bank's deal is not declined)
   R5  the deal completed at the bank, the borrower's tracker has nothing
   R6  the App's winning bid is missing or differs from the portal's accepted bid
   R7  a bid is still live on a request that ended without acceptance
@@ -35,6 +36,10 @@ PORTAL_OPEN = {"bidding", "open"}
 PIPE_CLOSED_BAD = {"declined", "cancelled", "withdrawn"}
 PIPE_DONE = {"completed", "booked", "disbursed"}
 BID_LIVE = {"submitted", "pending_approval"}
+# App statuses meaning "the borrower accepted a bid". deal_declined: that bank then
+# declined the deal; the portal keeps the request accepted (it holds the acceptance),
+# so both sides agree on "accepted" for R2/R6.
+APP_ACCEPTED = {"accepted", "deal_declined"}
 # A request that ended without acceptance. 'closed' is NOT here: the window shut with offers
 # and the borrower is still choosing, so live bids there are correct (db/059).
 PORTAL_ENDED = {"expired", "cancelled", "withdrawn"}
@@ -73,20 +78,25 @@ def find(app: dict[str, Any], portal: dict[str, Any]) -> list[tuple[str, str, st
 
     for rid in sorted(set(a_req) & set(p_req)):
         a, p = a_req[rid]["status"], p_req[rid]["status"]
-        if (a == "accepted") != (p == "accepted"):
+        if (a in APP_ACCEPTED) != (p == "accepted"):
             out.append(("R2", rid, f"App says '{a}', portal says '{p}'"))
         elif (a in APP_OPEN) != (p in PORTAL_OPEN):
             out.append(("R3", rid, f"App says '{a}', portal says '{p}'"))
         pipe = p_pipe.get(rid)
-        if a == "accepted" and pipe and pipe["status"] in PIPE_CLOSED_BAD:
+        if a == "accepted" and pipe and pipe["status"] == "declined":
+            out.append(("R4", rid, "bank declined the deal; borrower still sees 'accepted'"))
+        elif a == "accepted" and pipe and pipe["status"] in PIPE_CLOSED_BAD:
             out.append(
                 ("R4", rid, f"bank {pipe['status']} the deal; borrower still sees 'accepted'")
             )
+        if a == "deal_declined" and not (pipe and pipe["status"] == "declined"):
+            got = pipe["status"] if pipe else "no deal"
+            out.append(("R4", rid, f"borrower sees 'deal_declined' but the bank's deal is {got}"))
         if pipe and pipe["status"] in PIPE_DONE and rid not in a_prog:
             out.append(
                 ("R5", rid, f"deal {pipe['status']} at the bank; borrower's tracker is empty")
             )
-        if a == "accepted":
+        if a in APP_ACCEPTED:
             want, got = p_acc_bid.get(rid), a_req[rid]["accepted_bid_id"]
             if want and got != want:
                 out.append(

@@ -108,3 +108,22 @@ def test_live_bids_while_borrower_chooses_are_not_drift() -> None:
         bids=[("b1", "r1", "submitted"), ("b2", "r2", "under_review"), ("b3", "r2", "submitted")],
     )
     assert rules(reconcile.find(app, portal)) == [("R7", "b3")]
+
+
+def test_declined_deal_shown_as_declined_is_in_sync() -> None:
+    """Borrower sees deal_declined; portal keeps the request accepted, deal declined."""
+    app = _app(("r1", "deal_declined", "b1"))
+    portal = _portal(
+        [("r1", "accepted")], bids=[("b1", "r1", "accepted")], pipes=[("r1", "declined")]
+    )
+    assert reconcile.find(app, portal) == []
+
+
+def test_deal_declined_without_a_declined_deal_is_flagged() -> None:
+    app = _app(("r1", "deal_declined", "b1"), ("r2", "deal_declined", "b2"))
+    portal = _portal(
+        [("r1", "accepted"), ("r2", "accepted")],
+        bids=[("b1", "r1", "accepted"), ("b2", "r2", "accepted")],
+        pipes=[("r1", "active")],
+    )
+    assert rules(reconcile.find(app, portal)) == [("R4", "r1"), ("R4", "r2")]
