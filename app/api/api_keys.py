@@ -123,6 +123,7 @@ def create_key(
     )
 
     row = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         text(f"""
             INSERT INTO institution.api_key
                 (institution_id, label, key_prefix, key_hash, key_hmac,

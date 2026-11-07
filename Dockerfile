@@ -12,6 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY db ./db
 
+# Run unprivileged. LibreOffice (docx -> pdf) needs a writable HOME for its profile.
+RUN useradd --system --uid 10001 --home-dir /tmp/app --create-home app
+ENV HOME=/tmp/app
+USER app
+
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://localhost:8000/health || exit 1

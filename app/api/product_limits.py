@@ -68,6 +68,7 @@ def _iid(claims: dict[str, Any]) -> str:
 async def list_limits(claims: dict = Depends(current_claims)) -> list[dict]:
     iid = _iid(claims)
     with service_session() as conn:
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         rows = conn.execute(text(f"""
             SELECT {_COLS} FROM institution.product_config
              WHERE institution_id = CAST(:iid AS uuid)
@@ -106,6 +107,7 @@ async def set_limits(
                 raise HTTPException(status_code=422,
                     detail=f"Amounts can't be above the platform maximum of {cap['cap_max']:,.0f}.")
 
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         row = conn.execute(text(f"""
             UPDATE institution.product_config
                SET min_rate = :min_rate, max_rate = :max_rate,

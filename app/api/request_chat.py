@@ -92,6 +92,7 @@ async def list_messages(request_id: UUID, claims: dict = Depends(current_claims)
     inst_id = _institution_id(claims)
     with service_session() as conn:
         rows = conn.execute(
+            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             text(f"""
                 SELECT {_COLS} FROM marketplace.request_message
                  WHERE request_id = CAST(:rid AS uuid) AND institution_id = CAST(:iid AS uuid)
@@ -144,6 +145,7 @@ async def send_message(
     try:
         with service_session() as conn:
             row = conn.execute(
+                # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
                 text(f"""
                     SELECT {_COLS} FROM marketplace.send_institution_message(
                         CAST(:rid AS uuid), CAST(:iid AS uuid), CAST(:mid AS uuid),

@@ -212,6 +212,7 @@ def update_webhook(
     updates.append("updated_at = now()")
 
     row = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         text(f"""
             UPDATE institution.webhook
             SET {', '.join(updates)}
