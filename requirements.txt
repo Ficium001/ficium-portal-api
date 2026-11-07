@@ -1,9 +1,9 @@
 fastapi==0.162.0
 uvicorn[standard]==0.54.0
 psycopg2-binary==2.9.13
-sqlalchemy[asyncio]==2.0.55
+sqlalchemy[asyncio]==2.0.57
 asyncpg==0.32.0
-pydantic==2.14.1
+pydantic==2.14.2
 pydantic-settings==2.16.2
 PyJWT[crypto]==2.15.1  # replaces python-jose (unmaintained; PYSEC-2026-4298)
 httpx==0.28.1
@@ -13,5 +13,5 @@ slowapi==0.1.10
 reportlab==5.1.0
 pypdf==6.21.4  # 3 DoS advisories fixed in 6.21.4
 docxtpl==0.20.2
-python-multipart==0.0.32
+python-multipart==0.0.33
 ficium-contract @ https://github.com/Ficium001/ficium-integration/archive/refs/tags/v1.9.1.tar.gz
