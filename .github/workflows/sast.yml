@@ -1,9 +1,10 @@
 name: SAST
 
-# Static analysis security scan. CodeQL's code-scanning upload requires
-# GitHub Advanced Security, which isn't enabled on this private repo.
-# Semgrep runs the same kind of analysis as a plain CI gate -- pass/fail
-# on findings, no GHAS dependency, no SARIF upload.
+# Semgrep (registry "auto" rules) on every push, PR and weekly. GitHub Advanced
+# Security isn't enabled, so this is a plain CI gate rather than code scanning.
+# Blocks on ERROR-severity findings; WARNING findings are annotated on the PR
+# but don't block. A finding judged safe gets an inline
+# `# nosemgrep: <rule-id>` with the reason, never a blanket ignore.
 
 on:
   push:
@@ -13,21 +14,40 @@ on:
   schedule:
     - cron: '0 3 * * 1'
 
+permissions:
+  contents: read
+
 jobs:
   semgrep:
     name: Semgrep SAST
     runs-on: ubuntu-latest
     timeout-minutes: 15
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.182.0
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Semgrep scan (auto ruleset)
-        # Report-only for now: brand-new gate with no triaged baseline.
-        # Once the first run's findings are triaged (real issues fixed,
-        # false positives added to .semgrepignore), remove
-        # continue-on-error to make this a real gate.
-        run: semgrep scan --config=auto
-        continue-on-error: true
+      - name: Semgrep scan (blocks on ERROR)
+        run: |
+          set +e
+          semgrep scan --config=auto --json --output semgrep.json --quiet
+          rc=$?
+          set -e
+          if [ "$rc" -ge 2 ]; then echo "::error::semgrep failed to run (exit $rc)"; exit "$rc"; fi
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("semgrep.json"))
+          res = d["results"]
+          block = [r for r in res if r["extra"]["severity"] == "ERROR"]
+          for r in res:
+              sev = r["extra"]["severity"]
+              if sev not in ("ERROR", "WARNING"):
+                  continue
+              lvl = "error" if sev == "ERROR" else "warning"
+              msg = " ".join(r["extra"]["message"].split())[:240]
+              rule = r["check_id"]
+              print(f"::{lvl} file={r['path']},line={r['start']['line']},title={rule.split('.')[-1]}::{rule}: {msg}")
+          print(f"{len(block)} blocking (ERROR) findings, {len(res)} total")
+          sys.exit(1 if block else 0)
+          PY

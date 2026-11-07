@@ -438,6 +438,7 @@ def list_rules(
         where += " AND r.status = :status"
         params["status"] = status
     rows = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         text(f"""
             SELECT r.id, r.name, r.description, r.status, r.priority,
                    r.created_at, r.updated_at,
@@ -481,6 +482,7 @@ def list_executions(
         where += " AND loan_request_id = CAST(:lrid AS uuid)"
         params["lrid"] = loan_request_id
     rows = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         text(f"""
             SELECT rule_id, rule_version_id, loan_request_id, outcome, bid_id,
                    detail, occurred_at

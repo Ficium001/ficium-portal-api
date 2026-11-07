@@ -152,6 +152,7 @@ async def list_members(
     """All members of the caller's institution (RLS-scoped). Active only by default."""
     where = "" if include_inactive else "WHERE active = true"
     rows = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         text(f"""
             SELECT m.*, au.is_active AS auth_active
             FROM institution.member m

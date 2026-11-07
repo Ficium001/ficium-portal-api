@@ -10,9 +10,9 @@ import time
 from typing import Any
 
 import httpx
+import jwt
 import structlog
-from jose import jwt
-from jose.exceptions import JOSEError
+from jwt import PyJWK, PyJWTError
 
 from .config import settings
 
@@ -61,7 +61,7 @@ async def verify_token(token: str) -> dict[str, Any]:
     """
     try:
         header = jwt.get_unverified_header(token)
-    except JOSEError as e:
+    except PyJWTError as e:
         raise TokenError("Malformed token.") from e
 
     kid = header.get("kid")
@@ -73,11 +73,11 @@ async def verify_token(token: str) -> dict[str, Any]:
     try:
         return jwt.decode(
             token,
-            key,
+            PyJWK(key, algorithm="RS256").key,
             algorithms=["RS256"],
             audience=settings.auth_audience,
             issuer=settings.auth_issuer,
         )
-    except JOSEError as e:
+    except PyJWTError as e:
         # Expired, bad signature, wrong issuer/audience — all untrusted.
         raise TokenError(str(e)) from e

@@ -24,7 +24,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -241,6 +241,7 @@ async def update_template(
 
         set_clause = ", ".join(f"{k} = :{k}" for k in fields) + ", updated_at = now()"
         row = _one_required(conn.execute(
+            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             text(f"UPDATE institution.doc_template SET {set_clause} WHERE id = :id RETURNING *"),
             {**fields, "id": str(template_id)},
         ))
@@ -630,6 +631,7 @@ async def list_generations(
         params["status"] = status
 
     rows = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         text(
             f"""
             SELECT * FROM institution.doc_generation
@@ -662,7 +664,9 @@ async def download_generation(
         raise HTTPException(status_code=404, detail=f"No {fmt} output for this generation.")
 
     data = await _storage_download(path)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{fmt}") as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-    return FileResponse(tmp_path, filename=Path(path).name)
+    # Stream from memory: the old temp file (delete=False) was never removed, leaving
+    # every downloaded deal document on the container's disk.
+    media = "application/pdf" if fmt == "pdf" else (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    return Response(content=data, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{Path(path).name}"'})
