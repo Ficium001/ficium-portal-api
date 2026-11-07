@@ -35,6 +35,12 @@ class DefaultResponseHeadersMiddleware(BaseHTTPMiddleware):
         # include 'x-content-type-options' header".
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
 
+        # HSTS: browsers must only ever reach this API over HTTPS. Two years, as
+        # the apps send; Railway terminates TLS but adds no HSTS of its own.
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+        )
+
         # Ensure JSON responses declare charset explicitly.
         content_type = response.headers.get("content-type", "")
         if content_type.startswith("application/json") and "charset" not in content_type:
