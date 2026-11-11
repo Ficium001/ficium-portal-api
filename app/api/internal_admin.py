@@ -292,7 +292,7 @@ def _q_audit_search(conn: Session, args: dict, actor: str) -> list[dict]:
 def _q_commission_rules(conn: Session, args: dict, actor: str) -> list[dict]:
     rows = conn.execute(text("""
         SELECT r.id AS rule_id, r.institution_id, i.name AS institution_name, r.product_code,
-               p.name AS product_name, r.rate, r.basis, r.effective_from, r.ended_on, r.reason,
+               p.label AS product_name, r.rate, r.basis, r.effective_from, r.ended_on, r.reason,
                r.set_by, r.approved_by, r.created_at,
                (r.effective_from <= (now() AT TIME ZONE 'Indian/Mauritius')::date
                 AND (r.ended_on IS NULL
@@ -309,7 +309,7 @@ def _q_commission_rules(conn: Session, args: dict, actor: str) -> list[dict]:
 
 def _q_products_list(conn: Session, args: dict, actor: str) -> list[dict]:
     rows = conn.execute(text(
-        "SELECT code AS product_code, name FROM catalog.product ORDER BY name"
+        "SELECT code AS product_code, label AS name FROM catalog.product ORDER BY label"
     )).fetchall()
     return [dict(r._mapping) for r in rows]
 
