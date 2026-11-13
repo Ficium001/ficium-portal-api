@@ -104,14 +104,13 @@ class Settings(BaseSettings):
     #    explicitly turns it on, e.g. briefly in a test environment.
     self_registration_enabled: bool = False
     # Where the PUBLIC application form and its confirmation page live: the borrower site, not
-    # the portal (the portal is restrictive: sign-in for provisioned users only). Both are
-    # environment, never code: this service never hard-codes the borrower app's address
-    # (tests/test_no_direct_link.py). Unset = the previous behaviour (link to the portal).
+    # the portal (the portal is restrictive: sign-in for provisioned users only). Environment,
+    # never code: this service never hard-codes the borrower app's address
+    # (tests/test_no_direct_link.py). Unset = link to the portal (previous behaviour).
+    # The public site reaches /access-requests through its own same-origin proxy, so the browser
+    # never calls this API cross-origin and allowed_origins stays portal-only.
     portal_public_url:          str = "https://ficium-portal.vercel.app"
     public_site_url:            str = ""   # PUBLIC_SITE_URL
-    # Browser origins allowed to call ONLY the two public application endpoints
-    # (app/core/public_cors.py), comma separated. Empty = nobody (secure by default).
-    access_request_origins:     str = ""   # ACCESS_REQUEST_ORIGINS
     access_request_verify_ttl:  int = 86400        # confirmation link, 24 h
     # Optional: Ficium ops mailbox told when a confirmed application arrives. Empty = off.
     access_request_notify_email: str = ""
