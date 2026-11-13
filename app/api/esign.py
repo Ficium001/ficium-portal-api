@@ -39,6 +39,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
+from ..core import offer_gate
 from ..core.config import settings
 from ..core.db import service_session
 from ..core.storage import storage_download as _storage_download
@@ -163,6 +164,20 @@ async def create_envelope(
     Approval gate enforced in institution.esign_create_envelope().
     """
     _require_module(claims)
+    iid = claims["institution_id"]
+
+    # The server, not the client's label, decides whether approval is needed:
+    # every envelope against a deal needs that deal's approved credit decision.
+    if offer_gate.is_deal(conn, iid, body["entity_id"]):
+        gate = offer_gate.deal_approval(conn, iid, body["entity_id"])
+        if not gate.approved:
+            raise HTTPException(status_code=409, detail=gate.message)
+        body["approval_instance_id"] = gate.instance_id
+        derived = offer_gate.envelope_type_for_generation(
+            conn, iid, body.get("doc_generation_id"), body["document_path"])
+        if derived:
+            body["entity_type"] = derived
+
     doc = await _storage_download(body["document_path"])
     doc_hash = hashlib.sha256(doc).hexdigest()
 
@@ -197,7 +212,8 @@ async def create_envelope(
             conn.rollback()
             raise HTTPException(
                 status_code=409,
-                detail="This document requires a completed approval first.",
+                detail="This document needs an approved credit decision before it "
+                       "can be sent. Open the deal's credit stage to see who has it.",
             ) from e
         raise
     row = _row_or_500(row, "esign_create_envelope")
@@ -231,7 +247,25 @@ async def create_envelope(
         conn.rollback()
         raise _email_failed("The signing request") from e
     conn.commit()
+    _link_generation(iid, body.get("doc_generation_id"), env_id)
     return {"envelope_id": env_id}
+
+
+def _link_generation(institution_id: str, generation_id: str | None, envelope_id: str) -> None:
+    """Mark the generated document as sent, so the deal's document list shows it.
+    Best-effort and after commit: the envelope is already sent either way."""
+    if not generation_id:
+        return
+    try:
+        with service_session() as s:
+            s.execute(text("""
+                UPDATE institution.doc_generation SET esign_envelope_id = CAST(:env AS uuid)
+                WHERE id = CAST(:gid AS uuid) AND institution_id = CAST(:iid AS uuid)
+                  AND esign_envelope_id IS NULL
+            """), {"env": envelope_id, "gid": str(generation_id), "iid": str(institution_id)})
+            s.commit()
+    except Exception:  # noqa: BLE001
+        log.warning("esign_generation_link_failed", envelope_id=envelope_id)
 
 
 @router.get("/envelopes")

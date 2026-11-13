@@ -41,6 +41,8 @@ from .api.internal_admin import router as internal_admin_router
 from .api.marketplace import router as marketplace_router
 from .api.members import router as members_router
 from .api.notifications import router as notifications_router
+from .api.offer_flow import router as offer_flow_router
+from .api.offer_setup import router as offer_setup_router
 from .api.onboarding import router as onboarding_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
@@ -207,4 +209,6 @@ app.include_router(internal_admin_router)  # admin site channel: signed + staff 
 app.include_router(access_requests_router)  # institution applications (public, record only)
 # Legacy self-registration: OFF (404) unless SELF_REGISTRATION_ENABLED.
 app.include_router(registration_router)
+app.include_router(offer_flow_router)       # one-step send offer from a deal
+app.include_router(offer_setup_router)      # offer setup checklist + standard defaults
 app.include_router(onboarding_router)      # onboarding submit (documents + prefs + stage)
