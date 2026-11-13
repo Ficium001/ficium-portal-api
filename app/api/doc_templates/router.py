@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -317,39 +316,58 @@ async def upload_version(
         ))
         if not template:
             raise HTTPException(status_code=404, detail="Template not found.")
-
-        next_version = template["current_version"] + 1
-        safe_name = _safe_filename(file.filename)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp) / safe_name
-            with open(tmp_path, "wb") as f:
-                shutil.copyfileobj(file.file, f)
-
-            checksum = merge_engine.sha256_of(tmp_path)
-            size_bytes = tmp_path.stat().st_size
-            storage_path = f"{_PREFIX}/{institution_id}/{template_id}/v{next_version}/{safe_name}"
-            await _storage_upload(storage_path, tmp_path.read_bytes(), ALLOWED_DOCX_MIME)
-
-        row = _one_required(conn.execute(
-            text("""
-                INSERT INTO institution.doc_template_version
-                    (institution_id, template_id, version_no, file_name, storage_path,
-                     file_size_bytes, checksum_sha256, change_note, created_by)
-                VALUES
-                    (:iid, :tid, :vno, :fname, :spath, :size, :checksum, :note, :creator)
-                RETURNING *
-            """),
-            {
-                "iid": institution_id, "tid": str(template_id), "vno": next_version,
-                "fname": safe_name, "spath": storage_path, "size": size_bytes,
-                "checksum": checksum, "note": change_note, "creator": creator_id,
-            },
-        ))
-        _audit(conn, claims=claims, action="doc_template_version.uploaded",
-               resource_type="doc_template_version", resource_id=row["id"],
-               metadata={"version_no": next_version})
+        row = await store_version(
+            conn, claims=claims, institution_id=institution_id, template=template,
+            creator_id=creator_id, file_name=_safe_filename(file.filename),
+            data=file.file.read(), change_note=change_note,
+        )
         conn.commit()
+    return row
+
+
+def known_merge_fields() -> dict[str, str]:
+    return {f["key"]: f["example"] for f in MERGE_FIELDS}
+
+
+async def store_version(
+    conn: Session, *, claims: dict, institution_id: str, template: dict,
+    creator_id: str, file_name: str, data: bytes, change_note: str | None,
+) -> dict:
+    """Validate a .docx against the merge fields, store it, and record it as a
+    draft version awaiting a second admin. Raises 422 with a readable list of
+    problems instead of storing a template that would fail at generation."""
+    next_version = template["current_version"] + 1
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / file_name
+        tmp_path.write_bytes(data)
+
+        check = merge_engine.check_template(tmp_path, known_merge_fields())
+        if not check.ok:
+            raise HTTPException(status_code=422, detail=check.message())
+
+        checksum = merge_engine.sha256_of(tmp_path)
+        size_bytes = tmp_path.stat().st_size
+        storage_path = f"{_PREFIX}/{institution_id}/{template['id']}/v{next_version}/{file_name}"
+        await _storage_upload(storage_path, data, ALLOWED_DOCX_MIME)
+
+    row = _one_required(conn.execute(
+        text("""
+            INSERT INTO institution.doc_template_version
+                (institution_id, template_id, version_no, file_name, storage_path,
+                 file_size_bytes, checksum_sha256, change_note, created_by)
+            VALUES
+                (:iid, :tid, :vno, :fname, :spath, :size, :checksum, :note, :creator)
+            RETURNING *
+        """),
+        {
+            "iid": institution_id, "tid": str(template["id"]), "vno": next_version,
+            "fname": file_name, "spath": storage_path, "size": size_bytes,
+            "checksum": checksum, "note": change_note, "creator": creator_id,
+        },
+    ))
+    _audit(conn, claims=claims, action="doc_template_version.uploaded",
+           resource_type="doc_template_version", resource_id=row["id"],
+           metadata={"version_no": next_version, "merge_fields": check.used})
     return row
 
 
