@@ -223,3 +223,79 @@ def test_provision_replay_returns_the_same_result_and_creates_nothing_more() -> 
         again = call(c, "commands", body)
     assert first.status_code == again.status_code == 200 and first.json() == again.json()
     assert conn.created().count("INSERT INTO institution.institution") == 1
+
+
+# ── invite_admin: a first admin for an existing institution that has none ─────────
+
+class OrphanConn(FakeConn):
+    def __init__(self, has_admin: bool = False, email_taken: bool = False) -> None:
+        super().__init__()
+        self.has_admin, self.email_taken = has_admin, email_taken
+
+    def nsql(self) -> list[tuple[str, dict]]:
+        return [(" ".join(q.split()), p) for q, p in self.sql]
+
+    def execute(self, stmt: Any, params: dict | None = None) -> _Res:
+        q, p = " ".join(str(stmt).split()), params or {}
+        if "FROM institution.institution WHERE id" in q:
+            self.sql.append((q, p))
+            return _Res([SimpleNamespace(id=uuid.UUID(NEW_INST), name="MCB")])
+        if "FROM institution.member WHERE institution_id" in q:
+            self.sql.append((q, p))
+            return _Res([(1,)] if self.has_admin else [])
+        if "FROM auth_portal.auth_users WHERE lower(email)" in q:
+            self.sql.append((q, p))
+            return _Res([(1,)] if self.email_taken else [])
+        return super().execute(stmt, params)
+
+
+def invite(maker: str = MAKER, **over: Any) -> dict:
+    args = {"institution_id": NEW_INST, "email": "Ops@MCB.mu", "full_name": "MCB Ops",
+            "reason": "Restore access after the reset", **over}
+    return cmd("institution.invite_admin", args, maker=maker)
+
+
+def _inserts(conn: OrphanConn) -> list[str]:
+    return [q.split(" (")[0] for q, _ in conn.nsql()
+            if q.startswith("INSERT INTO")
+            and not any(s in q for s in ("audit.event", "admin_command_log"))]
+
+
+def test_invite_admin_is_four_eyes() -> None:
+    conn = OrphanConn()
+    with chan(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", invite(maker=CHECKER))
+    assert r.status_code == 403 and _inserts(conn) == []
+
+
+def test_invite_admin_creates_an_unusable_primary_admin_only_for_an_orphan() -> None:
+    conn = OrphanConn()
+    with chan(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", invite())
+    assert r.status_code == 200, r.text
+    assert _inserts(conn) == [
+        "INSERT INTO auth_portal.auth_users", "INSERT INTO institution.member",
+    ]
+    login = next(p for q, p in conn.nsql() if q.startswith("INSERT INTO auth_portal.auth_users"))
+    assert login["pw"] == "!invited-not-activated" and login["email"] == "ops@mcb.mu"
+    assert conn.actions() == ["institution.admin_invited"]
+    assert r.json()["data"]["admin_email"] == "ops@mcb.mu"
+
+
+@pytest.mark.parametrize("kw,code", [
+    ({"has_admin": True}, "has_admin"), ({"email_taken": True}, "email_in_use"),
+])
+def test_invite_admin_refuses_a_bank_with_an_admin_or_a_used_email(kw: dict, code: str) -> None:
+    conn = OrphanConn(**kw)
+    with chan(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", invite())
+    assert r.status_code == 409 and r.json()["error"] == code and _inserts(conn) == []
+
+
+@pytest.mark.parametrize("over", [{"institution_id": "00000000-0000-0000-0000-000000000001"},
+                                  {"email": "nope"}, {"full_name": "x"}, {"reason": "short"}])
+def test_invite_admin_validates(over: dict) -> None:
+    conn = OrphanConn()
+    with chan(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", invite(**over))
+    assert r.status_code == 422 and _inserts(conn) == []

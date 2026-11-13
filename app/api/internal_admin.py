@@ -10,7 +10,8 @@ endpoints here, both POST with a JSON body:
 Ops: compliance.overview, documents.list, document.download, institutions.list,
 entitlements.catalog, groups.list, audit.search, access_requests.list (queries);
 document.review, access_request.review (one person); waiver.grant, waiver.revoke,
-institution.approve, institution.suspend, entitlement.set, institution.provision (four-eyes).
+institution.approve, institution.suspend, entitlement.set, institution.provision,
+institution.invite_admin (four-eyes).
 
 Every call must pass BOTH checks, so neither a leaked signing key nor a stolen
 staff token is enough on its own:
@@ -32,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -59,7 +61,7 @@ FOUR_EYES_OPS = frozenset({
     "waiver.grant", "waiver.revoke",
     "institution.approve", "institution.suspend", "entitlement.set",
     "commission.set", "commission.end",
-    "institution.provision",
+    "institution.provision", "institution.invite_admin",
 })
 MAX_WAIVER_DAYS = 180
 
@@ -781,6 +783,64 @@ def _c_institution_provision(conn: Session, args: dict, ctx: dict) -> dict:
             "deployment_model": model, "onboarding_stage": "registered"}
 
 
+def _c_institution_invite_admin(conn: Session, args: dict, ctx: dict) -> dict:
+    """A first admin for an EXISTING institution that has none (e.g. after a data reset).
+
+    Only when no active primary admin exists, so staff can never add themselves to a
+    working bank. Same unusable login + ficium-auth invite as institution.provision.
+    """
+    iid = _uuid(args.get("institution_id"), "institution_id")
+    if iid == settings.platform_institution_id:
+        raise ChannelError(422, "invalid_field", "Ficium staff are invited from the Team page.")
+    email = str(args.get("email") or "").strip().lower()
+    if not (3 <= len(email) <= 254 and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)):
+        raise ChannelError(422, "invalid_field", "email is not valid")
+    name = str(args.get("full_name") or "").strip()
+    if not 2 <= len(name) <= 200:
+        raise ChannelError(422, "invalid_field", "full_name must be 2-200 characters")
+    reason = _reason(args.get("reason"))
+
+    inst = conn.execute(text("""
+        SELECT id, name FROM institution.institution WHERE id = CAST(:iid AS uuid) FOR UPDATE
+    """), {"iid": iid}).fetchone()
+    if inst is None:
+        raise ChannelError(404, "not_found", "Institution not found.")
+    if conn.execute(text("""
+        SELECT 1 FROM institution.member
+         WHERE institution_id = CAST(:iid AS uuid) AND is_primary_admin AND active
+           AND deactivated_at IS NULL LIMIT 1
+    """), {"iid": iid}).fetchone():
+        raise ChannelError(409, "has_admin",
+                           "This institution already has an active administrator; they invite their own users.")
+    if conn.execute(text("""
+        SELECT 1 FROM auth_portal.auth_users WHERE lower(email) = :e OR lower(username) = :e
+        UNION ALL SELECT 1 FROM institution.member WHERE lower(email) = :e LIMIT 1
+    """), {"e": email}).fetchone():
+        raise ChannelError(409, "email_in_use", "That email already has a portal account.")
+
+    login_id = str(uuid.uuid4())
+    conn.execute(text("""
+        INSERT INTO auth_portal.auth_users
+            (id, email, username, role, institution_id, password_hash, is_active,
+             email_verified, must_change_password, created_at, updated_at)
+        VALUES (CAST(:id AS uuid), :email, :email, 'institution_admin', CAST(:iid AS uuid),
+                :pw, true, false, false, now(), now())
+    """), {"id": login_id, "email": email, "iid": iid, "pw": UNUSABLE_PASSWORD})
+    conn.execute(text("""
+        INSERT INTO institution.member
+          (institution_id, auth_user_id, email, full_name, role, is_primary_admin, active,
+           group_id, invited_at)
+        VALUES (CAST(:iid AS uuid), CAST(:uid AS uuid), :email, :name, 'admin', true, true,
+                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
+                now())
+    """), {"iid": iid, "uid": login_id, "email": email, "name": name})
+    _audit(conn, ctx["checker"], "institution.admin_invited", "institution", iid, iid,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "admin_email": email,
+            "reason": reason})
+    return {"institution_id": iid, "institution_name": inst.name, "admin_email": email,
+            "admin_login_id": login_id}
+
+
 COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "document.review": _c_document_review,
     "waiver.grant": _c_waiver_grant,
@@ -792,6 +852,7 @@ COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "commission.end": _c_commission_end,
     "access_request.review": _c_access_request_review,
     "institution.provision": _c_institution_provision,
+    "institution.invite_admin": _c_institution_invite_admin,
 }
 
 
