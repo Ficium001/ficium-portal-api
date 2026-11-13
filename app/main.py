@@ -16,6 +16,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from . import maintenance
 from .api.acceptance import router as acceptance_router
+from .api.access_requests import router as access_requests_router
 from .api.admin import public_router as admin_public_router
 from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
@@ -40,6 +41,8 @@ from .api.internal_admin import router as internal_admin_router
 from .api.marketplace import router as marketplace_router
 from .api.members import router as members_router
 from .api.notifications import router as notifications_router
+from .api.offer_flow import router as offer_flow_router
+from .api.offer_setup import router as offer_setup_router
 from .api.onboarding import router as onboarding_router
 from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
@@ -203,5 +206,9 @@ app.include_router(acceptance_router)      # contract v1 acceptance call (own ke
 app.include_router(deal_document_uploads_router)  # contract 1.5 borrower uploads (OFF by default)
 app.include_router(controls_router)        # four-eyes switches (Setup > Controls)
 app.include_router(internal_admin_router)  # admin site channel: signed + staff MFA token, API only
-app.include_router(registration_router)    # self-registration, one identity system
+app.include_router(access_requests_router)  # institution applications (public, record only)
+# Legacy self-registration: OFF (404) unless SELF_REGISTRATION_ENABLED.
+app.include_router(registration_router)
+app.include_router(offer_flow_router)       # one-step send offer from a deal
+app.include_router(offer_setup_router)      # offer setup checklist + standard defaults
 app.include_router(onboarding_router)      # onboarding submit (documents + prefs + stage)

@@ -29,6 +29,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
+from ..core.config import settings
 from ..core.db import service_session
 from ..core.ratelimit import limiter
 
@@ -89,6 +90,11 @@ class RegisterBody(BaseModel):
 @router.post("/register", status_code=201)
 @limiter.limit("5/hour")
 async def register(request: Request, response: Response, body: RegisterBody) -> dict[str, Any]:
+    # KJ 2026-11-13: institutions apply (/access-requests) and are provisioned by two
+    # Ficium admins after the contract. Open self-registration is off unless an
+    # operator turns it on (SELF_REGISTRATION_ENABLED), e.g. briefly in a test env.
+    if not settings.self_registration_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
     problem = password_problem(body.password)
     if problem:
         raise HTTPException(status_code=422, detail=problem)
