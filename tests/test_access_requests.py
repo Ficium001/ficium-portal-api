@@ -174,3 +174,15 @@ def test_the_confirmation_link_points_at_the_public_site_when_configured() -> No
     with patch.object(settings, "public_site_url", "https://site.example/"):
         _, mail = _call(Svc(), "/access-requests", GOOD)
     assert "https://site.example/request-access/verify?token=" in mail.await_args.args[2]
+
+
+@pytest.mark.parametrize("path", ["/access-requests", "/access-requests/verify"])
+def test_the_public_endpoints_grant_no_browser_origin_of_their_own(path: str) -> None:
+    """The public site reaches these through its own same-origin proxy (vercel rewrite), so the
+    browser never calls this API cross-origin and no origin is allowed beyond the portal's."""
+    c = TestClient(app, raise_server_exceptions=False)
+    pre = c.options(path, headers={"Origin": "https://site.example",
+                                   "Access-Control-Request-Method": "POST"})
+    post = c.post(path, json={}, headers={"Origin": "https://site.example"})
+    assert "access-control-allow-origin" not in pre.headers
+    assert "access-control-allow-origin" not in post.headers

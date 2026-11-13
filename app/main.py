@@ -57,7 +57,6 @@ from .core.observability import (
     configure_logging,
     metrics_endpoint,
 )
-from .core.public_cors import PublicApplyCORS
 from .core.ratelimit import limiter
 from .core.response_headers import DefaultResponseHeadersMiddleware
 from .integration import dispatcher as integration_dispatcher
@@ -164,13 +163,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-)
-
-
-# Outermost: lets the public site call the two public application endpoints (and only those).
-app.add_middleware(
-    PublicApplyCORS,
-    origins=frozenset(o.strip() for o in settings.access_request_origins.split(",") if o.strip()),
 )
 
 
