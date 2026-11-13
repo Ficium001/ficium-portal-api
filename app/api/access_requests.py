@@ -227,7 +227,8 @@ async def submit(request: Request, response: Response, body: AccessRequestBody) 
             send_to = body.contact_email
 
     if send_to:
-        url = f"{settings.portal_public_url.rstrip('/')}/request-access/verify?token={raw}"
+        base = (settings.public_site_url or settings.portal_public_url).rstrip("/")
+        url = f"{base}/request-access/verify?token={raw}"
         try:
             await send_email(send_to, "Confirm your application to Ficium",
                              _confirm_email(body.institution_name, url))
