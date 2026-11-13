@@ -18,6 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api import access_requests as ar
+from app.core.config import settings
 from app.core.mail import EmailNotSent
 from app.core.ratelimit import limiter
 from app.main import app
@@ -90,7 +91,7 @@ def test_new_application_is_a_record_only_and_emails_a_hashed_link() -> None:
     token = _token_from(mail)
     assert ins["h"] == hashlib.sha256(token.encode()).hexdigest() and token not in str(ins)
     assert mail.await_args.args[0] == "ada@zzbank.mu"
-    assert "/request-access/verify?token=" in mail.await_args.args[2]
+    assert f"{settings.portal_public_url}/request-access/verify?token=" in mail.await_args.args[2]
 
 
 def test_honeypot_gets_the_same_answer_and_nothing_happens() -> None:
@@ -167,3 +168,9 @@ def test_a_wrong_or_used_link_is_refused() -> None:
     r, _ = _call(svc, "/access-requests/verify", {"token": "u" * 43})
     assert r.status_code == 400 and "expired" in r.json()["detail"]
     assert not any(q.startswith("INSERT INTO audit.event") for q, _ in svc.sql)
+
+
+def test_the_confirmation_link_points_at_the_public_site_when_configured() -> None:
+    with patch.object(settings, "public_site_url", "https://site.example/"):
+        _, mail = _call(Svc(), "/access-requests", GOOD)
+    assert "https://site.example/request-access/verify?token=" in mail.await_args.args[2]
