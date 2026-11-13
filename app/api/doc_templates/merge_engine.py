@@ -83,3 +83,79 @@ def resolve_context(entity_snapshot: dict[str, Any], overrides: dict[str, Any]) 
     ctx = dict(entity_snapshot)
     ctx.update(overrides or {})
     return ctx
+
+
+# ---------------------------------------------------------------------------
+# Upload-time validation
+# ---------------------------------------------------------------------------
+# A merge-tag typo used to surface only at generation time ("check the template
+# for typos"), after a second admin had already approved the version. Checking
+# at upload means the maker fixes it before it ever reaches the checker.
+
+class TemplateCheck:
+    def __init__(
+        self,
+        used: list[str],
+        unknown: list[tuple[str, str | None]],
+        error: str | None = None,
+    ) -> None:
+        self.used = used
+        self.unknown = unknown  # (tag as written, closest known field or None)
+        self.error = error
+
+    @property
+    def ok(self) -> bool:
+        return not self.unknown and self.error is None
+
+    def message(self) -> str:
+        if self.error:
+            return self.error
+        lines = ["This template can't be uploaded yet:"]
+        for tag, suggestion in self.unknown:
+            hint = f" — did you mean {{{{ {suggestion} }}}}?" if suggestion else ""
+            lines.append(f"• {{{{ {tag} }}}} is not a merge field{hint}")
+        lines.append(
+            "Fix these in Word and upload again. The merge-field list on this "
+            "page shows every field you can use."
+        )
+        return "\n".join(lines)
+
+
+def check_template(template_path: Path, known_fields: dict[str, str]) -> TemplateCheck:
+    """Check a .docx template's tags against the known merge fields, then
+    test-fill it with example values. Returns problems instead of raising."""
+    import difflib
+    import tempfile
+
+    from jinja2 import TemplateSyntaxError
+
+    try:
+        names = DocxTemplate(str(template_path)).get_undeclared_template_variables()
+    except TemplateSyntaxError as exc:
+        return TemplateCheck([], [], (
+            f"A merge tag in this Word file is broken ({exc.message}). "
+            "Write every tag exactly as {{ field_name }} and upload again."
+        ))
+    except Exception:  # noqa: BLE001 — not a readable .docx at all
+        return TemplateCheck([], [], (
+            "This file could not be read as a Word template. "
+            "Save it from Word as .docx and upload again."
+        ))
+
+    used = sorted(n for n in names if n in known_fields)
+    unknown = [
+        (n, next(iter(difflib.get_close_matches(n, list(known_fields), n=1, cutoff=0.6)), None))
+        for n in sorted(n for n in names if n not in known_fields)
+    ]
+    if unknown:
+        return TemplateCheck(used, unknown)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            render_docx(template_path, dict(known_fields), Path(tmp) / "check.docx")
+    except MergeError:
+        return TemplateCheck(used, [], (
+            "This template failed a test fill with example values. Check that "
+            "tags only use {{ field_name }} with no extra logic, then upload again."
+        ))
+    return TemplateCheck(used, [])

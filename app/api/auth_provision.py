@@ -23,6 +23,7 @@ from argon2.exceptions import HashingError
 from fastapi import APIRouter, Body, HTTPException
 from sqlalchemy import text
 
+from ..core.config import settings
 from ..core.db import service_session
 
 router = APIRouter(prefix="/auth", tags=["auth-provision"])
@@ -39,6 +40,9 @@ _hasher = PasswordHasher(
 
 @router.post("/provision-member")
 async def provision_member(body: dict = Body(...)) -> dict:
+    # Legacy step of the old self-registration flow: off with it (see registration.py).
+    if not settings.self_registration_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
     """
     Create a ficium-auth entry for a newly registered institution member.
 
