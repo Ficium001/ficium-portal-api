@@ -97,6 +97,17 @@ class Settings(BaseSettings):
     def admin_staff_role_set(self) -> frozenset[str]:
         return frozenset(r.strip().lower() for r in self.admin_staff_roles.split(",") if r.strip())
 
+    # ── Institution onboarding (KJ 2026-11-13: the portal is restrictive, SaaS-like).
+    #    An institution APPLIES (/access-requests); after the contract two Ficium admins
+    #    provision it (institution.provision, four-eyes). Open self-registration
+    #    (POST /auth/register, POST /auth/provision-member) is OFF: 404 unless an operator
+    #    explicitly turns it on, e.g. briefly in a test environment.
+    self_registration_enabled: bool = False
+    portal_public_url:          str = "https://ficium-portal.vercel.app"
+    access_request_verify_ttl:  int = 86400        # confirmation link, 24 h
+    # Optional: Ficium ops mailbox told when a confirmed application arrives. Empty = off.
+    access_request_notify_email: str = ""
+
     # ── Scheduled maintenance inside the API (replaces the GitHub cron, which had no secret and
     #    only ran every 3-4 h). OFF by default: turning it on is an operator decision.
     maintenance_close_expired_enabled: bool = False
