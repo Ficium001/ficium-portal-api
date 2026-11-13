@@ -187,6 +187,7 @@ class TestAuthBoundary:
         ("GET", "/marketplace/my-bids"),
         ("POST", "/marketplace/bids"),
         ("GET", "/marketplace/bids/00000000-0000-0000-0000-000000000000/reveal"),
+        ("POST", "/marketplace/bids/00000000-0000-0000-0000-000000000000/withdraw"),
         ("GET", "/marketplace/requests/message-templates"),
         ("GET", "/marketplace/requests/00000000-0000-0000-0000-000000000000/messages"),
         ("POST", "/marketplace/requests/00000000-0000-0000-0000-000000000000/messages"),

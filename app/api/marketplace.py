@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
@@ -139,6 +140,84 @@ async def get_bid(bid_id: str, conn: Session = Depends(tenant_conn)) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Bid not found.")
     return _row(row)
+
+# ── POST /marketplace/bids/{bid_id}/withdraw ─────────────────────────────────
+WITHDRAWABLE_BID_STATUSES = frozenset({"draft", "submitted", "under_review"})
+WITHDRAW_REASON_MAX = 500
+
+
+@router.post("/bids/{bid_id}/withdraw")
+async def withdraw_bid(
+    bid_id: str,
+    body: dict = Body(default={}),
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    Withdraw an offer this institution no longer stands behind.
+
+    Goes through governance as `bid.withdraw` (four-eyes on by default, switchable in Setup >
+    Controls), so with four-eyes on a second person approves before the borrower is told.
+    Only an unresolved bid can be withdrawn; the table trigger from db/061 enforces it again at
+    execution, so a bid accepted while its withdrawal waited for a checker stays accepted.
+    The borrower receives bid.withdrawn through the contract outbox (db/018 trigger).
+    """
+    if not claims.get("institution_id"):
+        raise HTTPException(status_code=403, detail="No institution context.")
+    try:
+        uuid.UUID(bid_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Bid not found.") from exc
+    reason = str(body.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="Give a reason for withdrawing this offer.")
+    if len(reason) > WITHDRAW_REASON_MAX:
+        raise HTTPException(status_code=422, detail=f"Reason too long (max {WITHDRAW_REASON_MAX} characters).")
+
+    # RLS-scoped: only this institution's own bids are visible.
+    bid = conn.execute(
+        text("SELECT status FROM marketplace.my_bids WHERE id = CAST(:id AS uuid)"), {"id": bid_id},
+    ).fetchone()
+    if bid is None:
+        raise HTTPException(status_code=404, detail="Bid not found.")
+    if bid.status not in WITHDRAWABLE_BID_STATUSES:
+        raise HTTPException(status_code=409, detail=f"This offer is {bid.status} and can no longer be withdrawn.")
+
+    pending = conn.execute(
+        text("""
+            SELECT 1 FROM governance.action
+             WHERE resource_id = CAST(:id AS uuid) AND category = 'bid.withdraw' AND status = 'pending'
+             LIMIT 1
+        """),
+        {"id": bid_id},
+    ).fetchone()
+    if pending is not None:
+        raise HTTPException(status_code=409, detail="A withdrawal of this offer is already waiting for approval.")
+
+    try:
+        row = conn.execute(
+            text("""
+                SELECT institution.submit_for_approval(
+                  'bid.withdraw', 'bid', CAST(:id AS uuid), CAST(:p AS jsonb)) AS id
+            """),
+            {"id": bid_id, "p": json.dumps({"bid_id": bid_id, "reason": reason})},
+        ).fetchone()
+    except DBAPIError as exc:
+        if "BID_NOT_WITHDRAWABLE" in str(getattr(exc, "orig", exc)):
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="This offer can no longer be withdrawn.") from exc
+        raise
+    if row is None or row.id is None:
+        raise HTTPException(status_code=500, detail="The withdrawal could not be recorded.")
+
+    # With four-eyes switched off, governance.submit has already executed it (single control, audited).
+    state = conn.execute(
+        text("SELECT status, control FROM governance.action WHERE id = :aid"), {"aid": row.id},
+    ).fetchone()
+    conn.commit()
+    executed = state is not None and state.control == "single" and state.status == "approved"
+    return {"action_id": str(row.id), "status": "withdrawn" if executed else "pending_approval"}
+
 
 @router.get("/bids/{bid_id}/reveal")
 async def get_bid_reveal(
