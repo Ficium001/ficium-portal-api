@@ -7,9 +7,19 @@ from contextlib import contextmanager
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _legacy_on() -> Any:
+    # Off by default since 2026-11-13 (see test_registration.py); these tests keep the
+    # legacy path honest for an operator who turns it on.
+    with patch.object(settings, "self_registration_enabled", True):
+        yield
 
 UID = "11111111-1111-1111-1111-111111111111"
 IID = "22222222-2222-2222-2222-222222222222"

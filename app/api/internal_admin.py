@@ -8,8 +8,10 @@ endpoints here, both POST with a JSON body:
     POST /internal/admin/v1/commands  changes; idempotent by command_id
 
 Ops: compliance.overview, documents.list, document.download, institutions.list,
-entitlements.catalog, groups.list, audit.search (queries); document.review (one person); waiver.grant,
-waiver.revoke, institution.approve, institution.suspend, entitlement.set (four-eyes).
+entitlements.catalog, groups.list, audit.search, access_requests.list (queries);
+document.review, access_request.review (one person); waiver.grant, waiver.revoke,
+institution.approve, institution.suspend, entitlement.set, institution.provision,
+institution.invite_admin (four-eyes).
 
 Every call must pass BOTH checks, so neither a leaked signing key nor a stolen
 staff token is enough on its own:
@@ -31,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -58,6 +61,7 @@ FOUR_EYES_OPS = frozenset({
     "waiver.grant", "waiver.revoke",
     "institution.approve", "institution.suspend", "entitlement.set",
     "commission.set", "commission.end",
+    "institution.provision", "institution.invite_admin",
 })
 MAX_WAIVER_DAYS = 180
 
@@ -314,10 +318,40 @@ def _q_products_list(conn: Session, args: dict, actor: str) -> list[dict]:
     return [dict(r._mapping) for r in rows]
 
 
+# Institution applications (db/060). Staff never see unconfirmed ones.
+ACCESS_VISIBLE = ("submitted", "in_review", "info_requested", "approved", "rejected", "provisioned")
+ACCESS_FILTERS = {
+    "open": ("submitted", "in_review", "info_requested", "approved"),
+    "closed": ("rejected", "provisioned"),
+    **{s: (s,) for s in ACCESS_VISIBLE},
+}
+
+
+def _q_access_requests_list(conn: Session, args: dict, actor: str) -> list[dict]:
+    which = args.get("status") or "open"
+    if which not in ACCESS_FILTERS:
+        raise ChannelError(422, "invalid_field", f"status must be one of {sorted(ACCESS_FILTERS)}")
+    rows = conn.execute(text("""
+        SELECT id AS request_id, reference, institution_name, institution_type, country,
+               reg_number, regulator, website, contact_name, contact_email, contact_phone,
+               contact_role, message, status, verified_at, reviewed_by, reviewed_at, review_note,
+               provisioned_by, provisioned_at, contract_reference, institution_id,
+               created_at, updated_at
+          FROM institution.access_request
+         WHERE status = ANY(CAST(:st AS text[]))
+         ORDER BY CASE status WHEN 'submitted' THEN 0 WHEN 'info_requested' THEN 1
+                              WHEN 'in_review' THEN 2 WHEN 'approved' THEN 3 ELSE 4 END,
+                  verified_at DESC NULLS LAST
+         LIMIT 300
+    """), {"st": list(ACCESS_FILTERS[which])}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
 SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "compliance.overview": _q_compliance_overview,
     "documents.list": _q_documents_list,
     "institutions.list": _q_institutions_list,
+    "access_requests.list": _q_access_requests_list,
     "entitlements.catalog": _q_entitlements_catalog,
     "groups.list": _q_groups_list,
     "audit.search": _q_audit_search,
@@ -618,6 +652,195 @@ def _c_commission_end(conn: Session, args: dict, ctx: dict) -> dict:
     return out
 
 
+# ── Institution applications and provisioning (db/060) ─────
+
+# Who may move an application where. One reviewer decides (the review is the check);
+# nothing is created until two admins provision it.
+REVIEW_TRANSITIONS: dict[str, frozenset[str]] = {
+    "submitted": frozenset({"in_review", "info_requested", "approved", "rejected"}),
+    "in_review": frozenset({"info_requested", "approved", "rejected"}),
+    "info_requested": frozenset({"in_review", "approved", "rejected"}),
+    "approved": frozenset({"in_review", "rejected"}),   # e.g. contract talks fell through
+}
+# Must equal ficium-auth's UNUSABLE marker (src/api/staff.py): never a valid Argon2
+# hash, so the login cannot sign in until the invitee sets a password from the link.
+UNUSABLE_PASSWORD = "!invited-not-activated"
+DEPLOYMENT_MODELS = frozenset({"saas", "paas", "on_prem"})
+
+
+def _access_request(conn: Session, rid: str) -> dict:
+    row = conn.execute(text("""
+        SELECT * FROM institution.access_request WHERE id = CAST(:id AS uuid) FOR UPDATE
+    """), {"id": rid}).fetchone()
+    if row is None:
+        raise ChannelError(404, "not_found", "Application not found.")
+    d = dict(row._mapping)
+    if d["status"] in ("unverified", "expired"):
+        raise ChannelError(404, "not_found", "Application not found.")
+    return d
+
+
+def _c_access_request_review(conn: Session, args: dict, ctx: dict) -> dict:
+    rid = _uuid(args.get("request_id"), "request_id")
+    to = args.get("status")
+    req = _access_request(conn, rid)
+    allowed = REVIEW_TRANSITIONS.get(req["status"], frozenset())
+    if to not in allowed:
+        raise ChannelError(409, "invalid_transition",
+                           f"An application that is {req['status']} cannot become {to}.")
+    note = _reason(args.get("note"), 10) if to in ("rejected", "info_requested") \
+        else (str(args.get("note") or "").strip()[:500] or None)
+    conn.execute(text("""
+        UPDATE institution.access_request
+           SET status = :to, reviewed_by = CAST(:by AS uuid), reviewed_at = now(),
+               review_note = :note, updated_at = now()
+         WHERE id = CAST(:id AS uuid)
+    """), {"to": to, "by": ctx["checker"], "note": note, "id": rid})
+    _audit(conn, ctx["checker"], f"access_request.{to}", "access_request", rid, None,
+           {"command_id": ctx["command_id"], "from": req["status"], "note": note,
+            "reference": req["reference"]})
+    return {"request_id": rid, "reference": req["reference"], "status": to, "review_note": note}
+
+
+def _c_institution_provision(conn: Session, args: dict, ctx: dict) -> dict:
+    rid = _uuid(args.get("request_id"), "request_id")
+    contract = str(args.get("contract_reference") or "").strip()
+    if not 3 <= len(contract) <= 100:
+        raise ChannelError(422, "invalid_field", "contract_reference must be 3-100 characters")
+    model = args.get("deployment_model") or "saas"
+    if model not in DEPLOYMENT_MODELS:
+        raise ChannelError(422, "invalid_field", f"deployment_model must be one of {sorted(DEPLOYMENT_MODELS)}")
+
+    req = _access_request(conn, rid)
+    if req["status"] != "approved":
+        raise ChannelError(409, "not_approved", "Only an approved application can be provisioned.")
+    email = req["contact_email"].strip().lower()
+
+    if conn.execute(text("""
+        SELECT 1 FROM auth_portal.auth_users WHERE lower(email) = :e OR lower(username) = :e
+        UNION ALL SELECT 1 FROM institution.member WHERE lower(email) = :e LIMIT 1
+    """), {"e": email}).fetchone():
+        raise ChannelError(409, "email_in_use", "That contact email already has a portal account.")
+    if conn.execute(text("""
+        SELECT 1 FROM institution.institution
+         WHERE lower(name) = lower(:n)
+            OR (CAST(:reg AS text) IS NOT NULL AND lower(reg_number) = lower(:reg) AND country = :c)
+         LIMIT 1
+    """), {"n": req["institution_name"], "reg": req["reg_number"], "c": req["country"]}).fetchone():
+        raise ChannelError(409, "institution_exists", "An institution with this name or registration already exists.")
+
+    inst = conn.execute(text("""
+        INSERT INTO institution.institution
+          (name, legal_name, institution_type, country, reg_number, regulator, website,
+           deployment_model, modules, onboarding_stage, compliance_status, approved,
+           primary_contact_email, primary_contact_name, primary_contact_phone, metadata)
+        VALUES
+          (:name, :name, :type, :country, :reg, :regulator, :website,
+           :model, '["marketplace"]'::jsonb, 'registered', 'not_submitted', false,
+           :email, :cname, :phone, CAST(:meta AS jsonb))
+        RETURNING id
+    """), {"name": req["institution_name"], "type": req["institution_type"],
+           "country": req["country"], "reg": req["reg_number"], "regulator": req["regulator"],
+           "website": req["website"], "model": model, "email": email,
+           "cname": req["contact_name"], "phone": req["contact_phone"],
+           "meta": json.dumps({"access_request_id": rid, "access_reference": req["reference"],
+                               "contract_reference": contract, "provisioned_by": ctx["checker"],
+                               "requested_by": ctx["maker"]})}).fetchone()
+    if inst is None:
+        raise ChannelError(500, "provision_failed", "The institution could not be created.")
+    iid = str(inst.id)
+    login_id = str(uuid.uuid4())
+    conn.execute(text("""
+        INSERT INTO auth_portal.auth_users
+            (id, email, username, role, institution_id, password_hash, is_active,
+             email_verified, must_change_password, created_at, updated_at)
+        VALUES (CAST(:id AS uuid), :email, :email, 'institution_admin', CAST(:iid AS uuid),
+                :pw, true, false, false, now(), now())
+    """), {"id": login_id, "email": email, "iid": iid, "pw": UNUSABLE_PASSWORD})
+    conn.execute(text("""
+        INSERT INTO institution.member
+          (institution_id, auth_user_id, email, full_name, role, is_primary_admin, active,
+           group_id, invited_at)
+        VALUES (CAST(:iid AS uuid), CAST(:uid AS uuid), :email, :name, 'admin', true, true,
+                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
+                now())
+    """), {"iid": iid, "uid": login_id, "email": email, "name": req["contact_name"]})
+    conn.execute(text("""
+        UPDATE institution.access_request
+           SET status = 'provisioned', provisioned_by = CAST(:by AS uuid), provisioned_at = now(),
+               contract_reference = :contract, institution_id = CAST(:iid AS uuid),
+               updated_at = now()
+         WHERE id = CAST(:id AS uuid)
+    """), {"by": ctx["checker"], "contract": contract, "iid": iid, "id": rid})
+
+    meta = {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "reference": req["reference"],
+            "contract_reference": contract, "deployment_model": model, "admin_email": email}
+    _audit(conn, ctx["checker"], "institution.provisioned", "institution", iid, iid,
+           {**meta, "access_request_id": rid})
+    _audit(conn, ctx["checker"], "access_request.provisioned", "access_request", rid, iid, meta)
+    return {"institution_id": iid, "institution_name": req["institution_name"],
+            "admin_email": email, "admin_login_id": login_id, "reference": req["reference"],
+            "deployment_model": model, "onboarding_stage": "registered"}
+
+
+def _c_institution_invite_admin(conn: Session, args: dict, ctx: dict) -> dict:
+    """A first admin for an EXISTING institution that has none (e.g. after a data reset).
+
+    Only when no active primary admin exists, so staff can never add themselves to a
+    working bank. Same unusable login + ficium-auth invite as institution.provision.
+    """
+    iid = _uuid(args.get("institution_id"), "institution_id")
+    if iid == settings.platform_institution_id:
+        raise ChannelError(422, "invalid_field", "Ficium staff are invited from the Team page.")
+    email = str(args.get("email") or "").strip().lower()
+    if not (3 <= len(email) <= 254 and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)):
+        raise ChannelError(422, "invalid_field", "email is not valid")
+    name = str(args.get("full_name") or "").strip()
+    if not 2 <= len(name) <= 200:
+        raise ChannelError(422, "invalid_field", "full_name must be 2-200 characters")
+    reason = _reason(args.get("reason"))
+
+    inst = conn.execute(text("""
+        SELECT id, name FROM institution.institution WHERE id = CAST(:iid AS uuid) FOR UPDATE
+    """), {"iid": iid}).fetchone()
+    if inst is None:
+        raise ChannelError(404, "not_found", "Institution not found.")
+    if conn.execute(text("""
+        SELECT 1 FROM institution.member
+         WHERE institution_id = CAST(:iid AS uuid) AND is_primary_admin AND active
+           AND deactivated_at IS NULL LIMIT 1
+    """), {"iid": iid}).fetchone():
+        raise ChannelError(409, "has_admin",
+                           "This institution already has an active administrator; they invite their own users.")
+    if conn.execute(text("""
+        SELECT 1 FROM auth_portal.auth_users WHERE lower(email) = :e OR lower(username) = :e
+        UNION ALL SELECT 1 FROM institution.member WHERE lower(email) = :e LIMIT 1
+    """), {"e": email}).fetchone():
+        raise ChannelError(409, "email_in_use", "That email already has a portal account.")
+
+    login_id = str(uuid.uuid4())
+    conn.execute(text("""
+        INSERT INTO auth_portal.auth_users
+            (id, email, username, role, institution_id, password_hash, is_active,
+             email_verified, must_change_password, created_at, updated_at)
+        VALUES (CAST(:id AS uuid), :email, :email, 'institution_admin', CAST(:iid AS uuid),
+                :pw, true, false, false, now(), now())
+    """), {"id": login_id, "email": email, "iid": iid, "pw": UNUSABLE_PASSWORD})
+    conn.execute(text("""
+        INSERT INTO institution.member
+          (institution_id, auth_user_id, email, full_name, role, is_primary_admin, active,
+           group_id, invited_at)
+        VALUES (CAST(:iid AS uuid), CAST(:uid AS uuid), :email, :name, 'admin', true, true,
+                (SELECT id FROM portal_admin.user_groups WHERE slug = 'institution_admin' LIMIT 1),
+                now())
+    """), {"iid": iid, "uid": login_id, "email": email, "name": name})
+    _audit(conn, ctx["checker"], "institution.admin_invited", "institution", iid, iid,
+           {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "admin_email": email,
+            "reason": reason})
+    return {"institution_id": iid, "institution_name": inst.name, "admin_email": email,
+            "admin_login_id": login_id}
+
+
 COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "document.review": _c_document_review,
     "waiver.grant": _c_waiver_grant,
@@ -627,6 +850,9 @@ COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "entitlement.set": _c_entitlement_set,
     "commission.set": _c_commission_set,
     "commission.end": _c_commission_end,
+    "access_request.review": _c_access_request_review,
+    "institution.provision": _c_institution_provision,
+    "institution.invite_admin": _c_institution_invite_admin,
 }
 
 

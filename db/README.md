@@ -99,6 +99,7 @@ The table below is history; the ledger is the source of truth.
 | `057_revoke_deal_guard_execute.sql` | Revoke EXECUTE on 056's `guard_bid_deal_template()` from public/anon/authenticated (053 rule, caught by CI) | Yes | ✅ (applied Oct 31 2026) |
 | `058_commission_schedule.sql` | Configurable commission: `billing.commission_rule` (scope bank/product/both/default, rate, effective date, never edited, a new rule closes the open one), `commission_for()` resolver (most specific wins), set/end functions used only by the admin channel (four-eyes), default seeded at the old 0.5%, `record_loan_booking()` charges the rule in force on the booking date and stores `rule_id` | Yes | ✅ (applied Nov 1 2026) |
 | `059_expire_bids_on_request_end.sql` | Reconcile R7: when a request ends without acceptance (expired/cancelled/withdrawn, from either the portal sweep or the App sync), its unresolved bids expire, which sends `bid.withdrawn` through the contract. `closed` stays live (borrower still choosing). Backfills the 2 stranded bids; self-verifies; EXECUTE revoked (053 rule) | Yes | ✅ (applied Nov 5 2026) |
+| `060_institution_access_request.sql` | `institution.access_request`: an institution APPLIES (record only, email-confirmed); staff review on the admin site; two admins provision it after the contract (`institution.provision`). No API-role privileges | Yes | ✅ (applied Nov 13 2026) |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a

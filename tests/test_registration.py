@@ -1,6 +1,10 @@
 """POST /auth/register: one server-side transaction creates the institution
 (unapproved), the ficium-auth login and the primary-admin member, or nothing.
-No Supabase Auth, no browser writes to the database."""
+No Supabase Auth, no browser writes to the database.
+
+Since 2026-11-13 the endpoint is OFF by default (institutions apply instead, see
+test_access_requests.py). These tests switch it on to keep the legacy path honest
+for an operator who enables it, and check that off really means off."""
 from __future__ import annotations
 
 import uuid
@@ -12,6 +16,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.ratelimit import limiter
 from app.main import app
 
@@ -45,7 +50,8 @@ class Svc:
 @pytest.fixture(autouse=True)
 def _reset_limits() -> Any:
     limiter.reset()
-    yield
+    with patch.object(settings, "self_registration_enabled", True):
+        yield
     limiter.reset()
 
 
@@ -102,3 +108,13 @@ def test_existing_email_gets_a_generic_refusal_and_no_writes() -> None:
 def test_rate_limited_per_ip() -> None:
     codes = [_post(Svc(), {**GOOD, "email": f"u{i}@zz.mu"}).status_code for i in range(6)]
     assert codes[:5] == [201] * 5 and codes[5] == 429
+
+
+def test_self_registration_is_off_by_default_and_writes_nothing() -> None:
+    svc = Svc()
+    with patch.object(settings, "self_registration_enabled", False):
+        r = _post(svc, GOOD)
+        legacy = TestClient(app, raise_server_exceptions=False).post(
+            "/auth/provision-member", json={"user_id": str(uuid.uuid4())})
+    assert r.status_code == 404 and svc.sql == []
+    assert legacy.status_code == 404
