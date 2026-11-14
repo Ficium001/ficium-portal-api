@@ -35,13 +35,14 @@ from typing import Any
 
 import httpx
 import structlog
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
 from ..core import offer_gate
 from ..core.config import settings
 from ..core.db import service_session
+from ..core.ratelimit import limiter
 from ..core.storage import storage_download as _storage_download
 from ..core.storage import storage_signed_url as _storage_signed_url
 from ..core.storage import storage_upload as _storage_upload
@@ -75,6 +76,10 @@ router = APIRouter(prefix="/esign", tags=["esign"])
 MODULE_KEY = "inst:esign"
 OTP_TTL_MIN = 10
 OTP_MAX_ATTEMPTS = 5
+# Each new code resets the per-code attempts, so codes themselves are capped per signer: without
+# this, anyone holding a signing link could request codes forever (5 guesses each) and flood the
+# signer's inbox. 5 codes an hour = at most 25 guesses an hour against a 1-in-a-million code.
+OTP_MAX_SENDS_PER_HOUR = 5
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -373,10 +378,19 @@ async def ceremony_state(
 
 
 @router.post("/public/{token}/otp")
-async def request_otp(token: str, conn: Session = Depends(service_conn)) -> dict:
+@limiter.limit("10/hour")
+async def request_otp(
+    token: str, request: Request, response: Response, conn: Session = Depends(service_conn),
+) -> dict:
     s = _live_signer(conn, token)
     if s.status == "signed":
         raise HTTPException(status_code=409, detail="Already signed.")
+    sent = conn.execute(text("""
+        SELECT count(*) AS n FROM institution.esign_event
+         WHERE signer_id = :s AND event = 'otp_sent' AND created_at > now() - interval '1 hour'
+    """), {"s": s.id}).fetchone()
+    if sent is not None and int(sent.n) >= OTP_MAX_SENDS_PER_HOUR:
+        raise HTTPException(status_code=429, detail="Too many codes requested. Try again in an hour.")
     otp = f"{secrets.randbelow(1_000_000):06d}"
     conn.execute(text("""
         UPDATE institution.esign_signer
@@ -400,8 +414,9 @@ async def request_otp(token: str, conn: Session = Depends(service_conn)) -> dict
 
 
 @router.post("/public/{token}/otp/verify")
+@limiter.limit("30/hour")
 async def verify_otp(
-    token: str, request: Request,
+    token: str, request: Request, response: Response,
     body: dict = Body(...), conn: Session = Depends(service_conn),
 ) -> dict:
     s = _live_signer(conn, token)

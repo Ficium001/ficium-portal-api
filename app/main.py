@@ -22,7 +22,6 @@ from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
 from .api.approval_engine import router as approval_engine_router
 from .api.approvals import router as approvals_router
-from .api.auth_provision import router as auth_provision_router
 from .api.autobid import router as autobid_router
 from .api.benefits import router as benefits_router
 from .api.booking import router as booking_router
@@ -48,7 +47,6 @@ from .api.pipeline import router as pipeline_router
 from .api.pipeline_templates import router as pipeline_templates_router
 from .api.portal_badges import router as portal_badges_router
 from .api.product_limits import router as product_limits_router
-from .api.registration import router as registration_router
 from .api.request_chat import router as request_chat_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
@@ -180,7 +178,6 @@ app.include_router(institutions_router)
 app.include_router(members_router)
 app.include_router(approvals_router)
 app.include_router(approval_engine_router)  # configurable chains (inst:approvals)
-app.include_router(auth_provision_router)
 app.include_router(groups_router)
 app.include_router(marketplace_router)
 app.include_router(request_chat_router)  # per-lender request chat (proxies App DB)
@@ -207,8 +204,8 @@ app.include_router(deal_document_uploads_router)  # contract 1.5 borrower upload
 app.include_router(controls_router)        # four-eyes switches (Setup > Controls)
 app.include_router(internal_admin_router)  # admin site channel: signed + staff MFA token, API only
 app.include_router(access_requests_router)  # institution applications (public, record only)
-# Legacy self-registration: OFF (404) unless SELF_REGISTRATION_ENABLED.
-app.include_router(registration_router)
+# Open self-registration (/auth/register, /auth/provision-member) was removed on 2026-11-14:
+# institutions apply via /access-requests and are provisioned by two admins.
 app.include_router(offer_flow_router)       # one-step send offer from a deal
 app.include_router(offer_setup_router)      # offer setup checklist + standard defaults
 app.include_router(onboarding_router)      # onboarding submit (documents + prefs + stage)

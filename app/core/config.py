@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     jwks_cache_ttl:  int = 3600
 
     # ── Server-to-server ──────────────────────────────────────
-    # Shared secret for calls from the ficium client-app Vercel backend.
-    # Set APP_SERVICE_SECRET to the same value in both services.
+    # No secret is shared with the borrower app. The two sides talk only through the
+    # integration contract below, each direction signed with its own key.
 
     # ── Integration contract v1 (ficium-integration) ─────────────
     # Inbound: borrower -> institution events, verified with B2I keys.
@@ -99,10 +99,8 @@ class Settings(BaseSettings):
 
     # ── Institution onboarding (KJ 2026-11-13: the portal is restrictive, SaaS-like).
     #    An institution APPLIES (/access-requests); after the contract two Ficium admins
-    #    provision it (institution.provision, four-eyes). Open self-registration
-    #    (POST /auth/register, POST /auth/provision-member) is OFF: 404 unless an operator
-    #    explicitly turns it on, e.g. briefly in a test environment.
-    self_registration_enabled: bool = False
+    #    provision it (institution.provision, four-eyes). There is no self-registration:
+    #    /auth/register and /auth/provision-member were removed on 2026-11-14.
     # Where the PUBLIC application form and its confirmation page live: the borrower site, not
     # the portal (the portal is restrictive: sign-in for provisioned users only). Environment,
     # never code: this service never hard-codes the borrower app's address
