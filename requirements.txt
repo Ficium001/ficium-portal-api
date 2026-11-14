@@ -1,9 +1,9 @@
-fastapi==0.162.0
+fastapi==0.162.4
 uvicorn[standard]==0.54.0
 psycopg2-binary==2.9.13
 sqlalchemy[asyncio]==2.0.57
 asyncpg==0.32.0
-pydantic==2.14.2
+pydantic==2.14.3
 pydantic-settings==2.16.2
 PyJWT[crypto]==2.15.1  # replaces python-jose (unmaintained; PYSEC-2026-4298)
 httpx==0.28.1
