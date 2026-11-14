@@ -311,6 +311,59 @@ def _q_commission_rules(conn: Session, args: dict, actor: str) -> list[dict]:
     return [dict(r._mapping) for r in rows]
 
 
+_MONTH = re.compile(r"^(20[2-9][0-9])-(0[1-9]|1[0-2])$")
+
+
+def _q_commission_statement(conn: Session, args: dict, actor: str) -> dict:
+    """One institution's commission for one calendar month (Mauritius time), line by line.
+
+    Read-only: the amounts are exactly what each booking recorded (db/025, db/058), so a
+    statement re-run later shows the same lines. A line's month is the month it was booked.
+    """
+    iid = args.get("institution_id")
+    month = str(args.get("month") or "")
+    try:
+        iid = str(uuid.UUID(str(iid)))
+    except (ValueError, TypeError) as e:
+        raise ChannelError(422, "invalid_field", "institution_id must be a uuid") from e
+    if not _MONTH.match(month):
+        raise ChannelError(422, "invalid_field", "month must be YYYY-MM")
+    inst = conn.execute(text(
+        "SELECT id, name, reg_number, country FROM institution.institution WHERE id = CAST(:i AS uuid)"
+    ), {"i": iid}).fetchone()
+    if inst is None:
+        raise ChannelError(404, "not_found", "institution not found")
+    rows = conn.execute(text("""
+        SELECT e.id AS commission_id, e.pipeline_id, e.request_id,
+               (e.created_at AT TIME ZONE 'Indian/Mauritius')::date AS booked_on,
+               p.code AS product_code, p.label AS product_name,
+               e.deal_amount, e.commission_rate, e.commission_amt, e.currency,
+               e.status, e.invoice_ref, e.invoiced_at, e.paid_at
+          FROM portal_admin.commission_event e
+          LEFT JOIN marketplace.request r ON r.id = e.request_id
+          LEFT JOIN catalog.product p ON p.id = r.product_id
+         WHERE e.institution_id = CAST(:i AS uuid)
+           AND e.created_at >= (CAST(:m || '-01' AS date)::timestamp AT TIME ZONE 'Indian/Mauritius')
+           AND e.created_at <  ((CAST(:m || '-01' AS date) + interval '1 month')::timestamp
+                                AT TIME ZONE 'Indian/Mauritius')
+         ORDER BY e.created_at, e.id
+         LIMIT 5000
+    """), {"i": iid, "m": month}).fetchall()
+    lines = [dict(r._mapping) for r in rows]
+    by_status: dict[str, Decimal] = {}
+    total = Decimal("0")
+    for ln in lines:
+        amt = Decimal(str(ln["commission_amt"] or 0))
+        total += amt
+        by_status[ln["status"]] = by_status.get(ln["status"], Decimal("0")) + amt
+    currencies = sorted({ln["currency"] for ln in lines if ln["currency"]})
+    return {
+        "institution": dict(inst._mapping), "month": month, "lines": lines,
+        "totals": {"deals": len(lines), "commission": total, "by_status": by_status,
+                   "currencies": currencies or ["MUR"]},
+    }
+
+
 def _q_products_list(conn: Session, args: dict, actor: str) -> list[dict]:
     rows = conn.execute(text(
         "SELECT code AS product_code, label AS name FROM catalog.product ORDER BY label"
@@ -356,6 +409,7 @@ SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "groups.list": _q_groups_list,
     "audit.search": _q_audit_search,
     "commission.rules": _q_commission_rules,
+    "commission.statement": _q_commission_statement,
     "products.list": _q_products_list,
 }
 
