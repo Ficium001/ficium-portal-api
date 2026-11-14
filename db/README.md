@@ -101,6 +101,7 @@ The table below is history; the ledger is the source of truth.
 | `059_expire_bids_on_request_end.sql` | Reconcile R7: when a request ends without acceptance (expired/cancelled/withdrawn, from either the portal sweep or the App sync), its unresolved bids expire, which sends `bid.withdrawn` through the contract. `closed` stays live (borrower still choosing). Backfills the 2 stranded bids; self-verifies; EXECUTE revoked (053 rule) | Yes | ✅ (applied Nov 5 2026) |
 | `060_institution_access_request.sql` | `institution.access_request`: an institution APPLIES (record only, email-confirmed); staff review on the admin site; two admins provision it after the contract (`institution.provision`). No API-role privileges | Yes | ✅ (applied Nov 13 2026) |
 | `061_bid_withdraw_guard.sql` | A bid can only be withdrawn while unresolved (draft/submitted/under_review): table trigger, so an approval of `bid.withdraw` fails cleanly if the borrower accepted meanwhile. Reason capped at 500 chars. Reached by `POST /marketplace/bids/{id}/withdraw` (governance, four-eyes switchable). | Yes |
+| `062_security_advisor_hardening.sql` | Fixed `search_path` on the 32 functions the Supabase advisor flagged (incl. definer functions `institution._execute_action`, `submit_for_approval`, `audit.log`, the dual-control functions); `bid_benefit` insert policy limited to the owner role. | Yes |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
