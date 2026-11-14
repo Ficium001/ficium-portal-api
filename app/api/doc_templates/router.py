@@ -16,6 +16,7 @@
 # =============================================================================
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 from datetime import date
@@ -369,6 +370,37 @@ async def store_version(
            resource_type="doc_template_version", resource_id=row["id"],
            metadata={"version_no": next_version, "merge_fields": check.used})
     return row
+
+
+@router.get("/{template_id}/versions/{version_id}/download")
+async def download_version(
+    template_id: UUID,
+    version_id: UUID,
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+):
+    """The uploaded Word file of one version, so a checker reads it before approving it.
+
+    Served only if it still matches the checksum recorded at upload: the approver opens
+    exactly the document that will be published, or gets an error.
+    """
+    row = _one(conn.execute(
+        text("""SELECT file_name, storage_path, checksum_sha256 FROM institution.doc_template_version
+                 WHERE id = :vid AND template_id = :tid AND institution_id = :iid"""),
+        {"vid": str(version_id), "tid": str(template_id), "iid": _institution_id(claims)},
+    ))
+    if not row:
+        raise HTTPException(status_code=404, detail="Version not found.")
+    data = await _storage_download(row["storage_path"])
+    if row["checksum_sha256"] and hashlib.sha256(data).hexdigest() != row["checksum_sha256"]:
+        raise HTTPException(status_code=409, detail=(
+            "This file no longer matches what was uploaded. Do not approve it; reject it and upload again."))
+    _audit(conn, claims=claims, action="doc_template_version.downloaded",
+           resource_type="doc_template_version", resource_id=str(version_id), metadata={})
+    conn.commit()
+    return Response(content=data, media_type=ALLOWED_DOCX_MIME,
+                    headers={"Content-Disposition": f'attachment; filename="{Path(row["file_name"]).name}"',
+                             "Cache-Control": "no-store"})
 
 
 @router.post("/{template_id}/versions/{version_id}/decide", response_model=VersionOut)

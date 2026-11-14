@@ -142,7 +142,7 @@ _ROW_COLUMNS = """
     category          AS action_category,
     {status}          AS action_status,
     scope, label, risk, institution_id, maker_id, maker_role,
-    resource_type, resource_id, resource_label, payload, payload_before,
+    resource_type, resource_id, resource_label, payload, payload_before, change,
     checker_id, checker_role, checker_note, checked_at,
     execution_status, executed_at, execution_error, expires_at,
     created_at        AS initiated_at,
@@ -375,6 +375,13 @@ async def approve_action(
             {"aid": action_id, "note": body.get("note")},
         ).fetchone()
     except Exception as e:
+        msg = str(getattr(e, "orig", e))
+        if "CHANGED_SINCE_REQUEST" in msg:
+            # db/063: the record no longer matches what the maker saw, so approving would
+            # authorise something nobody asked for.
+            raise HTTPException(status_code=409, detail=(
+                "This record changed after the request was made, so it is no longer what was "
+                "asked for. Reject it and ask for the change again.")) from e
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"result": result.res if result else None}
 
