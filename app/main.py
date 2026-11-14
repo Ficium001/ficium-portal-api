@@ -17,8 +17,6 @@ from slowapi.middleware import SlowAPIMiddleware
 from . import maintenance
 from .api.acceptance import router as acceptance_router
 from .api.access_requests import router as access_requests_router
-from .api.admin import public_router as admin_public_router
-from .api.admin import router as admin_router
 from .api.api_keys import router as api_keys_router
 from .api.approval_engine import router as approval_engine_router
 from .api.approvals import router as approvals_router
@@ -172,8 +170,8 @@ async def health() -> dict:
 
 
 app.add_route("/metrics", metrics_endpoint, methods=["GET"], include_in_schema=False)
-app.include_router(admin_router)
-app.include_router(admin_public_router)
+# The old single-actor platform admin (/admin/*) was removed on 2026-11-14: staff use the admin
+# sites, which reach this API only through /internal/admin/v1 (signed, staff MFA, four-eyes).
 app.include_router(institutions_router)
 app.include_router(members_router)
 app.include_router(approvals_router)

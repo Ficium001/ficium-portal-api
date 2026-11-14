@@ -102,6 +102,7 @@ The table below is history; the ledger is the source of truth.
 | `060_institution_access_request.sql` | `institution.access_request`: an institution APPLIES (record only, email-confirmed); staff review on the admin site; two admins provision it after the contract (`institution.provision`). No API-role privileges | Yes | ✅ (applied Nov 13 2026) |
 | `061_bid_withdraw_guard.sql` | A bid can only be withdrawn while unresolved (draft/submitted/under_review): table trigger, so an approval of `bid.withdraw` fails cleanly if the borrower accepted meanwhile. Reason capped at 500 chars. Reached by `POST /marketplace/bids/{id}/withdraw` (governance, four-eyes switchable). | Yes |
 | `062_security_advisor_hardening.sql` | Fixed `search_path` on the 32 functions the Supabase advisor flagged (incl. definer functions `institution._execute_action`, `submit_for_approval`, `audit.log`, the dual-control functions); `bid_benefit` insert policy limited to the owner role. | Yes |
+| `063_four_eyes_show_the_change.sql` | Four-eyes requests carry a readable before → after table frozen at submission (`governance.describe_change`, column `change`, plus `payload_before`/`resource_label`); `approve_action` refuses when the record changed since the request (`CHANGED_SINCE_REQUEST`). Pending requests backfilled. | Yes |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a

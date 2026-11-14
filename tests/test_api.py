@@ -192,9 +192,6 @@ class TestAuthBoundary:
         ("GET", "/marketplace/requests/00000000-0000-0000-0000-000000000000/messages"),
         ("POST", "/marketplace/requests/00000000-0000-0000-0000-000000000000/messages"),
         ("GET", "/approvals/pending"),
-        ("GET", "/admin/me"),
-        ("GET", "/admin/metrics"),
-        ("GET", "/admin/institutions"),
         ("GET", "/products"),
         ("GET", "/webhooks"),
     ]
@@ -295,8 +292,7 @@ class TestMembersEndpoints:
         app.dependency_overrides[current_claims] = _claims_override(claims)
         app.dependency_overrides[tenant_conn] = _conn_override()
         try:
-            with patch("app.api.admin.service_session", side_effect=_mock_service_session):
-                r = TestClient(app, raise_server_exceptions=False).get("/members/my-group")
+            r = TestClient(app, raise_server_exceptions=False).get("/members/my-group")
             assert r.status_code == 200
         finally:
             app.dependency_overrides.clear()
@@ -443,48 +439,6 @@ class TestApprovalsEndpoints:
 
 
 # ===========================================================================
-# Admin endpoints
-# ===========================================================================
-class TestAdminEndpoints:
-    def _admin_patch(self):
-        """Patch service_session at the admin module level."""
-        return patch("app.api.admin.service_session", side_effect=_mock_service_session)
-
-    def test_admin_me_returns_200_with_null(self, admin_client):
-        """/admin/me returns null when no admin row in mock DB."""
-        with self._admin_patch():
-            r = admin_client.get("/admin/me")
-        assert r.status_code == 200
-        assert r.json() is None or isinstance(r.json(), dict)
-
-    def test_admin_me_institution_user_returns_200(self, auth_client):
-        """/admin/me returns null (not 403) for non-admin — endpoint is permissive."""
-        with self._admin_patch():
-            r = auth_client.get("/admin/me")
-        assert r.status_code == 200
-
-    def test_admin_metrics_institution_user_returns_403(self, auth_client):
-        """institution_admin has no admin_users row → _require_admin raises 403."""
-        with self._admin_patch():
-            r = auth_client.get("/admin/metrics")
-        assert r.status_code == 403
-
-    def test_admin_institutions_institution_user_returns_403(self, auth_client):
-        with self._admin_patch():
-            r = auth_client.get("/admin/institutions")
-        assert r.status_code == 403
-
-    def test_admin_users_institution_user_returns_403(self, auth_client):
-        with self._admin_patch():
-            r = auth_client.get("/admin/users")
-        assert r.status_code == 403
-
-    def test_admin_roles_institution_user_returns_403(self, auth_client):
-        with self._admin_patch():
-            r = auth_client.get("/admin/roles")
-        assert r.status_code == 403
-
-
 # ===========================================================================
 # Catalog endpoints (no prefix — /products, /webhooks, /audit)
 # ===========================================================================
@@ -733,11 +687,3 @@ class TestApprovalVotingVsConfiguration:
             assert client.get("/approval-engine/templates").status_code == 403
         finally:
             app.dependency_overrides.clear()
-
-
-@pytest.fixture(autouse=True)
-def _legacy_admin_on(monkeypatch):
-    """These tests cover the retired /admin/* routes, which are off by default."""
-    from app.core.config import settings as _s
-
-    monkeypatch.setattr(_s, "legacy_admin_enabled", True)

@@ -3,7 +3,6 @@ screens used to link to a public URL that never worked."""
 from __future__ import annotations
 
 import uuid
-from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -68,30 +67,3 @@ def test_document_hidden_by_rls_is_a_404() -> None:
 
 def test_bank_needs_the_documents_module() -> None:
     assert _client(Conn(), ["inst:bids"]).get(f"/documents/{DOC}/download").status_code == 403
-
-
-def _admin_get(conn: Conn) -> Any:
-    @contextmanager
-    def svc():  # noqa: ANN202
-        yield conn
-
-    with patch("app.api.admin.service_session", svc), \
-         patch("app.core.storage.storage_signed_url", _signed):
-        return _client(conn, []).get(f"/admin/documents/{DOC}/download")
-
-
-def test_admin_review_link() -> None:
-    r = _admin_get(Conn())
-    assert r.status_code == 200 and r.json()["url"].endswith("exp=300")
-
-
-def test_non_admin_cannot_use_the_review_link() -> None:
-    assert _admin_get(Conn(admin=False)).status_code == 403
-
-
-@pytest.fixture(autouse=True)
-def _legacy_admin_on(monkeypatch):
-    """These tests cover the retired /admin/* routes, which are off by default."""
-    from app.core.config import settings as _s
-
-    monkeypatch.setattr(_s, "legacy_admin_enabled", True)
