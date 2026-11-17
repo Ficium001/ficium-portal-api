@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import ficium_contract as fc
@@ -16,6 +17,7 @@ import httpx
 import structlog
 from sqlalchemy import text
 
+from ..core import api_traffic
 from ..core.config import settings
 from ..core.db import service_session
 
@@ -42,6 +44,21 @@ def _mark(event_id: str, ok: bool, error: str) -> str:
         )
 
 
+def _defer(event_id: str) -> None:
+    with service_session() as s:
+        s.execute(text("SELECT integration.defer(:i)"), {"i": event_id})
+
+
+def _peer_paused(r: httpx.Response) -> bool:
+    """The borrower app answered 503 channel_paused: held on purpose, not a failure."""
+    if r.status_code != 503:
+        return False
+    try:
+        return r.json().get("error") == "channel_paused"
+    except ValueError:
+        return False
+
+
 def encode(envelope: dict[str, Any]) -> bytes:
     """The exact bytes that are signed and sent."""
     return json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -51,6 +68,10 @@ async def dispatch_once(client: httpx.AsyncClient, limit: int = 20) -> dict[str,
     key = settings.integration_i2b_signing_key.encode()
     url = settings.integration_peer_url
     counts = {"delivered": 0, "pending": 0, "dead": 0}
+    # Paused by Ficium: claim nothing. Events stay in the outbox untouched (no attempt is used, so
+    # none can dead-letter) and go out in order once the channel is resumed.
+    if api_traffic.paused("integration.events_out"):
+        return counts
     rows = await asyncio.to_thread(_claim, limit)
     for event_id, envelope in rows:
         # Never send anything that breaks the contract. Bid events are built in SQL, which
@@ -72,6 +93,7 @@ async def dispatch_once(client: httpx.AsyncClient, limit: int = 20) -> dict[str,
             )
             continue
         body = encode(envelope)
+        started = time.perf_counter()
         try:
             r = await client.post(
                 url,
@@ -83,8 +105,20 @@ async def dispatch_once(client: httpx.AsyncClient, limit: int = 20) -> dict[str,
                 timeout=10.0,
             )
             ok, err = 200 <= r.status_code < 300, f"HTTP {r.status_code}: {r.text[:300]}"
+            if _peer_paused(r):
+                await asyncio.to_thread(_defer, event_id)
+                counts["pending"] += 1
+                continue
         except httpx.HTTPError as e:
             ok, err = False, f"{type(e).__name__}: {e}"
+            api_traffic.record(
+                "integration.events_out", api_traffic.NETWORK, started, type(e).__name__
+            )
+        else:
+            api_traffic.record(
+                "integration.events_out", api_traffic.outcome_for_status(r.status_code), started,
+                f"HTTP {r.status_code}" if r.status_code >= 500 else None,
+            )
         outcome = await asyncio.to_thread(_mark, event_id, ok, err)
         counts[outcome] = counts.get(outcome, 0) + 1
         if not ok:

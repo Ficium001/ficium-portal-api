@@ -48,6 +48,7 @@ from .api.product_limits import router as product_limits_router
 from .api.request_chat import router as request_chat_router
 from .api.v1.marketplace import router as v1_marketplace_router
 from .api.webhooks import router as webhooks_router
+from .core import api_traffic
 from .core.config import settings
 from .core.db import close_pool, init_pool
 from .core.observability import (
@@ -71,6 +72,7 @@ async def lifespan(app: FastAPI):
     dispatcher: asyncio.Task[None] | None = None
     if settings.integration_outbound_enabled:
         dispatcher = asyncio.create_task(integration_dispatcher.run_forever(stop))
+    traffic_task = asyncio.create_task(api_traffic.run_forever(stop))
     maintenance_task: asyncio.Task[None] | None = None
     if settings.maintenance_close_expired_enabled:
         maintenance_task = asyncio.create_task(maintenance.run_forever(stop))
@@ -94,6 +96,7 @@ async def lifespan(app: FastAPI):
         await dispatcher
     if maintenance_task is not None:
         await maintenance_task
+    await traffic_task
     close_pool()
     log.info("portal_api_stopped")
 
@@ -153,6 +156,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(DefaultResponseHeadersMiddleware)
 
+app.add_middleware(api_traffic.ApiTrafficMiddleware)
 app.add_middleware(RequestObservabilityMiddleware)
 app.add_middleware(
     CORSMiddleware,
