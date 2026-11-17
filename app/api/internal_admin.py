@@ -48,6 +48,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from ..core import api_traffic
 from ..core.config import settings
 from ..core.db import service_session
 from ..core.security import TokenError, verify_token
@@ -62,6 +63,7 @@ FOUR_EYES_OPS = frozenset({
     "institution.approve", "institution.suspend", "entitlement.set",
     "commission.set", "commission.end",
     "institution.provision", "institution.invite_admin",
+    "api_channel.resume",
 })
 MAX_WAIVER_DAYS = 180
 
@@ -400,6 +402,10 @@ def _q_access_requests_list(conn: Session, args: dict, actor: str) -> list[dict]
     return [dict(r._mapping) for r in rows]
 
 
+def _q_traffic_overview(conn: Session, args: dict, actor: str) -> dict:
+    return api_traffic.overview(conn)
+
+
 SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "compliance.overview": _q_compliance_overview,
     "documents.list": _q_documents_list,
@@ -411,6 +417,7 @@ SYNC_QUERIES: dict[str, Callable[[Session, dict, str], Any]] = {
     "commission.rules": _q_commission_rules,
     "commission.statement": _q_commission_statement,
     "products.list": _q_products_list,
+    "traffic.overview": _q_traffic_overview,
 }
 
 
@@ -895,6 +902,20 @@ def _c_institution_invite_admin(conn: Session, args: dict, ctx: dict) -> dict:
             "admin_login_id": login_id}
 
 
+def _c_api_channel(state: str):
+    def run(conn: Session, args: dict, ctx: dict) -> dict:
+        try:
+            out = api_traffic.apply_policy(conn, {**args, "state": state}, ctx["checker"])
+        except api_traffic.PolicyError as e:
+            raise ChannelError(e.status, e.code, e.detail) from None
+        _audit(conn, ctx["checker"], f"api_channel.{'paused' if state == 'paused' else 'resumed'}",
+               "api_channel", None, None,
+               {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "channel": out["channel"],
+                "version": out["version"], "applied": out["applied"], "reason": args.get("reason")})
+        return out
+    return run
+
+
 COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "document.review": _c_document_review,
     "waiver.grant": _c_waiver_grant,
@@ -907,6 +928,8 @@ COMMANDS: dict[str, Callable[[Session, dict, dict], dict]] = {
     "access_request.review": _c_access_request_review,
     "institution.provision": _c_institution_provision,
     "institution.invite_admin": _c_institution_invite_admin,
+    "api_channel.pause": _c_api_channel("paused"),
+    "api_channel.resume": _c_api_channel("enabled"),
 }
 
 

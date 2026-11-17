@@ -40,6 +40,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from . import api_traffic
 from .db import service_session
 
 log = structlog.get_logger()
@@ -98,6 +99,28 @@ async def _fire_single(
     }
 
     delivery_id = str(uuid.uuid4())
+    if api_traffic.paused("webhooks.out"):
+        # Held by Ficium: recorded in the bank's delivery log, but the webhook's failure counter is
+        # left alone so a pause can never auto-disable a bank's endpoint.
+        api_traffic.record("webhooks.out", api_traffic.BLOCKED)
+        try:
+            with service_session() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO institution.webhook_delivery
+                            (id, webhook_id, institution_id, event_type, event_id, payload,
+                             status, attempts, last_attempt_at, response_status, response_body)
+                        VALUES (:id, :wid, :iid, :et, CAST(:eid AS uuid), CAST(:payload AS jsonb),
+                                'failed', 0, now(), NULL, :rb)
+                        ON CONFLICT (id) DO NOTHING
+                    """),
+                    {"id": delivery_id, "wid": str(webhook["id"]), "iid": institution_id,
+                     "et": event_type, "eid": event_id, "payload": json.dumps(payload),
+                     "rb": "held: webhook delivery is paused by Ficium"},
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("webhook_hold_record_failed", webhook_id=str(webhook["id"]))
+        return
     timeout_s = (webhook["timeout_ms"] or 30_000) / 1000
     retry_max = webhook["retry_max"] or 3
     attempts = 0
@@ -120,6 +143,7 @@ async def _fire_single(
                 delivered = False
                 break
 
+            started = time.perf_counter()
             async with httpx.AsyncClient(timeout=timeout_s) as client:
                 resp = await client.post(
                     webhook["endpoint_url"],
@@ -129,7 +153,10 @@ async def _fire_single(
             status_code = resp.status_code
             response_body = resp.text[:2000]
             delivered = 200 <= status_code < 300
+            api_traffic.record("webhooks.out", api_traffic.outcome_for_status(status_code), started,
+                               f"HTTP {status_code}" if status_code >= 500 else None)
         except Exception as exc:  # noqa: BLE001
+            api_traffic.record("webhooks.out", api_traffic.NETWORK, None, type(exc).__name__)
             status_code = None
             response_body = str(exc)[:2000]
             delivered = False
