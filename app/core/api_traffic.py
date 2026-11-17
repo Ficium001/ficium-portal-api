@@ -188,7 +188,7 @@ class Recorder:
         key = (channel, _hour(t))
         at = datetime.fromtimestamp(t, UTC)
         with self._lock:
-            row = self._rows.setdefault(key, defaultdict(int))  # type: ignore[arg-type]
+            row = self._rows.setdefault(key, defaultdict(int))
             row["total"] += 1
             row[_COLUMN[outcome]] += 1
             if ms is not None and outcome != BLOCKED:
@@ -208,7 +208,7 @@ class Recorder:
         """Put back what a failed flush could not write, so a database blip loses nothing."""
         with self._lock:
             for key, row in rows.items():
-                cur = self._rows.setdefault(key, defaultdict(int))  # type: ignore[arg-type]
+                cur = self._rows.setdefault(key, defaultdict(int))
                 for k, v in row.items():
                     cur[k] += v
             for ch, at in ok_at.items():
@@ -246,6 +246,7 @@ _COUNT_COLS = (
     "lat_b6",
     "lat_b7",
 )
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text  (built only from constant column names)
 _UPSERT = text(
     "INSERT INTO integration.api_traffic_hour (channel, hour, " + ", ".join(_COUNT_COLS) + ") "
     "VALUES (:channel, :hour, " + ", ".join(f":{c}" for c in _COUNT_COLS) + ") "
@@ -402,6 +403,7 @@ def overview(conn: Any, now: float | None = None) -> dict[str, Any]:
     first = _hour(t - (WINDOW_HOURS - 1) * 3600)
     hours = [_hour(t - (WINDOW_HOURS - 1 - i) * 3600) for i in range(WINDOW_HOURS)]
     rows = conn.execute(
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text  (built only from constant column names)
         text(
             "SELECT channel, hour, "
             + ", ".join(_COUNT_COLS)
