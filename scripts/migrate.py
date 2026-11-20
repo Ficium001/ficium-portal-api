@@ -13,6 +13,7 @@ A fleet of cells (one database per bank, see docs in ficium-infra):
     python scripts/migrate.py --cells cells.json --apply
     python scripts/migrate.py --cells cells.json --cell mcb --apply
     python scripts/migrate.py --cells cells.json --cell newbank --apply --fresh
+    python scripts/migrate.py --apply --upto 063_x.sql   # stop after this file
 
 cells.json lists cells in rollout order (put the internal test cell first) and
 names the environment variable holding each DSN. DSNs never go in the file:
@@ -33,6 +34,15 @@ Guarantees:
   * A database with no ledger is only migrated with --fresh and --cell, and
     only when it holds no Ficium schema (a new, empty cell). A database that
     has Ficium schemas but no ledger must be baselined first.
+
+New cells are built from db/baseline/ when it exists: schema.sql is a
+schema-only snapshot of the live Portal DB through the file named in
+db/baseline/BASELINE (see scripts/schema_baseline.py). --fresh then runs, as
+ONE transaction: the roles in roles.txt, a small compatibility layer for
+plain Postgres (extensions schema, auth helpers, an auth.users stub), the
+snapshot, the ledger, and a 'baseline' ledger row for every file it covers.
+Later files are then applied normally. Without db/baseline/, --fresh replays
+every file from 000.
 
 000_auth_shim.sql is only for non-Supabase Postgres and is recorded as
 skipped when auth.uid() already exists.
@@ -62,6 +72,8 @@ LEDGER = "039_migration_ledger.sql"
 AUTH_SHIM = "000_auth_shim.sql"
 # Any of these present means the database already holds Ficium data.
 FICIUM_SCHEMAS = ("institution", "marketplace", "governance", "integration", "catalog")
+ROLE_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+COMPAT_EXTENSIONS = ("pgcrypto", "uuid-ossp")
 # pg_try_advisory_lock key: fixed, so every runner on a database contends for it.
 LOCK_KEY = 0x0F1C1A6D
 
@@ -126,6 +138,44 @@ def ledger_sql(p: Path, status: str) -> str:
         "insert into ops.schema_migration (filename, sha256, status) "
         f"values ('{p.name}', '{sha(p)}', '{status}');"
     )
+
+
+@dataclass
+class Baseline:
+    schema: Path
+    through: str
+    roles: list[str]
+
+
+def load_baseline(db_dir: Path) -> Baseline | None:
+    d = db_dir / "baseline"
+    schema = d / "schema.sql"
+    if not schema.exists():
+        return None
+    meta: dict[str, str] = {}
+    for line in (d / "BASELINE").read_text().splitlines():
+        if ":" in line and not line.startswith("#"):
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip()
+    through = meta.get("through", "")
+    names = [p.name for p in files(db_dir)]
+    if through not in names:
+        raise ConfigError(f"baseline/BASELINE: through {through!r} is not a file in {db_dir}")
+    if through < LEDGER:
+        raise ConfigError(f"baseline must cover {LEDGER} (the ledger) or later")
+    if meta.get("schema_sha256") != sha(schema):
+        raise ConfigError(
+            "baseline/schema.sql does not match schema_sha256 in BASELINE: regenerate it"
+        )
+    roles = [
+        r.strip()
+        for r in (d / "roles.txt").read_text().splitlines()
+        if r.strip() and not r.startswith("#")
+    ]
+    bad = [r for r in roles if not ROLE_RE.match(r)]
+    if bad:
+        raise ConfigError(f"baseline/roles.txt: invalid role names {bad}")
+    return Baseline(schema, through, roles)
 
 
 # ── Cells ────────────────────────────────────────────────────────────────────
@@ -296,18 +346,69 @@ def cmd_baseline(conn: Conn, cell: str, upto: str, db_dir: Path) -> int:
     return 0
 
 
-def apply_cell(name: str, conn: Conn, db_dir: Path) -> tuple[bool, int]:
-    """Apply pending files on one cell. Returns (ok, files applied)."""
+def compat_sql(conn: Conn, roles: list[str], db_dir: Path) -> str:
+    """What the snapshot needs on plain Postgres. Idempotent; a no-op on Supabase."""
+    parts = ["do $$ begin"]
+    for r in roles:  # ROLE_RE-validated, safe to inline
+        parts.append(
+            f"  if not exists (select 1 from pg_roles where rolname = '{r}') "
+            f"then create role {r} nologin; end if;"
+        )
+    parts.append("end $$;")
+    parts.append("create schema if not exists extensions;")
+    for ext in COMPAT_EXTENSIONS:
+        parts.append(
+            f"do $$ begin if not exists (select 1 from pg_extension where extname = '{ext}') "
+            f'then create extension "{ext}" with schema extensions; end if; end $$;'
+        )
+    if not has_auth_uid(conn):
+        shim = db_dir / AUTH_SHIM
+        parts.append((shim if shim.exists() else DEFAULT_DB_DIR / AUTH_SHIM).read_text())
+    # identity.* (legacy) references auth.users(id); a stub keeps those keys valid.
+    parts.append("create schema if not exists auth;")
+    parts.append("create table if not exists auth.users (id uuid primary key);")
+    return "\n".join(parts) + "\n"
+
+
+def build_from_baseline(name: str, conn: Conn, db_dir: Path, base: Baseline) -> bool:
+    batch = [
+        compat_sql(conn, base.roles, db_dir),
+        base.schema.read_text(),
+        # The snapshot sets search_path to '' for the session; later files expect the default.
+        "RESET ALL;",
+        (db_dir / LEDGER).read_text(),
+    ]
+    covered = [p for p in files(db_dir) if p.name <= base.through]
+    batch += [ledger_sql(p, "baseline") for p in covered]
+    try:
+        q(conn, "\n".join(batch))
+    except psycopg2.Error as e:
+        say(f"[{name}] FAILED building from baseline: {(e.pgerror or str(e)).strip()}", error=True)
+        print(f"[{name}] nothing was kept")
+        return False
+    print(f"[{name}] built from baseline through {base.through} ({len(covered)} files)")
+    return True
+
+
+def apply_cell(name: str, conn: Conn, db_dir: Path, upto: str | None = None) -> tuple[bool, int]:
+    """Apply pending files on one cell, up to and including `upto`. Returns (ok, applied)."""
     if ledger(conn) is None:
-        # A fresh cell: create the ledger first (039 is idempotent and is
-        # re-run and recorded in its turn) so every file, 000 onwards, can
-        # record itself in the same transaction as its change.
-        q(conn, (db_dir / LEDGER).read_text())
+        base = load_baseline(db_dir)
+        if base is not None and (upto is None or upto >= base.through):
+            if not build_from_baseline(name, conn, db_dir, base):
+                return False, 0
+        else:
+            # No baseline: create the ledger first (039 is idempotent and is
+            # re-run and recorded in its turn) so every file, 000 onwards, can
+            # record itself in the same transaction as its change.
+            q(conn, (db_dir / LEDGER).read_text())
     done = ledger(conn) or {}
     count = 0
     for p in files(db_dir):
         if p.name in done:
             continue
+        if upto is not None and p.name > upto:
+            break
         skip = p.name == AUTH_SHIM and has_auth_uid(conn)
         body = "" if skip else p.read_text() + "\n"
         try:
@@ -321,7 +422,13 @@ def apply_cell(name: str, conn: Conn, db_dir: Path) -> tuple[bool, int]:
     return True, count
 
 
-def cmd_apply(conns: dict[str, Conn], db_dir: Path, fresh: bool, single_cell: bool) -> int:
+def cmd_apply(
+    conns: dict[str, Conn],
+    db_dir: Path,
+    fresh: bool,
+    single_cell: bool,
+    upto: str | None = None,
+) -> int:
     # 1. Preflight every cell before touching any.
     states = {n: inspect(n, c, db_dir) for n, c in conns.items()}
     blocked = False
@@ -354,15 +461,16 @@ def cmd_apply(conns: dict[str, Conn], db_dir: Path, fresh: bool, single_cell: bo
     names = list(conns)
     for i, name in enumerate(names):
         conn = conns[name]
-        if not states[name].pending:
-            print(f"[{name}] up to date")
+        todo = [n for n in states[name].pending if upto is None or n <= upto]
+        if not todo and states[name].has_ledger:
+            print(f"[{name}] up to date" + (f" through {upto}" if upto else ""))
             continue
         if not try_lock(conn):
             say(f"[{name}] another migration holds the lock; stopping", error=True)
             _stopped(names[i + 1 :])
             return 1
         try:
-            ok, n = apply_cell(name, conn, db_dir)
+            ok, n = apply_cell(name, conn, db_dir, upto)
         finally:
             unlock(conn)
         if not ok:
@@ -396,6 +504,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--cell", help="only this cell")
     ap.add_argument("--fresh", action="store_true", help="allow a new, empty cell (with --cell)")
     ap.add_argument("--json", action="store_true", help="with --status: JSON output")
+    ap.add_argument("--upto", metavar="FILE", help="with --apply: stop after this file")
     return ap.parse_args(argv)
 
 
@@ -408,10 +517,16 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             raise ConfigError("--fresh needs --apply and, with --cells, --cell NAME")
         if a.json and not a.status:
             raise ConfigError("--json needs --status")
+        if a.upto and not a.apply:
+            raise ConfigError("--upto needs --apply")
         cells = load_cells(a.cells, a.cell, env)
         if a.baseline and len(cells) != 1:
             raise ConfigError("--baseline runs on one cell: add --cell NAME")
-        files(db_dir)  # validate the directory before connecting anywhere
+        names = [p.name for p in files(db_dir)]  # validate before connecting anywhere
+        if a.upto and a.upto not in names:
+            raise ConfigError(f"--upto {a.upto!r} is not a file in {db_dir}")
+        if a.apply and a.fresh:
+            load_baseline(db_dir)  # a bad baseline fails here, not mid-build
     except ConfigError as e:
         say(f"config: {e}", error=True)
         return 2
@@ -433,7 +548,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             ((name, conn),) = conns.items()
             return cmd_baseline(conn, name, a.baseline, db_dir)
         single = a.cell is not None or not a.cells
-        return cmd_apply(conns, db_dir, a.fresh, single)
+        return cmd_apply(conns, db_dir, a.fresh, single, a.upto)
     finally:
         for conn in conns.values():
             conn.close()

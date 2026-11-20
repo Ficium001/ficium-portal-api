@@ -361,3 +361,180 @@ def test_missing_dsn_variable_rejected(tmp_path, mig_dir):
 def test_real_db_folder_is_valid():
     names = [p.name for p in migrate.files(ROOT / "db")]
     assert migrate.LEDGER in names and names == sorted(names)
+
+
+# ── Building a new cell from db/baseline/ ────────────────────────────────────
+
+BASE_SQL = """SELECT pg_catalog.set_config('search_path', '', false);
+CREATE SCHEMA institution;
+CREATE TABLE institution.alpha (id integer);
+CREATE TABLE institution.beta (id integer);
+GRANT SELECT ON TABLE institution.alpha TO authenticated;
+GRANT SELECT ON TABLE institution.beta TO ficium_test_reader;
+"""
+
+
+def write_baseline(mig_dir: Path, body: str = BASE_SQL, through: str = migrate.LEDGER) -> None:
+    d = mig_dir / "baseline"
+    d.mkdir(exist_ok=True)
+    (d / "schema.sql").write_text(body)
+    (d / "roles.txt").write_text("# generated\nauthenticated\nficium_test_reader\n")
+    digest = migrate.sha(d / "schema.sql")
+    (d / "BASELINE").write_text(f"through: {through}\nschema_sha256: {digest}\n")
+
+
+def test_fresh_cell_built_from_baseline(make_db, mig_dir):
+    write_baseline(mig_dir)
+    # A later file with unqualified names: proves the snapshot's search_path was reset.
+    (mig_dir / "041_after.sql").write_text("create table after_baseline (id int);\n")
+    dsn = make_db()
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=dsn) == 0
+    st = dict(rows(dsn, "select filename, status from ops.schema_migration"))
+    assert st == {
+        "001_alpha.sql": "baseline",
+        "002_beta.sql": "baseline",
+        migrate.LEDGER: "baseline",
+        "040_gamma.sql": "applied",
+        "041_after.sql": "applied",
+    }
+    assert table_exists(dsn, "institution.beta") and table_exists(dsn, "public.after_baseline")
+    assert rows(
+        dsn, "select has_table_privilege('ficium_test_reader', 'institution.beta', 'select')"
+    )[0][0]
+    assert rows(dsn, "select auth.uid() is null")[0][0]  # compat: auth helpers present
+    assert run(["--check"], mig_dir, PORTAL_DB_DSN=dsn) == 0
+
+
+def test_baseline_build_is_one_transaction(make_db, mig_dir):
+    write_baseline(mig_dir, BASE_SQL + "CREATE TABLE institution.alpha (id integer);\n")
+    dsn = make_db()
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=dsn) == 1
+    assert not table_exists(dsn, "institution.beta")
+    assert not table_exists(dsn, "ops.schema_migration")
+
+
+def test_hand_edited_baseline_refused(make_db, mig_dir):
+    write_baseline(mig_dir)
+    with (mig_dir / "baseline" / "schema.sql").open("a") as f:
+        f.write("-- edited\n")
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=make_db()) == 2
+
+
+def test_upto_stops_after_named_file(make_db, mig_dir):
+    write_baseline(mig_dir)
+    (mig_dir / "041_after.sql").write_text("create table after_baseline (id int);\n")
+    dsn = make_db()
+    assert run(["--apply", "--fresh", "--upto", "040_gamma.sql"], mig_dir, PORTAL_DB_DSN=dsn) == 0
+    assert "041_after.sql" not in ledger_names(dsn)
+    assert run(["--apply", "--upto", "999_nope.sql"], mig_dir, PORTAL_DB_DSN=dsn) == 2
+    assert run(["--apply"], mig_dir, PORTAL_DB_DSN=dsn) == 0
+    assert "041_after.sql" in ledger_names(dsn)
+
+
+def _server_major() -> int:
+    return int(rows(ADMIN_DSN, "select current_setting('server_version_num')::int / 10000")[0][0])
+
+
+def _pg_dump_for_tests() -> tuple[bool, str | None]:
+    """(usable, local binary). None = the pinned docker image, as in production."""
+    import re
+    import subprocess
+
+    if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+        return True, None
+    exe = os.environ.get("SCHEMA_BASELINE_PG_DUMP") or shutil.which("pg_dump")
+    if exe:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
+        m = re.search(r"(\d+)\.", out)
+        if m and int(m.group(1)) >= _server_major():
+            return True, exe
+    return False, None
+
+
+def test_round_trip_dump_build_dump_is_identical(make_db, mig_dir, tmp_path, monkeypatch):
+    """What the schema-baseline workflow does against live, on a stand-in 'live'."""
+    usable, exe = _pg_dump_for_tests()
+    if not usable:
+        pytest.skip("no docker and no local pg_dump matching the server")
+    if exe:
+        monkeypatch.setenv("SCHEMA_BASELINE_PG_DUMP", exe)
+    else:
+        monkeypatch.delenv("SCHEMA_BASELINE_PG_DUMP", raising=False)
+    sb_spec = importlib.util.spec_from_file_location("sb", ROOT / "scripts" / "schema_baseline.py")
+    assert sb_spec and sb_spec.loader
+    sb = importlib.util.module_from_spec(sb_spec)
+    sys.modules["sb"] = sb
+    sb_spec.loader.exec_module(sb)
+    monkeypatch.setattr(sb, "SCHEMAS", ("institution", "ops"))
+
+    live = make_db()  # a 'live' database built the old way, file by file
+    with psycopg2.connect(live) as c, c.cursor() as cur:
+        cur.execute(
+            "do $$ begin if not exists (select 1 from pg_roles where rolname='authenticated')"
+            " then create role authenticated nologin; end if; end $$"
+        )
+    (mig_dir / "041_policy.sql").write_text(
+        "alter table institution.alpha enable row level security;\n"
+        "create policy a_read on institution.alpha for select to authenticated using (true);\n"
+        "grant select on institution.alpha to authenticated;\n"
+    )
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=live) == 0
+    live_sql = tmp_path / "live.sql"
+    live_sql.write_text(sb.normalise(sb.pg_dump(live)))
+    assert sb.write(live_sql, "041_policy.sql", mig_dir / "baseline") is True
+
+    cell = make_db()
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=cell) == 0
+    assert sb.normalise(sb.pg_dump(cell)) == live_sql.read_text()
+    assert run(["--check"], mig_dir, PORTAL_DB_DSN=cell) == 0
+
+
+def test_real_baseline_builds_a_cell(make_db):
+    """The committed db/baseline/ builds a cell on plain Postgres 17 and passes --check."""
+    if not (ROOT / "db" / "baseline" / "schema.sql").exists():
+        pytest.skip("no committed baseline yet")
+    if _server_major() < 17:
+        pytest.skip("the baseline needs Postgres 17+")
+    dsn = make_db()
+    env = {"MIGRATIONS_DIR": str(ROOT / "db"), "PORTAL_DB_DSN": dsn}
+    assert migrate.main(["--apply", "--fresh"], env) == 0
+    assert migrate.main(["--check"], env) == 0
+    n = rows(
+        dsn,
+        "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+        "where n.nspname = 'institution' and c.relrowsecurity",
+    )[0][0]
+    assert n > 20, "RLS should be on across the institution schema"
+
+
+def test_canonical_removes_pooler_search_path_artefact(make_db, mig_dir, monkeypatch):
+    """A live dump whose search_path leaked (names unqualified) canonicalises to the clean dump."""
+    usable, exe = _pg_dump_for_tests()
+    if not usable:
+        pytest.skip("no docker and no local pg_dump matching the server")
+    if exe:
+        monkeypatch.setenv("SCHEMA_BASELINE_PG_DUMP", exe)
+    sb_spec = importlib.util.spec_from_file_location("sb2", ROOT / "scripts" / "schema_baseline.py")
+    assert sb_spec and sb_spec.loader
+    sb = importlib.util.module_from_spec(sb_spec)
+    sys.modules["sb2"] = sb
+    sb_spec.loader.exec_module(sb)
+    monkeypatch.setattr(sb, "SCHEMAS", ("institution", "ops", "public"))
+
+    (mig_dir / "041_trigger.sql").write_text(
+        "create function public.touch() returns trigger language plpgsql "
+        "as $$ begin return new; end $$;\n"
+        "create trigger alpha_touch before update on institution.alpha "
+        "for each row execute function public.touch();\n"
+    )
+    live = make_db()
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=live) == 0
+    clean = sb.normalise(sb.pg_dump(live))
+    assert "EXECUTE FUNCTION public.touch()" in clean
+    leaked = clean.replace(
+        "SELECT pg_catalog.set_config('search_path', '', false);",
+        "SELECT pg_catalog.set_config('search_path', 'public', false);",
+    ).replace("EXECUTE FUNCTION public.touch()", "EXECUTE FUNCTION touch()")
+    assert leaked != clean
+    assert sb.canonical(leaked, ADMIN_DSN) == clean
+    assert sb.canonical(clean, ADMIN_DSN) == clean
