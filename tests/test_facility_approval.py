@@ -51,10 +51,20 @@ class _Res:
         return self._scalar
 
 
+class _PgError(Exception):
+    """Shaped like SQLAlchemy's DBAPIError: the driver error, with its diag, on .orig."""
+
+    def __init__(self, message: str, detail: str) -> None:
+        super().__init__(message)
+        diag = type("Diag", (), {"message_detail": detail})()
+        self.orig = type("Orig", (), {"diag": diag})()
+
+
 class Session:
     def __init__(self, *, stage: dict[str, Any] | None = None, rules: list[_Row] | None = None,
-                 close_error: str | None = None) -> None:
+                 close_error: str | None = None, route_error: Exception | None = None) -> None:
         self.stage, self.rules, self.close_error = stage, rules or [], close_error
+        self.route_error = route_error
         self.sql: list[str] = []
         self.params: list[Any] = []
         self.committed = False
@@ -77,6 +87,8 @@ class Session:
         if "FROM institution.doa_rule" in q:
             return _Res(self.rules)
         if "approvals_route" in q:
+            if self.route_error:
+                raise self.route_error
             return _Res([_Row(id="inst-1")])
         if "marketplace.close_deal" in q:
             if self.close_error:
@@ -143,6 +155,41 @@ def test_no_matching_rule_is_a_clear_409() -> None:
         r = c.post(f"/pipelines/{DEAL}/stages/s1/advance", json={})
     assert r.status_code == 409
     assert "credit approval rule" in r.json()["detail"]
+
+
+NO_APPROVER = _PgError(
+    "ERROR: APPROVALS_NO_APPROVER",
+    'Step 1 "Credit approval" needs 1 approver(s) other than the submitter with the '
+    "checker role; 0 can act.",
+)
+
+
+def test_credit_stage_nobody_can_approve_is_a_clear_409() -> None:
+    """db/065: routing refuses an approval no one but the submitter could approve."""
+    s = Session(stage=ROUTED, rules=[CATCH_ALL], route_error=NO_APPROVER)
+    with _client(s) as c:
+        r = c.post(f"/pipelines/{DEAL}/stages/s1/advance", json={})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert 'Step 1 "Credit approval" needs 1 approver(s)' in detail
+    assert "checker role" in detail and "Setup > Team" in detail
+    assert not any("awaiting_approval" in q for q in s.sql)  # the stage did not move
+    assert not s.committed
+
+
+def test_engine_route_maps_no_approver() -> None:
+    from fastapi import HTTPException
+
+    from app.api.approval_engine import _engine_call
+
+    s = Session(stage=ROUTED, rules=[CATCH_ALL], route_error=NO_APPROVER)
+    try:
+        _engine_call(s, "SELECT institution.approvals_route(...)", {})  # type: ignore[arg-type]
+    except HTTPException as e:
+        assert e.status_code == 409
+        assert "needs 1 approver(s)" in e.detail and "Setup > Team" in e.detail
+    else:
+        raise AssertionError("APPROVALS_NO_APPROVER was not mapped")
 
 
 def test_ordinary_stage_is_unchanged() -> None:
