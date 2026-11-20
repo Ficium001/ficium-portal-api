@@ -1,0 +1,6 @@
+{
+  "cells": [
+    { "name": "internal", "dsn_env": "CELL_INTERNAL_DSN" },
+    { "name": "mcb", "dsn_env": "CELL_MCB_DSN" }
+  ]
+}

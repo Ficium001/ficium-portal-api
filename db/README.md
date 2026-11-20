@@ -42,6 +42,60 @@ own history (e.g. `fix_portal_notification_deal_links`,
 `enable_rls_marketplace_sync_state`) and would be missing from a rebuild.
 The table below is history; the ledger is the source of truth.
 
+## One database per bank (Nov 20 2026)
+
+The target architecture gives every bank its own cell: its own API
+deployment and its own database (see `ficium-infra/docs/architecture/`).
+The same runner migrates the whole fleet:
+
+```
+python scripts/migrate.py --cells cells.json --status --json   # where every cell is
+python scripts/migrate.py --cells cells.json --check           # CI / daily: any drift fails
+python scripts/migrate.py --cells cells.json --apply           # roll out, cell by cell
+python scripts/migrate.py --cells cells.json --cell newbank --apply --fresh   # new, empty cell
+```
+
+`cells.json` lists cells in rollout order and names the environment variable
+holding each DSN (from Doppler); a connection string in the file is rejected.
+Put the internal test cell first so it takes every release before a bank
+does. See `cells.example.json`.
+
+What `--apply` guarantees:
+
+- **Every cell is checked before any is changed.** An unreachable cell, a file
+  edited after it was applied, or a ledger row with no file stops the whole
+  run with nothing changed anywhere.
+- **One cell at a time, first failure stops the rollout.** The failed file is
+  rolled back on that cell (file and ledger row are one transaction); later
+  cells are not started. Fix forward with a new file and run again.
+- **One runner per database.** Each cell is migrated under an advisory lock;
+  a second runner stops instead of racing. Use a session-mode connection
+  (direct, or Supabase session pooler on 5432), not the transaction pooler.
+- **No accidental first runs.** A database without a ledger is migrated only
+  with `--cell NAME --fresh`, and only if it holds no Ficium schema. A live
+  database without a ledger must be baselined first (`--baseline`, one cell).
+- `--baseline` runs on exactly one cell.
+
+Tests: `tests/test_migrate.py`, against real Postgres 17 in CI
+(`MIGRATE_TEST_PG`); in CI a missing variable fails the job rather than
+skipping.
+
+### Known gap: a new cell cannot yet be built from this repo
+
+Tried on Nov 20 2026 against an empty Postgres 16 with Supabase stand-ins
+(`auth.users`, `storage.*`): 23 of 34 files in
+`ficium-portal/supabase/migrations` fail (e.g. `institution` is used before
+any file creates it, because it was created outside these files), and most
+of `db/` fails behind them. Also: `049` uses the `MAINTAIN` privilege
+(Postgres 17+), `052` verifies live product mappings, and the bank tables
+reference `auth_portal` (ficium-auth) and `auth.users` directly.
+
+The fix, next step: a schema baseline taken from the live Portal DB
+(`pg_dump --schema-only` of the Ficium schemas plus the reference data the
+self-verifying files check), recorded as the starting point for new cells,
+with CI building a cell from baseline + later files on every pull request
+and comparing it to the live schema.
+
 ## Files
 
 | File | Purpose | Must run on Supabase? | Live as of Aug 3 2026? |
