@@ -14,4 +14,6 @@ reportlab==5.1.0
 pypdf==6.21.4  # 3 DoS advisories fixed in 6.21.4
 docxtpl==0.20.2
 python-multipart==0.0.33
-ficium-contract @ https://github.com/Ficium001/ficium-integration/archive/refs/tags/v1.9.1.tar.gz
+# Integration contract, vendored (ficium-integration is private; no token at install).
+# Built from tag v1.9.1, checked against vendor/SHA256SUMS. How to update: vendor/README.md
+./vendor/ficium_contract-1.9.1-py3-none-any.whl
