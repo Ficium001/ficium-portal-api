@@ -80,21 +80,50 @@ Tests: `tests/test_migrate.py`, against real Postgres 17 in CI
 (`MIGRATE_TEST_PG`); in CI a missing variable fails the job rather than
 skipping.
 
-### Known gap: a new cell cannot yet be built from this repo
+### Building a new cell: `db/baseline/`
 
-Tried on Nov 20 2026 against an empty Postgres 16 with Supabase stand-ins
-(`auth.users`, `storage.*`): 23 of 34 files in
-`ficium-portal/supabase/migrations` fail (e.g. `institution` is used before
-any file creates it, because it was created outside these files), and most
-of `db/` fails behind them. Also: `049` uses the `MAINTAIN` privilege
-(Postgres 17+), `052` verifies live product mappings, and the bank tables
-reference `auth_portal` (ficium-auth) and `auth.users` directly.
+Replaying history cannot build a new database: tried on Nov 20 2026, 23 of 34
+files in `ficium-portal/supabase/migrations` fail on an empty Postgres
+(`institution` is used before any file creates it: it was created outside
+these files), and most of `db/` fails behind them. So new cells start from a
+**schema-only snapshot of the live Portal DB** instead:
 
-The fix, next step: a schema baseline taken from the live Portal DB
-(`pg_dump --schema-only` of the Ficium schemas plus the reference data the
-self-verifying files check), recorded as the starting point for new cells,
-with CI building a cell from baseline + later files on every pull request
-and comparing it to the live schema.
+| File | What |
+|---|---|
+| `baseline/schema.sql` | `pg_dump --schema-only --no-owner` of the Ficium schemas (`admin`, `audit`, `auth_portal`, `autobid`, `billing`, `catalog`, `entitlements`, `governance`, `identity`, `institution`, `integration`, `marketplace`, `ops`, `portal_admin`, `public`). No rows from any table, so no bank or borrower data. Generated, never edited |
+| `baseline/roles.txt` | Roles the snapshot grants to; created `NOLOGIN` on a new cell |
+| `baseline/BASELINE` | `through` (last file the snapshot includes), when it was taken, and the snapshot's SHA-256 (a hand edit is refused) |
+
+`migrate.py --fresh` builds a cell from it in **one transaction**: the roles,
+a small compatibility layer for plain Postgres (`extensions` schema with
+`pgcrypto`/`uuid-ossp`, the `auth.uid()`/`jwt()`/`role()` helpers from
+`000_auth_shim.sql`, an `auth.users` stub for the legacy `identity` keys), the
+snapshot, the ledger, and a `baseline` ledger row for every file up to
+`through`. Later files then apply normally.
+
+**Proof, every day and on every PR touching `db/`** (`.github/workflows/schema-baseline.yml`):
+dump live; build a scratch cell on Postgres 17 from the snapshot plus `db/`
+files up to the live ledger point; dump it; the two dumps must be identical.
+A change made on live without a `db/` file fails this. Then the files live has
+not run yet are applied to the scratch cell, so a file that cannot build a new
+cell fails before it ships.
+
+**To regenerate** (after a hand fix on live, or to move `through` forward):
+push any change on a branch named `schema-baseline/...` and open a PR. The
+workflow takes the snapshot from live, verifies it as above, and commits it to
+the branch.
+
+Normalised out of the dump: `\restrict` lines and version comments (change
+every run) and Supabase's `ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin`
+platform defaults (meaningless in a cell, and only a superuser may set them).
+
+Still Supabase-shaped inside the snapshot, to retire over time:
+- `identity.*` (legacy) keys reference `auth.users`; the compat stub keeps them valid.
+- One `pg_cron` job (`governance-expire-stale-actions`, every 5 min) lives in
+  `cron.job`, outside the snapshot: a cell needs a worker for it.
+- `institution._call_provision_user` calls `extensions.http_post`, but the
+  `http` extension is not installed on live, so the function cannot run.
+  It is dead code; `045` only looked for `pg_net` calls.
 
 ## Files
 
@@ -168,11 +197,16 @@ file's own header comment for what it actually requires.
 
 ## Load order (non-Supabase / on-prem)
 
-1. `000_auth_shim.sql` — creates `auth.*` helpers the Portal SQL depends on
-2. Portal migrations from `ficium-portal/supabase/migrations/` in order — schema, RLS, maker-checker
-3. Every other file in this directory, in filename order
+One command, on an empty Postgres 17+:
 
-On Supabase, skip step 1 (Supabase already provides `auth.*`). Steps 2 and 3 always apply.
+```
+PORTAL_DB_DSN=... python scripts/migrate.py --apply --fresh
+```
+
+It builds from `db/baseline/` (see above), then applies every later file.
+The previous instructions (`000_auth_shim.sql`, then
+`ficium-portal/supabase/migrations/`, then this folder) do not work: those
+files cannot rebuild the schema (tested Nov 20 2026).
 
 ---
 
