@@ -121,12 +121,9 @@ def _sections(lines: list[str]) -> list[list[str]]:
     """Split a dump at pg_dump's object headers ("--" / "-- Name: ..." / "--")."""
     out: list[list[str]] = [[]]
     for i, line in enumerate(lines):
-        if (
-            line == "--"
-            and i + 2 < len(lines)
-            and lines[i + 1].startswith("-- Name: ")
-            and lines[i + 2] == "--"
-        ):
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        header = nxt.startswith("-- Name: ") and i + 2 < len(lines) and lines[i + 2] == "--"
+        if line == "--" and (header or nxt.startswith("-- PostgreSQL database dump complete")):
             out.append([])
         out[-1].append(line)
     return out

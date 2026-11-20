@@ -50,6 +50,16 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA institution GRANT SELECT ON
 CREATE FUNCTION institution.f() RETURNS void LANGUAGE sql AS $$ SELECT 1 $$
     SET search_path TO 'public';
 
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: -
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON SEQUENCES TO anon;
+
+--
+-- PostgreSQL database dump complete
+--
+
 \unrestrict 8f3kQZ1xY2
 """
 
@@ -62,6 +72,7 @@ def test_normalise_drops_volatile_and_platform_lines() -> None:
     # the header of the dropped statement goes too; the one with a statement stays
     assert "Schema: public; Owner: -" not in out
     assert "Schema: institution; Owner: -" in out
+    assert out.rstrip().endswith("-- PostgreSQL database dump complete\n--")
     assert "CREATE SCHEMA IF NOT EXISTS public;" in out
     assert "CREATE SCHEMA institution;" in out
     assert "\n\n\n" not in out
