@@ -168,6 +168,9 @@ def canonical(dump: str, admin_dsn: str) -> str:
     admin.autocommit = True
     try:
         with admin.cursor() as cur:
+            # Database names cannot be bind parameters; `name` is random hex and is quoted by
+            # sql.Identifier, psycopg2's composition API for identifiers.
+            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
             cur.execute(sql.SQL("create database {}").format(sql.Identifier(name)))
         dsn = make_dsn(**{**parse_dsn(admin_dsn), "dbname": name})
         conn = migrate.connect(dsn)
@@ -184,6 +187,8 @@ def canonical(dump: str, admin_dsn: str) -> str:
                 "where datname = %s and pid <> pg_backend_pid()",
                 (name,),
             )
+            # Same as above: random hex, quoted by sql.Identifier.
+            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
             cur.execute(sql.SQL("drop database if exists {}").format(sql.Identifier(name)))
         admin.close()
 
