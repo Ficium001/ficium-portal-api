@@ -108,6 +108,11 @@ A change made on live without a `db/` file fails this. Then the files live has
 not run yet are applied to the scratch cell, so a file that cannot build a new
 cell fails before it ships.
 
+First snapshot: taken Nov 20 2026 through `063_four_eyes_show_the_change.sql`
+(14,821 lines; no `INSERT`/`COPY`, no e-mail addresses, URLs or real ids).
+A cell built from it matched live line for line, and `064_api_traffic.sql`
+(merged Nov 17, **not yet applied on live**) then applied cleanly.
+
 **To regenerate** (after a hand fix on live, or to move `through` forward):
 push any change on a branch named `schema-baseline/...` and open a PR. The
 workflow takes the snapshot from live, verifies it as above, and commits it to
