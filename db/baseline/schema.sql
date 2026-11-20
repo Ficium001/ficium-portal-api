@@ -1,5 +1,5 @@
 -- Ficium Portal DB schema baseline. GENERATED: do not edit by hand.
--- Schema only (no rows), through 063_four_eyes_show_the_change.sql. Regenerate with the
+-- Schema only (no rows), through 064_api_traffic.sql. Regenerate with the
 -- schema-baseline workflow on a schema-baseline/* branch; see db/README.md.
 
 --
@@ -2754,6 +2754,21 @@ BEGIN
       FOR UPDATE SKIP LOCKED)
   RETURNING o.id, o.envelope, o.attempts;
 END $$;
+
+--
+-- Name: defer(text); Type: FUNCTION; Schema: integration; Owner: -
+--
+
+CREATE FUNCTION integration.defer(p_id text) RETURNS void
+    LANGUAGE sql SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'integration'
+    AS $$
+  UPDATE integration.outbox
+     SET status = 'pending', attempts = greatest(attempts - 1, 0), lease_until = NULL,
+         next_attempt_at = now() + interval '1 minute' * (1 + random() * 0.2),
+         last_error = 'held: the receiving side has paused this channel'
+   WHERE id = p_id AND status = 'sending';
+$$;
 
 --
 -- Name: enqueue(text, text, jsonb, text); Type: FUNCTION; Schema: integration; Owner: -
@@ -6921,6 +6936,61 @@ CREATE TABLE integration.aggregate_sequence (
 );
 
 --
+-- Name: api_channel_policy; Type: TABLE; Schema: integration; Owner: -
+--
+
+CREATE TABLE integration.api_channel_policy (
+    channel text NOT NULL,
+    state text NOT NULL,
+    version bigint NOT NULL,
+    reason text,
+    changed_by uuid,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT api_channel_policy_channel_check CHECK ((channel ~ '^[a-z][a-z0-9_.]{2,59}$'::text)),
+    CONSTRAINT api_channel_policy_reason_check CHECK (((reason IS NULL) OR (length(reason) <= 2000))),
+    CONSTRAINT api_channel_policy_state_check CHECK ((state = ANY (ARRAY['enabled'::text, 'paused'::text]))),
+    CONSTRAINT api_channel_policy_version_check CHECK ((version >= 0))
+);
+
+--
+-- Name: api_channel_status; Type: TABLE; Schema: integration; Owner: -
+--
+
+CREATE TABLE integration.api_channel_status (
+    channel text NOT NULL,
+    last_ok_at timestamp with time zone,
+    last_error_at timestamp with time zone,
+    last_error text,
+    CONSTRAINT api_channel_status_channel_check CHECK ((channel ~ '^[a-z][a-z0-9_.]{2,59}$'::text)),
+    CONSTRAINT api_channel_status_last_error_check CHECK (((last_error IS NULL) OR (length(last_error) <= 300)))
+);
+
+--
+-- Name: api_traffic_hour; Type: TABLE; Schema: integration; Owner: -
+--
+
+CREATE TABLE integration.api_traffic_hour (
+    channel text NOT NULL,
+    hour timestamp with time zone NOT NULL,
+    total bigint DEFAULT 0 NOT NULL,
+    ok bigint DEFAULT 0 NOT NULL,
+    client_errors bigint DEFAULT 0 NOT NULL,
+    server_errors bigint DEFAULT 0 NOT NULL,
+    network_errors bigint DEFAULT 0 NOT NULL,
+    blocked bigint DEFAULT 0 NOT NULL,
+    lat_b0 bigint DEFAULT 0 NOT NULL,
+    lat_b1 bigint DEFAULT 0 NOT NULL,
+    lat_b2 bigint DEFAULT 0 NOT NULL,
+    lat_b3 bigint DEFAULT 0 NOT NULL,
+    lat_b4 bigint DEFAULT 0 NOT NULL,
+    lat_b5 bigint DEFAULT 0 NOT NULL,
+    lat_b6 bigint DEFAULT 0 NOT NULL,
+    lat_b7 bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT api_traffic_hour_channel_check CHECK ((channel ~ '^[a-z][a-z0-9_.]{2,59}$'::text)),
+    CONSTRAINT api_traffic_hour_hour_check CHECK ((hour = date_trunc('hour'::text, hour)))
+);
+
+--
 -- Name: document_upload; Type: TABLE; Schema: integration; Owner: -
 --
 
@@ -8844,6 +8914,27 @@ ALTER TABLE ONLY integration.aggregate_sequence
     ADD CONSTRAINT aggregate_sequence_pkey PRIMARY KEY (aggregate_id);
 
 --
+-- Name: api_channel_policy api_channel_policy_pkey; Type: CONSTRAINT; Schema: integration; Owner: -
+--
+
+ALTER TABLE ONLY integration.api_channel_policy
+    ADD CONSTRAINT api_channel_policy_pkey PRIMARY KEY (channel);
+
+--
+-- Name: api_channel_status api_channel_status_pkey; Type: CONSTRAINT; Schema: integration; Owner: -
+--
+
+ALTER TABLE ONLY integration.api_channel_status
+    ADD CONSTRAINT api_channel_status_pkey PRIMARY KEY (channel);
+
+--
+-- Name: api_traffic_hour api_traffic_hour_pkey; Type: CONSTRAINT; Schema: integration; Owner: -
+--
+
+ALTER TABLE ONLY integration.api_traffic_hour
+    ADD CONSTRAINT api_traffic_hour_pkey PRIMARY KEY (channel, hour);
+
+--
 -- Name: document_upload document_upload_pkey; Type: CONSTRAINT; Schema: integration; Owner: -
 --
 
@@ -9854,6 +9945,12 @@ CREATE UNIQUE INDEX uq_one_vote_per_actor ON institution.approval_action USING b
 --
 
 CREATE UNIQUE INDEX uq_pipeline_template_default ON institution.pipeline_template USING btree (institution_id) WHERE ((is_default = true) AND (is_active = true));
+
+--
+-- Name: api_traffic_hour_hour_idx; Type: INDEX; Schema: integration; Owner: -
+--
+
+CREATE INDEX api_traffic_hour_hour_idx ON integration.api_traffic_hour USING btree (hour);
 
 --
 -- Name: ix_document_upload_doc; Type: INDEX; Schema: integration; Owner: -
@@ -12655,6 +12752,24 @@ ALTER TABLE integration.acceptance_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE integration.aggregate_sequence ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: api_channel_policy; Type: ROW SECURITY; Schema: integration; Owner: -
+--
+
+ALTER TABLE integration.api_channel_policy ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: api_channel_status; Type: ROW SECURITY; Schema: integration; Owner: -
+--
+
+ALTER TABLE integration.api_channel_status ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: api_traffic_hour; Type: ROW SECURITY; Schema: integration; Owner: -
+--
+
+ALTER TABLE integration.api_traffic_hour ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: document_upload; Type: ROW SECURITY; Schema: integration; Owner: -
 --
 
@@ -13697,6 +13812,12 @@ REVOKE ALL ON FUNCTION integration.build_market_intelligence() FROM PUBLIC;
 --
 
 REVOKE ALL ON FUNCTION integration.claim_batch(p_limit integer, p_lease_seconds integer) FROM PUBLIC;
+
+--
+-- Name: FUNCTION defer(p_id text); Type: ACL; Schema: integration; Owner: -
+--
+
+REVOKE ALL ON FUNCTION integration.defer(p_id text) FROM PUBLIC;
 
 --
 -- Name: FUNCTION enqueue(p_type text, p_aggregate_id text, p_data jsonb, p_source text); Type: ACL; Schema: integration; Owner: -
