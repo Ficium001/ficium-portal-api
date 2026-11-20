@@ -28,6 +28,7 @@ from sqlalchemy import Row, text
 from sqlalchemy.orm import Session
 
 from ..core import doa
+from ..core.approval_errors import NO_APPROVER_MESSAGE, pg_detail
 from ..core.roles import INSTITUTION_ADMIN_ROLES
 from ..deps import current_claims as get_claims
 from ..deps import tenant_conn
@@ -52,6 +53,7 @@ ENGINE_ERRORS: dict[str, tuple[int, str]] = {
     "APPROVALS_DELEGATION_INVALID": (403, "No valid delegation covers this action."),
     "APPROVALS_TEMPLATE_NOT_ACTIVE": (409, "Routed template is not active."),
     "APPROVALS_NOT_WITHDRAWABLE": (409, "Only in-progress approvals can be withdrawn."),
+    "APPROVALS_NO_APPROVER": (409, NO_APPROVER_MESSAGE),
 }
 
 
@@ -64,6 +66,8 @@ def _engine_call(conn: Session, sql: str, params: dict) -> Any:
         for code, (status, detail) in ENGINE_ERRORS.items():
             if code in msg:
                 conn.rollback()
+                if code == "APPROVALS_NO_APPROVER" and (why := pg_detail(e)):
+                    detail = f"{why} {detail}"
                 raise HTTPException(status_code=status, detail=detail) from e
         if "uq_one_vote_per_actor" in msg or "duplicate key" in msg:
             conn.rollback()

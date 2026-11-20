@@ -102,9 +102,17 @@ class Journey:
 
 
 def _person(
-    j: Journey, key: str, slug: str, *, member_id: str | None = None, auth_uid: str | None = None
+    j: Journey,
+    key: str,
+    slug: str,
+    *,
+    member_role: str = "maker",
+    member_id: str | None = None,
+    auth_uid: str | None = None,
 ) -> None:
-    """A portal user at MCB in the given group (created in-transaction unless ids given)."""
+    """A portal user at MCB in the given group with the given maker/checker role
+    (created in-transaction unless ids given). member_role is what the approval
+    engine checks: a credit step with approver_role 'checker' needs a checker."""
     if member_id is None:
         member_id, auth_uid = str(uuid.uuid4()), str(uuid.uuid4())
         email = f"golden-{key}-{member_id[:6]}@zz.mu"
@@ -116,10 +124,18 @@ def _person(
         )
         j.sql(
             """INSERT INTO institution.member (id, institution_id, auth_user_id, email, full_name,
-                 is_primary_admin, active, group_id)
+                 is_primary_admin, active, group_id, member_role)
                  VALUES (CAST(:m AS uuid), CAST(:i AS uuid), CAST(:a AS uuid), :e, :n, false, true,
-                         (SELECT id FROM portal_admin.user_groups WHERE slug = :g))""",
-            {"m": member_id, "i": MCB, "a": auth_uid, "e": email, "n": f"Golden {key}", "g": slug},
+                         (SELECT id FROM portal_admin.user_groups WHERE slug = :g), :r)""",
+            {
+                "m": member_id,
+                "i": MCB,
+                "a": auth_uid,
+                "e": email,
+                "n": f"Golden {key}",
+                "g": slug,
+                "r": member_role,
+            },
         )
     else:
         email = j.sql(
@@ -286,7 +302,7 @@ def ok(r: httpx.Response, step: str, *codes: int) -> Any:
 def test_golden_path(journey: Journey) -> None:
     j = journey
     _person(j, "officer", "bank_officer")
-    _person(j, "approver", "bank_officer_approver")
+    _person(j, "approver", "bank_officer_approver", member_role="checker")
     _person(j, "admin", "institution_admin")
     request_id, anon_id = str(uuid.uuid4()), str(uuid.uuid4())
     if not j.sql(
@@ -660,25 +676,20 @@ def _approve_stage(j: Journey, pipeline_id: str, stage_id: str, stage: dict[str,
     for _ in range(10):
         pending = j.sql(
             """
-            SELECT asi.id, m.id AS member_id, m.auth_user_id, g.slug, sd.name
+            SELECT asi.id, m.id AS member_id, m.auth_user_id, g.slug, sd.name, m.member_role
               FROM institution.approval_stage_instance asi
               JOIN institution.approval_instance ai ON ai.id = asi.instance_id
               JOIN institution.approval_stage_def sd ON sd.id = asi.stage_def_id
               JOIN institution.member m ON m.institution_id = ai.institution_id AND m.active
               LEFT JOIN portal_admin.user_groups g ON g.id = m.group_id
              WHERE asi.instance_id = CAST(:i AS uuid) AND asi.status = 'active'
-               AND m.auth_user_id::text IS DISTINCT FROM ai.entity_maker_id::text
-               AND m.id::text IS DISTINCT FROM ai.entity_maker_id::text
-               AND (   (sd.committee_id IS NOT NULL AND EXISTS (
-                          SELECT 1 FROM institution.committee_member cm
-                           WHERE cm.committee_id = sd.committee_id AND cm.member_id = m.id
-                             AND cm.is_voting AND (cm.valid_to IS NULL OR cm.valid_to > now())))
-                    OR (sd.committee_id IS NULL
-                        AND sd.approver_role IN (g.slug, m.role, m.member_role)))
+               -- the engine's own rule, not a copy of it: whoever approvals_cast would accept
+               AND m.auth_user_id IS DISTINCT FROM ai.entity_maker_id
+               AND institution.approvals_is_eligible(asi.id, m.auth_user_id)
                AND NOT EXISTS (SELECT 1 FROM institution.approval_action a
                                 WHERE a.stage_instance_id = asi.id
-                                  AND a.actor_id::text IN (m.id::text, m.auth_user_id::text))
-             ORDER BY asi.seq, (m.auth_user_id::text LIKE '%') DESC LIMIT 1""",
+                                  AND a.actor_id = m.auth_user_id)
+             ORDER BY asi.seq, m.created_at LIMIT 1""",
             {"i": str(inst)},
         )
         if not pending:
@@ -689,13 +700,14 @@ def _approve_stage(j: Journey, pipeline_id: str, stage_id: str, stage: dict[str,
             if st == "approved":
                 return
             raise AssertionError(f"7: credit approval is '{st}' and nobody at MCB can act on it")
-        asi, member_id, auth_uid, slug, step = pending[0]
+        asi, member_id, auth_uid, slug, step, mrole = pending[0]
         key = f"approver-{str(member_id)[:6]}"
         if key not in j.people:
             _person(
                 j,
                 key,
                 slug or "institution_admin",
+                member_role=mrole or "maker",
                 member_id=str(member_id),
                 auth_uid=str(auth_uid),
             )

@@ -120,7 +120,7 @@ def _portal_events(j: Journey, *aggregates: str, since: set[str]) -> list[dict[s
 def test_golden_path_two_sides(journey: Journey, app_side: AppSide) -> None:  # noqa: F811
     j, app = journey, app_side
     _person(j, "officer", "bank_officer")
-    _person(j, "approver", "bank_officer_approver")
+    _person(j, "approver", "bank_officer_approver", member_role="checker")
     _person(j, "admin", "institution_admin")
     seen: set[str] = set()
 
