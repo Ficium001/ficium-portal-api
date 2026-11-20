@@ -505,3 +505,36 @@ def test_real_baseline_builds_a_cell(make_db):
         "where n.nspname = 'institution' and c.relrowsecurity",
     )[0][0]
     assert n > 20, "RLS should be on across the institution schema"
+
+
+def test_canonical_removes_pooler_search_path_artefact(make_db, mig_dir, monkeypatch):
+    """A live dump whose search_path leaked (names unqualified) canonicalises to the clean dump."""
+    usable, exe = _pg_dump_for_tests()
+    if not usable:
+        pytest.skip("no docker and no local pg_dump matching the server")
+    if exe:
+        monkeypatch.setenv("SCHEMA_BASELINE_PG_DUMP", exe)
+    sb_spec = importlib.util.spec_from_file_location("sb2", ROOT / "scripts" / "schema_baseline.py")
+    assert sb_spec and sb_spec.loader
+    sb = importlib.util.module_from_spec(sb_spec)
+    sys.modules["sb2"] = sb
+    sb_spec.loader.exec_module(sb)
+    monkeypatch.setattr(sb, "SCHEMAS", ("institution", "ops", "public"))
+
+    (mig_dir / "041_trigger.sql").write_text(
+        "create function public.touch() returns trigger language plpgsql "
+        "as $$ begin return new; end $$;\n"
+        "create trigger alpha_touch before update on institution.alpha "
+        "for each row execute function public.touch();\n"
+    )
+    live = make_db()
+    assert run(["--apply", "--fresh"], mig_dir, PORTAL_DB_DSN=live) == 0
+    clean = sb.normalise(sb.pg_dump(live))
+    assert "EXECUTE FUNCTION public.touch()" in clean
+    leaked = clean.replace(
+        "SELECT pg_catalog.set_config('search_path', '', false);",
+        "SELECT pg_catalog.set_config('search_path', 'public', false);",
+    ).replace("EXECUTE FUNCTION public.touch()", "EXECUTE FUNCTION touch()")
+    assert leaked != clean
+    assert sb.canonical(leaked, ADMIN_DSN) == clean
+    assert sb.canonical(clean, ADMIN_DSN) == clean

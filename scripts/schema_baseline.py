@@ -1,7 +1,7 @@
 """Schema baseline for new bank cells: a schema-only snapshot of the live Portal DB.
 
     python scripts/schema_baseline.py live-point DSN    # latest file in the live ledger
-    python scripts/schema_baseline.py dump DSN OUT      # normalised dump of the Ficium schemas
+    python scripts/schema_baseline.py dump DSN OUT [--canonical ADMIN_DSN]
     python scripts/schema_baseline.py write LIVE_SQL --through FILE
     python scripts/schema_baseline.py scan FILE         # fail on anything like a secret
 
@@ -16,6 +16,13 @@ it builds a scratch cell to the live ledger point and diffs its dump against
 live. Any difference fails, including hand-made hotfixes on live that no
 db/ file explains.
 
+A dump of live is taken through the Supabase pooler, where pg_dump's own
+search_path='' did not always hold (observed 20 Nov 2026: one dump came out
+with search_path 'public, extensions' and unqualified names). --canonical
+removes that variable: the dump is restored into a throwaway database on
+ADMIN_DSN (a direct connection) and dumped again from there, so live and
+scratch are both dumped the same way.
+
 Every dump uses the same pinned pg_dump (the postgres:17-alpine image, through
 docker), so live and scratch dumps are byte-comparable: a different pg_dump
 build can emit different output for identical schemas. Set
@@ -29,11 +36,13 @@ import datetime as dt
 import hashlib
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
 
 import psycopg2
+from psycopg2.extensions import make_dsn, parse_dsn
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_DIR = ROOT / "db" / "baseline"
@@ -148,6 +157,36 @@ def normalise(dump: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
+def canonical(dump: str, admin_dsn: str) -> str:
+    """Restore `dump` into a throwaway database on `admin_dsn`, dump it again, drop it."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import migrate  # noqa: PLC0415 - sibling script, same compat layer as a new cell
+
+    name = "canon_" + secrets.token_hex(6)
+    admin = psycopg2.connect(admin_dsn)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'create database "{name}"')
+        dsn = make_dsn(**{**parse_dsn(admin_dsn), "dbname": name})
+        conn = migrate.connect(dsn)
+        try:
+            compat = migrate.compat_sql(conn, roles_in(dump), migrate.DEFAULT_DB_DIR)
+            migrate.q(conn, compat + dump)
+        finally:
+            conn.close()
+        return normalise(pg_dump(dsn))
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(
+                "select pg_terminate_backend(pid) from pg_stat_activity "
+                "where datname = %s and pid <> pg_backend_pid()",
+                (name,),
+            )
+            cur.execute(f'drop database if exists "{name}"')
+        admin.close()
+
+
 # ── Roles, secrets ───────────────────────────────────────────────────────────
 
 
@@ -254,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("dump")
     p.add_argument("dsn")
     p.add_argument("out", type=Path)
+    p.add_argument("--canonical", metavar="ADMIN_DSN", help="restore and re-dump on this server")
     p = sub.add_parser("write")
     p.add_argument("live_sql", type=Path)
     p.add_argument("--through", required=True)
@@ -264,7 +304,10 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "live-point":
         print(live_point(a.dsn))
     elif a.cmd == "dump":
-        a.out.write_text(normalise(pg_dump(a.dsn)))
+        text = normalise(pg_dump(a.dsn))
+        if a.canonical:
+            text = canonical(text, a.canonical)
+        a.out.write_text(text)
         print(f"dumped {len(a.out.read_text().splitlines())} lines to {a.out}")
     elif a.cmd == "write":
         write(a.live_sql, a.through)

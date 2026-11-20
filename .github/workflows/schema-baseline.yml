@@ -79,8 +79,8 @@ jobs:
           echo "Live ledger is at $point. Files merged but not yet applied on live:"
           python scripts/migrate.py --status || true
 
-      - name: Dump live (schema only)
-        run: python scripts/schema_baseline.py dump "$PORTAL_DB_DSN" /tmp/live.sql
+      - name: Dump live (schema only, canonicalised on the scratch server)
+        run: python scripts/schema_baseline.py dump "$PORTAL_DB_DSN" /tmp/live.sql --canonical "$SCRATCH_ADMIN"
 
       - name: Regenerate the snapshot (schema-baseline/* branches)
         if: env.REGENERATE == 'true'
