@@ -36,7 +36,16 @@ GRANT USAGE ON SCHEMA institution TO authenticated;
 GRANT SELECT(id) ON TABLE institution.member TO authenticated WITH GRANT OPTION;
 REVOKE ALL ON TABLE institution.member FROM PUBLIC;
 GRANT ALL ON SCHEMA public TO PUBLIC;
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: -
+--
+
 ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON TABLES TO anon;
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: institution; Owner: -
+--
+
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA institution GRANT SELECT ON TABLES TO rdr;
 CREATE FUNCTION institution.f() RETURNS void LANGUAGE sql AS $$ SELECT 1 $$
     SET search_path TO 'public';
@@ -50,6 +59,9 @@ def test_normalise_drops_volatile_and_platform_lines() -> None:
     assert "\\restrict" not in out and "\\unrestrict" not in out
     assert "Dumped from" not in out and "Dumped by" not in out
     assert "FOR ROLE supabase_admin" not in out
+    # the header of the dropped statement goes too; the one with a statement stays
+    assert "Schema: public; Owner: -" not in out
+    assert "Schema: institution; Owner: -" in out
     assert "CREATE SCHEMA IF NOT EXISTS public;" in out
     assert "CREATE SCHEMA institution;" in out
     assert "\n\n\n" not in out

@@ -16,8 +16,10 @@ it builds a scratch cell to the live ledger point and diffs its dump against
 live. Any difference fails, including hand-made hotfixes on live that no
 db/ file explains.
 
-pg_dump must be 17+ (the server is 17). If the local pg_dump is older or
-missing, the postgres:17-alpine image is used through docker.
+Every dump uses the same pinned pg_dump (the postgres:17-alpine image, through
+docker), so live and scratch dumps are byte-comparable: a different pg_dump
+build can emit different output for identical schemas. Set
+SCHEMA_BASELINE_PG_DUMP to use a local binary instead (tests without docker).
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ import datetime as dt
 import hashlib
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -95,15 +96,8 @@ _IDENT = re.compile(r'^"?([a-z_][a-z0-9_]*)"?$')
 
 
 def _local_pg_dump() -> str | None:
-    # SCHEMA_BASELINE_PG_DUMP: tests point this at a pg_dump matching their server.
-    if forced := os.environ.get("SCHEMA_BASELINE_PG_DUMP"):
-        return forced
-    exe = shutil.which("pg_dump")
-    if not exe:
-        return None
-    out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
-    m = re.search(r"(\d+)\.", out)
-    return exe if m and int(m.group(1)) >= 17 else None
+    # Only when explicitly asked for: see the module docstring.
+    return os.environ.get("SCHEMA_BASELINE_PG_DUMP") or None
 
 
 def pg_dump(dsn: str) -> str:
@@ -123,14 +117,36 @@ def pg_dump(dsn: str) -> str:
     return res.stdout
 
 
+def _sections(lines: list[str]) -> list[list[str]]:
+    """Split a dump at pg_dump's object headers ("--" / "-- Name: ..." / "--")."""
+    out: list[list[str]] = [[]]
+    for i, line in enumerate(lines):
+        if (
+            line == "--"
+            and i + 2 < len(lines)
+            and lines[i + 1].startswith("-- Name: ")
+            and lines[i + 2] == "--"
+        ):
+            out.append([])
+        out[-1].append(line)
+    return out
+
+
 def normalise(dump: str) -> str:
-    out = []
+    kept = []
     for line in dump.splitlines():
         if _DROP_LINE.match(line) or _SUPABASE_DEFAULTS.match(line):
             continue
         if line == "CREATE SCHEMA public;":
             line = "CREATE SCHEMA IF NOT EXISTS public;"
-        out.append(line)
+        kept.append(line)
+    out: list[str] = []
+    for sec in _sections(kept):
+        is_object = len(sec) >= 3 and sec[1].startswith("-- Name: ")
+        body = sec[3:] if is_object else sec
+        if is_object and not any(ln.strip() for ln in body):
+            continue  # header of an object whose statements were all dropped
+        out.extend(sec)
     text = "\n".join(out).strip() + "\n"
     return re.sub(r"\n{3,}", "\n\n", text)
 

@@ -435,26 +435,31 @@ def _server_major() -> int:
     return int(rows(ADMIN_DSN, "select current_setting('server_version_num')::int / 10000")[0][0])
 
 
-def _matching_pg_dump() -> str | None:
+def _pg_dump_for_tests() -> tuple[bool, str | None]:
+    """(usable, local binary). None = the pinned docker image, as in production."""
     import re
     import subprocess
 
-    for exe in (os.environ.get("SCHEMA_BASELINE_PG_DUMP"), shutil.which("pg_dump")):
-        if not exe:
-            continue
+    if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+        return True, None
+    exe = os.environ.get("SCHEMA_BASELINE_PG_DUMP") or shutil.which("pg_dump")
+    if exe:
         out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
         m = re.search(r"(\d+)\.", out)
         if m and int(m.group(1)) >= _server_major():
-            return exe
-    return None
+            return True, exe
+    return False, None
 
 
 def test_round_trip_dump_build_dump_is_identical(make_db, mig_dir, tmp_path, monkeypatch):
     """What the schema-baseline workflow does against live, on a stand-in 'live'."""
-    exe = _matching_pg_dump()
-    if not exe:
-        pytest.skip("no pg_dump matching the server")
-    monkeypatch.setenv("SCHEMA_BASELINE_PG_DUMP", exe)
+    usable, exe = _pg_dump_for_tests()
+    if not usable:
+        pytest.skip("no docker and no local pg_dump matching the server")
+    if exe:
+        monkeypatch.setenv("SCHEMA_BASELINE_PG_DUMP", exe)
+    else:
+        monkeypatch.delenv("SCHEMA_BASELINE_PG_DUMP", raising=False)
     sb_spec = importlib.util.spec_from_file_location("sb", ROOT / "scripts" / "schema_baseline.py")
     assert sb_spec and sb_spec.loader
     sb = importlib.util.module_from_spec(sb_spec)
