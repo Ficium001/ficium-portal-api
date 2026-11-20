@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl libreoffic
 
 COPY requirements.txt .
 COPY vendor ./vendor
-RUN sha256sum -c vendor/SHA256SUMS && pip install --no-cache-dir -r requirements.txt
+RUN (cd vendor && sha256sum -c SHA256SUMS) && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY db ./db
