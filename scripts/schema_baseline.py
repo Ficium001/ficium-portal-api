@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extensions import make_dsn, parse_dsn
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -167,7 +168,7 @@ def canonical(dump: str, admin_dsn: str) -> str:
     admin.autocommit = True
     try:
         with admin.cursor() as cur:
-            cur.execute(f'create database "{name}"')
+            cur.execute(sql.SQL("create database {}").format(sql.Identifier(name)))
         dsn = make_dsn(**{**parse_dsn(admin_dsn), "dbname": name})
         conn = migrate.connect(dsn)
         try:
@@ -183,7 +184,7 @@ def canonical(dump: str, admin_dsn: str) -> str:
                 "where datname = %s and pid <> pg_backend_pid()",
                 (name,),
             )
-            cur.execute(f'drop database if exists "{name}"')
+            cur.execute(sql.SQL("drop database if exists {}").format(sql.Identifier(name)))
         admin.close()
 
 
