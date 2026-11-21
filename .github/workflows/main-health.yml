@@ -1,0 +1,80 @@
+name: main-health
+
+# Nobody noticed main was red for days in Nov 2026 (integration and the
+# golden path). Branch protection cannot require checks on this private repo
+# on the current GitHub plan, so this makes a red main loud instead:
+#
+#   a watched workflow fails on main -> open (or comment on) an issue
+#   "main is red: <workflow>", labelled main-red; GitHub emails watchers
+#   the same workflow passes again   -> close that issue
+#
+# Advisory jobs (ADVISORY below) never open an issue: go-live-readiness is red
+# by design until a pilot bank's setup is complete.
+
+on:
+  workflow_run:
+    workflows: [CI, integration-tests, SAST, schema-baseline, reconcile]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      WORKFLOW: ${{ github.event.workflow_run.name }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      EVENT: ${{ github.event.workflow_run.event }}
+      ADVISORY: "go-live-readiness"
+    steps:
+      - name: Open, update or close the main-red issue
+        run: |
+          set -euo pipefail
+          title="main is red: ${WORKFLOW}"
+          existing=$(gh issue list --repo "$REPO" --state open --label main-red \
+                       --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+
+          if [ "$CONCLUSION" = "cancelled" ] || [ "$CONCLUSION" = "skipped" ]; then
+            echo "run was $CONCLUSION: nothing to report"; exit 0
+          fi
+
+          # Which jobs failed, ignoring advisory ones.
+          failed=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --paginate \
+                     --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | .name' \
+                   | grep -vxF -f <(printf '%s\n' $ADVISORY) || true)
+
+          if [ -z "$failed" ]; then
+            echo "no blocking job failed (conclusion: $CONCLUSION)"
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$REPO" \
+                --comment "Green again: [$WORKFLOW run]($RUN_URL) on \`${SHA:0:7}\`."
+            fi
+            exit 0
+          fi
+
+          jobs=$(printf '%s\n' "$failed" | sed 's/^/- `/; s/$/`/')
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "[$WORKFLOW run]($RUN_URL) failed on \`main\` at \`${SHA:0:7}\` (trigger: $EVENT)." \
+            "Failed jobs:" "$jobs")
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Still failing. $body"
+          else
+            gh label create main-red --repo "$REPO" --color B60205 \
+              --description "A workflow is failing on main" --force >/dev/null
+            gh issue create --repo "$REPO" --title "$title" --label main-red \
+              --body "$body
+
+          Closes itself when this workflow passes on \`main\` again."
+          fi
