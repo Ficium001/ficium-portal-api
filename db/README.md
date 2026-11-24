@@ -196,6 +196,7 @@ Still Supabase-shaped inside the snapshot, to retire over time:
 | `066_least_privilege_cleanup.sql` | From the Nov 24 2026 database audit: RLS enabled on `integration.admin_command_log` (was off; only postgres had grants); dead `authenticated` grants on `_retired_workflow_20261006` revoked; `authenticated` USAGE on `auth_portal` revoked (no table grants, tenant sessions never read it). No behaviour change for any API path | Yes |
 | `067_drop_cleared_backup_schema.sql` | Drops `_cleared_20261112`, the pre-reset copy of test data from Nov 12 2026 (20 tables incl. password hashes in an `auth_portal.auth_users` copy). Nothing referenced it; not part of the baseline. Approved by KJ, Nov 24 2026 | Yes |
 | `068_drop_retired_schemas.sql` | Drops `_retired_workflow_20261006` (old workflow, superseded by `institution.pipeline_*`) and `_rollback` (snapshot used by `rollback/022`–`024`, which can no longer run). Nothing referenced either; neither is in the baseline. Approved by KJ, Nov 24 2026 | Yes |
+| `069_fk_indexes_and_policy_initplan.sql` | Index for every foreign key that had none (74) and policies call `auth.uid()`/`jwt()`/`role()` through `(select …)` (19), evaluated once per query. Self-checking block: fails and rolls back if anything is left; no-op on an already-fixed cell. Dry-run on live (rolled back), then applied Nov 24 2026 | Yes |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
