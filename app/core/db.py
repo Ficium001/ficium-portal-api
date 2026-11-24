@@ -97,6 +97,15 @@ def _session_or_raise() -> sessionmaker:
     return _SessionLocal
 
 
+# Undo what an earlier client of a pooled connection can leave behind (pg_dump sets
+# both for its session; Supabase's pooler does not reset them). Transaction-scoped.
+_RESET_POOLED_SETTINGS = (
+    "SELECT set_config('row_security', 'on', true), "
+    "CASE WHEN current_setting('restrict_nonsystem_relation_kind', true) IS NOT NULL "
+    "THEN set_config('restrict_nonsystem_relation_kind', '', true) END"
+)
+
+
 @contextmanager
 def tenant_session(claims: dict[str, Any]) -> Generator[Session]:
     """
@@ -159,6 +168,8 @@ def service_session() -> Generator[Session]:
     SessionLocal = _session_or_raise()
     session = SessionLocal()
     try:
+        # Same carried-over settings as in tenant_session(): views would be refused.
+        session.execute(text(_RESET_POOLED_SETTINGS))
         yield session
         session.commit()
     except Exception:
