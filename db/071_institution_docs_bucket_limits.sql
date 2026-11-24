@@ -11,10 +11,17 @@
 -- From the 2026-11-24 database audit.
 -- =============================================================================
 
-update storage.buckets
-   set file_size_limit = 20 * 1024 * 1024,
-       allowed_mime_types = array[
-         'application/pdf', 'image/jpeg', 'image/png', 'image/heic', 'image/webp',
-         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']
- where id = 'institution-docs';
+-- Guarded: a cell on plain Postgres (CI, or a bank cell without Supabase Storage) has no
+-- storage schema, and there is nothing to limit.
+do $$
+begin
+  if to_regclass('storage.buckets') is not null then
+    update storage.buckets
+       set file_size_limit = 20 * 1024 * 1024,
+           allowed_mime_types = array[
+             'application/pdf', 'image/jpeg', 'image/png', 'image/heic', 'image/webp',
+             'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']
+     where id = 'institution-docs';
+  end if;
+end $$;
