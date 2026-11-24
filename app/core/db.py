@@ -131,9 +131,17 @@ def tenant_session(claims: dict[str, Any]) -> Generator[Session]:
         # current_user = authenticated with rolbypassrls = false. Every API
         # call pays each DB round trip, so this matters when the API and
         # the database are in different regions.
+        # The same statement also undoes two settings a pooled connection can
+        # carry over from an earlier client (pg_dump sets both for its
+        # session, and Supabase's pooler does not reset them): row_security
+        # off makes every RLS query fail, and restrict_nonsystem_relation_kind
+        # (Postgres 17+) blocks views. Both reset with the transaction.
         session.execute(
             text("SELECT set_config('request.jwt.claims', :c, true), "
-                 "set_config('role', 'authenticated', true)"),
+                 "set_config('role', 'authenticated', true), "
+                 "set_config('row_security', 'on', true), "
+                 "CASE WHEN current_setting('restrict_nonsystem_relation_kind', true) IS NOT NULL "
+                 "THEN set_config('restrict_nonsystem_relation_kind', '', true) END"),
             {"c": claims_json},
         )
         yield session
