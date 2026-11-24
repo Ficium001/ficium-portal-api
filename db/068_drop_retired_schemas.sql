@@ -21,6 +21,7 @@
 -- Audit: Ficium database audit, 2026-11-24. Approved by KJ.
 -- =============================================================================
 
-drop schema _retired_workflow_20261006 cascade;
+-- if exists: a new cell built from db/baseline/ never had these schemas.
+drop schema if exists _retired_workflow_20261006 cascade;
 
-drop schema _rollback cascade;
+drop schema if exists _rollback cascade;

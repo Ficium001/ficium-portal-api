@@ -12,4 +12,5 @@
 -- Audit: Ficium database audit, 2026-11-24. Approved by KJ.
 -- =============================================================================
 
-drop schema _cleared_20261112 cascade;
+-- if exists: a new cell built from db/baseline/ never had this schema.
+drop schema if exists _cleared_20261112 cascade;

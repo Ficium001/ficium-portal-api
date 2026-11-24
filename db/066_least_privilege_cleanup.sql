@@ -19,6 +19,12 @@
 
 alter table integration.admin_command_log enable row level security;
 
-revoke all on all tables in schema _retired_workflow_20261006 from authenticated;
+-- Guarded: a new cell built from db/baseline/ never had this schema.
+do $$
+begin
+  if exists (select 1 from pg_namespace where nspname = '_retired_workflow_20261006') then
+    revoke all on all tables in schema _retired_workflow_20261006 from authenticated;
+  end if;
+end $$;
 
 revoke usage on schema auth_portal from authenticated;
