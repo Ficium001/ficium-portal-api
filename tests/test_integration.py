@@ -117,6 +117,14 @@ def rolled_back_tx(dsn: str):
     try:
         conn.autocommit = False
         cur = conn.cursor()
+        # The session pooler can hand over a connection pg_dump used last (the
+        # schema-baseline job dumps live at the same time): it leaves
+        # row_security off and views restricted. Same reset as tenant_session().
+        cur.execute(
+            "SELECT set_config('row_security', 'on', true), "
+            "CASE WHEN current_setting('restrict_nonsystem_relation_kind', true) IS NOT NULL "
+            "THEN set_config('restrict_nonsystem_relation_kind', '', true) END"
+        )
         if dsn == PORTAL_DSN:
             _seed_tenant(cur)
         yield cur
