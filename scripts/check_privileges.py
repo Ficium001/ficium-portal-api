@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import psycopg2
 from psycopg2.extensions import connection as Conn
@@ -97,6 +98,13 @@ def annotate(label: str, msg: str) -> None:
         print(f"::error title=privileges::[{label}] {msg}")
 
 
+def _session_dsn(dsn: str) -> str:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import migrate  # noqa: PLC0415 - sibling script
+
+    return str(migrate.session_dsn(dsn))
+
+
 def main() -> int:
     sources = (("portal", "PORTAL_DB_DSN"), ("app", "APP_DB_DSN"))
     targets = [(label, os.environ[env]) for label, env in sources if os.environ.get(env)]
@@ -105,11 +113,15 @@ def main() -> int:
 
     bad = 0
     for label, dsn in targets:
-        conn = psycopg2.connect(dsn)
-        conn.set_session(readonly=True, autocommit=True)
+        conn = psycopg2.connect(_session_dsn(dsn))
+        # Read-only per transaction (BEGIN READ ONLY), never per session: a
+        # session-level default_transaction_read_only stays on a pooled backend
+        # and makes the next client's writes fail (seen on Nov 20 2026).
+        conn.set_session(readonly=True, autocommit=False)
         try:
             findings = find(conn)
         finally:
+            conn.rollback()
             conn.close()
         if findings:
             print(f"{label} DB: {len(findings)} finding(s)")

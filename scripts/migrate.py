@@ -47,8 +47,13 @@ every file from 000.
 000_auth_shim.sql is only for non-Supabase Postgres and is recorded as
 skipped when auth.uid() already exists.
 
-Use a session-mode connection (Supabase session pooler, port 5432, or a
-direct connection): the advisory lock does not survive a transaction pooler.
+Session state and Supabase's pooler: the transaction pooler (port 6543) hands
+the same database backend to different clients without resetting it, so a
+session-level setting (pg_dump's search_path and row_security, an advisory
+lock, a read-only session) stays behind for whoever gets that backend next,
+including the API. Every connection made here goes through session_dsn(),
+which moves a transaction-pooler DSN to the session pooler (same host and
+credentials, port 5432).
 """
 
 from __future__ import annotations
@@ -58,11 +63,13 @@ import hashlib
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import psycopg2
 from psycopg2.extensions import connection as Conn
+from psycopg2.extensions import make_dsn, parse_dsn
 
 DEFAULT_DB_DIR = Path(__file__).resolve().parent.parent / "db"
 FILE_RE = re.compile(r"^[0-9]{3}_[a-z0-9_]+\.sql$")
@@ -234,7 +241,41 @@ def q(conn: Conn, sql: str) -> list[tuple]:
         return cur.fetchall() if cur.description else []
 
 
+SUPABASE_POOLER_SUFFIX = ".pooler.supabase.com"
+
+
+def describe_dsn(dsn: str) -> str:
+    """Where a DSN points, without credentials: for CI logs."""
+    p = parse_dsn(dsn)
+    host, port = p.get("host", ""), str(p.get("port") or "5432")
+    if host.endswith(SUPABASE_POOLER_SUFFIX):
+        mode = {"6543": "transaction pooler", "5432": "session pooler"}.get(port, "pooler")
+        return f"Supabase {mode} ({host}:{port})"
+    if host.endswith(".supabase.co"):
+        return f"Supabase direct connection ({host}:{port})"
+    return f"{host or 'local socket'}:{port}"
+
+
+def session_dsn(dsn: str) -> str:
+    """The same database through a connection whose session state is its own.
+
+    Supabase's transaction pooler (port 6543) shares backends between clients
+    and does not reset them, so session-level state leaks. Its session pooler
+    (port 5432, same host and credentials) gives each client its own backend.
+    """
+    p = parse_dsn(dsn)
+    if p.get("host", "").endswith(SUPABASE_POOLER_SUFFIX) and str(p.get("port")) == "6543":
+        print(
+            "note: using the Supabase session pooler (5432) instead of the "
+            "transaction pooler (6543), which leaks session state between clients",
+            file=sys.stderr,
+        )
+        return make_dsn(**{**p, "port": "5432"})
+    return dsn
+
+
 def connect(dsn: str) -> Conn:
+    dsn = session_dsn(dsn)
     conn = psycopg2.connect(dsn, connect_timeout=10, application_name="ficium-migrate")
     conn.autocommit = True
     return conn

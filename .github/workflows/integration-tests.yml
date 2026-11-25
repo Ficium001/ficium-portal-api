@@ -54,6 +54,22 @@ jobs:
             exit 1
           fi
 
+      - name: Where the DSNs point (host and port only, no credentials)
+        # The transaction pooler (6543) shares backends between clients without
+        # resetting them; scripts/migrate.py, schema_baseline.py and
+        # check_privileges.py move to the session pooler (5432) on their own.
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          from migrate import describe_dsn
+          for name in ("PORTAL_DB_DSN", "APP_DB_DSN"):
+              print(f"{name}: {describe_dsn(os.environ[name])}")
+          PY
+
       - name: Migrations applied and unedited (db/ vs ops.schema_migration)
         # Fails if a db/*.sql file was merged but never applied, or edited
         # after it was applied. Closes the class behind the Aug 2026 incident

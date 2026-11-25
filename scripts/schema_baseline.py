@@ -110,7 +110,17 @@ def _local_pg_dump() -> str | None:
     return os.environ.get("SCHEMA_BASELINE_PG_DUMP") or None
 
 
+def _session_dsn(dsn: str) -> str:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import migrate  # noqa: PLC0415 - sibling script
+
+    return str(migrate.session_dsn(dsn))
+
+
 def pg_dump(dsn: str) -> str:
+    # pg_dump makes session-level settings (search_path, row_security, timeouts):
+    # never through the transaction pooler, where they would outlive the dump.
+    dsn = _session_dsn(dsn)
     args = list(DUMP_FLAGS) + [f"--schema={s}" for s in SCHEMAS]
     exe = _local_pg_dump()
     if exe:
@@ -232,7 +242,9 @@ def scan(text: str) -> list[tuple[int, str]]:
 
 
 def live_point(dsn: str) -> str:
-    conn = psycopg2.connect(dsn, connect_timeout=20, application_name="ficium-schema-baseline")
+    conn = psycopg2.connect(
+        _session_dsn(dsn), connect_timeout=20, application_name="ficium-schema-baseline"
+    )
     try:
         with conn.cursor() as cur:
             cur.execute("select max(filename) from ops.schema_migration")

@@ -71,6 +71,9 @@ jobs:
             exit 1
           fi
 
+      - name: Where the live DSN points (host and port only)
+        run: python -c "import os, sys; sys.path.insert(0, 'scripts'); from migrate import describe_dsn; print('PORTAL_DB_DSN:', describe_dsn(os.environ['PORTAL_DB_DSN']))"
+
       - name: Live ledger point
         id: point
         run: |
