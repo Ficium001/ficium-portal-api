@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core import doa
+from ..core.approval_errors import NO_APPROVER_MESSAGE, pg_detail
 from ..core.credit_decision import (
     CreditDecisionInput,
     has_decision_permission,
@@ -543,6 +544,10 @@ def _submit_for_credit_approval(
         if "APPROVALS_TEMPLATE_NOT_ACTIVE" in str(exc):
             raise HTTPException(status_code=409,
                 detail="The approval chain this facility routes to is not active.") from exc
+        if "APPROVALS_NO_APPROVER" in str(exc):
+            why = pg_detail(exc)
+            raise HTTPException(status_code=409,
+                detail=f"{why} {NO_APPROVER_MESSAGE}" if why else NO_APPROVER_MESSAGE) from exc
         raise
     if row is None:
         raise HTTPException(status_code=500, detail="Internal error.")

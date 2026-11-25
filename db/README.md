@@ -42,6 +42,94 @@ own history (e.g. `fix_portal_notification_deal_links`,
 `enable_rls_marketplace_sync_state`) and would be missing from a rebuild.
 The table below is history; the ledger is the source of truth.
 
+## One database per bank (Nov 20 2026)
+
+The target architecture gives every bank its own cell: its own API
+deployment and its own database (see `ficium-infra/docs/architecture/`).
+The same runner migrates the whole fleet:
+
+```
+python scripts/migrate.py --cells cells.json --status --json   # where every cell is
+python scripts/migrate.py --cells cells.json --check           # CI / daily: any drift fails
+python scripts/migrate.py --cells cells.json --apply           # roll out, cell by cell
+python scripts/migrate.py --cells cells.json --cell newbank --apply --fresh   # new, empty cell
+```
+
+`cells.json` lists cells in rollout order and names the environment variable
+holding each DSN (from Doppler); a connection string in the file is rejected.
+Put the internal test cell first so it takes every release before a bank
+does. See `cells.example.json`.
+
+What `--apply` guarantees:
+
+- **Every cell is checked before any is changed.** An unreachable cell, a file
+  edited after it was applied, or a ledger row with no file stops the whole
+  run with nothing changed anywhere.
+- **One cell at a time, first failure stops the rollout.** The failed file is
+  rolled back on that cell (file and ledger row are one transaction); later
+  cells are not started. Fix forward with a new file and run again.
+- **One runner per database.** Each cell is migrated under an advisory lock;
+  a second runner stops instead of racing. Use a session-mode connection
+  (direct, or Supabase session pooler on 5432), not the transaction pooler.
+- **No accidental first runs.** A database without a ledger is migrated only
+  with `--cell NAME --fresh`, and only if it holds no Ficium schema. A live
+  database without a ledger must be baselined first (`--baseline`, one cell).
+- `--baseline` runs on exactly one cell.
+
+Tests: `tests/test_migrate.py`, against real Postgres 17 in CI
+(`MIGRATE_TEST_PG`); in CI a missing variable fails the job rather than
+skipping.
+
+### Building a new cell: `db/baseline/`
+
+Replaying history cannot build a new database: tried on Nov 20 2026, 23 of 34
+files in `ficium-portal/supabase/migrations` fail on an empty Postgres
+(`institution` is used before any file creates it: it was created outside
+these files), and most of `db/` fails behind them. So new cells start from a
+**schema-only snapshot of the live Portal DB** instead:
+
+| File | What |
+|---|---|
+| `baseline/schema.sql` | `pg_dump --schema-only --no-owner` of the Ficium schemas (`admin`, `audit`, `auth_portal`, `autobid`, `billing`, `catalog`, `entitlements`, `governance`, `identity`, `institution`, `integration`, `marketplace`, `ops`, `portal_admin`, `public`). No rows from any table, so no bank or borrower data. Generated, never edited |
+| `baseline/roles.txt` | Roles the snapshot grants to; created `NOLOGIN` on a new cell |
+| `baseline/BASELINE` | `through` (last file the snapshot includes), when it was taken, and the snapshot's SHA-256 (a hand edit is refused) |
+
+`migrate.py --fresh` builds a cell from it in **one transaction**: the roles,
+a small compatibility layer for plain Postgres (`extensions` schema with
+`pgcrypto`/`uuid-ossp`, the `auth.uid()`/`jwt()`/`role()` helpers from
+`000_auth_shim.sql`, an `auth.users` stub for the legacy `identity` keys), the
+snapshot, the ledger, and a `baseline` ledger row for every file up to
+`through`. Later files then apply normally.
+
+**Proof, every day and on every PR touching `db/`** (`.github/workflows/schema-baseline.yml`):
+dump live; build a scratch cell on Postgres 17 from the snapshot plus `db/`
+files up to the live ledger point; dump it; the two dumps must be identical.
+A change made on live without a `db/` file fails this. Then the files live has
+not run yet are applied to the scratch cell, so a file that cannot build a new
+cell fails before it ships.
+
+First snapshot: taken Nov 20 2026 through `063_four_eyes_show_the_change.sql`
+(14,821 lines; no `INSERT`/`COPY`, no e-mail addresses, URLs or real ids).
+A cell built from it matched live line for line, and `064_api_traffic.sql`
+(merged Nov 17, **not yet applied on live**) then applied cleanly.
+
+**To regenerate** (after a hand fix on live, or to move `through` forward):
+push any change on a branch named `schema-baseline/...` and open a PR. The
+workflow takes the snapshot from live, verifies it as above, and commits it to
+the branch.
+
+Normalised out of the dump: `\restrict` lines and version comments (change
+every run) and Supabase's `ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin`
+platform defaults (meaningless in a cell, and only a superuser may set them).
+
+Still Supabase-shaped inside the snapshot, to retire over time:
+- `identity.*` (legacy) keys reference `auth.users`; the compat stub keeps them valid.
+- One `pg_cron` job (`governance-expire-stale-actions`, every 5 min) lives in
+  `cron.job`, outside the snapshot: a cell needs a worker for it.
+- `institution._call_provision_user` calls `extensions.http_post`, but the
+  `http` extension is not installed on live, so the function cannot run.
+  It is dead code; `045` only looked for `pg_net` calls.
+
 ## Files
 
 | File | Purpose | Must run on Supabase? | Live as of Aug 3 2026? |
@@ -104,6 +192,16 @@ The table below is history; the ledger is the source of truth.
 | `062_security_advisor_hardening.sql` | Fixed `search_path` on the 32 functions the Supabase advisor flagged (incl. definer functions `institution._execute_action`, `submit_for_approval`, `audit.log`, the dual-control functions); `bid_benefit` insert policy limited to the owner role. | Yes |
 | `063_four_eyes_show_the_change.sql` | Four-eyes requests carry a readable before → after table frozen at submission (`governance.describe_change`, column `change`, plus `payload_before`/`resource_label`); `approve_action` refuses when the record changed since the request (`CHANGED_SINCE_REQUEST`). Pending requests backfilled. | Yes |
 | `064_api_traffic.sql` | API traffic for the admin site: `integration.api_channel_policy` (pause state per channel, versioned, written only by the admin command channel), `api_traffic_hour` (per channel per hour: outcome counts + 8 latency buckets, 35-day retention), `api_channel_status` (last ok / last scrubbed error). RLS on, nothing granted to API roles. Plus `integration.defer()` (a peer that answers 503 `channel_paused` is held, not failed, so a long pause cannot dead-letter events). Written by `app/core/api_traffic.py` | Yes |
+| `065_approvals_route_requires_an_approver.sql` | `approvals_route` refuses (`APPROVALS_NO_APPROVER`, 409 with the step, role and numbers) to start an approval when any step has fewer eligible approvers other than the submitter than the step needs (single/checklist/external hold 1, dual 2, committee by its quorum). Before, such a step sat active forever with nobody able to act. Same transaction, nothing created. Exercised on live Nov 20 2026 in a rolled-back transaction (8 cases) | Yes |
+| `066_least_privilege_cleanup.sql` | From the Nov 24 2026 database audit: RLS enabled on `integration.admin_command_log` (was off; only postgres had grants); dead `authenticated` grants on `_retired_workflow_20261006` revoked; `authenticated` USAGE on `auth_portal` revoked (no table grants, tenant sessions never read it). No behaviour change for any API path | Yes |
+| `067_drop_cleared_backup_schema.sql` | Drops `_cleared_20261112`, the pre-reset copy of test data from Nov 12 2026 (20 tables incl. password hashes in an `auth_portal.auth_users` copy). Nothing referenced it; not part of the baseline. Approved by KJ, Nov 24 2026 | Yes |
+| `068_drop_retired_schemas.sql` | Drops `_retired_workflow_20261006` (old workflow, superseded by `institution.pipeline_*`) and `_rollback` (snapshot used by `rollback/022`–`024`, which can no longer run). Nothing referenced either; neither is in the baseline. Approved by KJ, Nov 24 2026 | Yes |
+| `069_fk_indexes_and_policy_initplan.sql` | Index for every foreign key that had none (74) and policies call `auth.uid()`/`jwt()`/`role()` through `(select …)` (19), evaluated once per query. Self-checking block: fails and rolls back if anything is left; no-op on an already-fixed cell. Dry-run on live (rolled back), then applied Nov 24 2026 | Yes |
+| `070_policy_roles_and_claims_initplan.sql` | Drops duplicate `institution.group` policy `group_select`; 5 policies read the JWT claims through `(select current_setting(...))`; 47 tenant-scoped `public`-role policies now `TO authenticated`. No change in access. Dry-run on live, then applied Nov 24 2026 | Yes |
+| `071_institution_docs_bucket_limits.sql` | `institution-docs` bucket: 20 MB limit (same as `deal_documents.MAX_BYTES`) and only PDF, JPEG, PNG, HEIC, WebP, .docx, .xlsx (same as `ALLOWED_MIME`). Applied Nov 24 2026 | Yes |
+| `072_fee_models.sql` | Commission becomes a fee model per rule: `basis` booked_amount / annualised (first amount + monthly x months, for regular plans) / amount_x_term (per year of term, for deposits) / tiered (marginal or whole bands) / flat, with floor, cap and clawback (0-36 months, full or pro rata). One calculation, `billing.compute_fee()`, used by the booking and the admin preview; the working is stored on `commission_event.calc` (`commission_amt` is now the stored fee, not a generated column). Bookings take `monthly_amount` / `term_months`; `booking_fee_inputs()` says which a deal needs (no rates). `record_booking_closure()` records the account ending and writes an append-only clawback credit (`billing.commission_adjustment`) inside the window. Every rule checked by `rule_shape_error()` (also a table CHECK). Backwards compatible: new arguments have defaults; the live 0.5% default is unchanged. Self-verifying | Yes | |
+| `073_retire_supabase_auth_identity_admin.sql` | Drops the `on_auth_user_created` trigger, the `identity` and `admin` schemas (earlier admin identity models, unused), and deletes the 3 Supabase Auth test users from Jun 2026. `portal_admin` stays the bank-side model; logins are ficium-auth. Approved by KJ, applied Nov 25 2026 | Yes |
+| `074_compliance_view_own_institution.sql` | `institution.compliance` filters itself: a bank session sees only the row for the `institution_id` in its claims (was: every bank). `postgres`/service sessions (bid guard, admin endpoints) still see all. `security_barrier`; write grants removed. Audit 2026-11-24; applied Nov 25 2026 | Yes |
 
 The `005_*` pair and the `009_*` pair share a numeric prefix because they
 landed independently rather than by strict sequence — treat the prefix as a
@@ -114,11 +212,16 @@ file's own header comment for what it actually requires.
 
 ## Load order (non-Supabase / on-prem)
 
-1. `000_auth_shim.sql` — creates `auth.*` helpers the Portal SQL depends on
-2. Portal migrations from `ficium-portal/supabase/migrations/` in order — schema, RLS, maker-checker
-3. Every other file in this directory, in filename order
+One command, on an empty Postgres 17+:
 
-On Supabase, skip step 1 (Supabase already provides `auth.*`). Steps 2 and 3 always apply.
+```
+PORTAL_DB_DSN=... python scripts/migrate.py --apply --fresh
+```
+
+It builds from `db/baseline/` (see above), then applies every later file.
+The previous instructions (`000_auth_shim.sql`, then
+`ficium-portal/supabase/migrations/`, then this folder) do not work: those
+files cannot rebuild the schema (tested Nov 20 2026).
 
 ---
 

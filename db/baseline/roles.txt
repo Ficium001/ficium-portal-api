@@ -1,0 +1,5 @@
+# Roles the baseline grants to; created NOLOGIN on a new cell. Generated.
+anon
+authenticated
+postgres
+service_role

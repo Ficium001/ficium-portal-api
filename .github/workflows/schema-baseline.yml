@@ -1,0 +1,138 @@
+name: schema-baseline
+
+# db/baseline/ is a schema-only snapshot of the live Portal DB (no rows): the
+# starting point for every new bank cell (scripts/migrate.py --fresh).
+#
+# Every run proves it still matches production:
+#   1. dump live (schema only, Ficium schemas)
+#   2. build a scratch cell on plain Postgres 17 from db/baseline/ + db/ files,
+#      up to the point the live ledger has reached
+#   3. dump the scratch cell and diff: any difference fails, including changes
+#      made on live without a db/ file
+#   4. apply the files live has not run yet, to prove they apply cleanly
+#
+# On a schema-baseline/* PR branch it first regenerates the snapshot from live,
+# and commits it back to the branch once steps 2-4 pass.
+
+on:
+  pull_request:
+    paths:
+      - "db/**"
+      - "scripts/migrate.py"
+      - "scripts/schema_baseline.py"
+      - ".github/workflows/schema-baseline.yml"
+  schedule:
+    - cron: "15 5 * * *"   # daily, before the 06:00 integration sweep
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schema-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # only to commit a regenerated snapshot to a schema-baseline/* PR branch
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+      SCRATCH_ADMIN: postgresql://postgres:ci-only@localhost:5432/postgres
+      SCRATCH_DSN: postgresql://postgres:ci-only@localhost:5432/scratch
+      REGENERATE: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'schema-baseline/') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Install
+        run: pip install psycopg2-binary==2.9.13
+
+      - name: Require the live DSN (never skip silently)
+        run: |
+          if [ -z "$PORTAL_DB_DSN" ]; then
+            echo "::error title=schema-baseline::Repository secret PORTAL_DB_DSN is not set (session pooler, port 5432)."
+            exit 1
+          fi
+
+      - name: Live ledger point
+        id: point
+        run: |
+          point=$(python scripts/schema_baseline.py live-point "$PORTAL_DB_DSN")
+          echo "point=$point" >> "$GITHUB_OUTPUT"
+          echo "Live ledger is at $point. Files merged but not yet applied on live:"
+          python scripts/migrate.py --status || true
+
+      - name: Dump live (schema only, canonicalised on the scratch server)
+        run: python scripts/schema_baseline.py dump "$PORTAL_DB_DSN" /tmp/live.sql --canonical "$SCRATCH_ADMIN"
+
+      - name: Regenerate the snapshot (schema-baseline/* branches)
+        if: env.REGENERATE == 'true'
+        env:
+          POINT: ${{ steps.point.outputs.point }}
+        run: python scripts/schema_baseline.py write /tmp/live.sql --through "$POINT"
+
+      - name: Snapshot present
+        run: |
+          if [ ! -f db/baseline/schema.sql ]; then
+            echo "::error title=schema-baseline::No db/baseline/ yet. Push a schema-baseline/* branch to generate it."
+            exit 1
+          fi
+
+      - name: No secrets in the snapshot
+        run: python scripts/schema_baseline.py scan db/baseline/schema.sql
+
+      - name: Build a scratch cell to the live point
+        env:
+          POINT: ${{ steps.point.outputs.point }}
+        run: |
+          python -c "import os, psycopg2; c = psycopg2.connect(os.environ['SCRATCH_ADMIN']); c.autocommit = True; c.cursor().execute('create database scratch')"
+          PORTAL_DB_DSN="$SCRATCH_DSN" python scripts/migrate.py --apply --fresh --upto "$POINT"
+
+      - name: Scratch cell is identical to live
+        run: |
+          python scripts/schema_baseline.py dump "$SCRATCH_DSN" /tmp/scratch.sql
+          if ! diff -u /tmp/live.sql /tmp/scratch.sql > /tmp/schema.diff; then
+            n=$(grep -cE '^[-+][^-+]' /tmp/schema.diff || true)
+            echo "::error title=schema-baseline::A cell built from db/ differs from live ($n changed lines). See the job summary."
+            head -400 /tmp/schema.diff
+            { echo "## Live (-) vs cell built from db/ (+)"; echo '```diff'; head -400 /tmp/schema.diff; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "identical: $(wc -l < /tmp/live.sql) lines"
+
+      - name: Files not yet on live apply cleanly to a new cell
+        run: |
+          PORTAL_DB_DSN="$SCRATCH_DSN" python scripts/migrate.py --apply
+          PORTAL_DB_DSN="$SCRATCH_DSN" python scripts/migrate.py --check
+
+      - name: Commit the regenerated snapshot
+        if: env.REGENERATE == 'true'
+        env:
+          POINT: ${{ steps.point.outputs.point }}
+        run: |
+          git config user.name "Ficium Admin"
+          git config user.email "kishan.jeebun@ficium.net"
+          git add db/baseline
+          if git diff --cached --quiet; then
+            echo "snapshot unchanged"
+            exit 0
+          fi
+          git commit -m "chore(db): schema baseline through $POINT (generated from live, verified)"
+          git push
