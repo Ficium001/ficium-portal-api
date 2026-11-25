@@ -234,6 +234,30 @@ class TestPortalTenantIsolation:
             assert seen == {MCB_INSTITUTION_ID}, \
                 f"tenant leak: caller saw {seen}"
 
+    def test_compliance_view_shows_only_own_bank(self):
+        """
+        institution.compliance runs with its owner's rights, so RLS under it
+        never applied: any member could read every bank's approval, missing
+        documents and can_bid (audit 2026-11-24; fixed by 074). A member sees
+        their own row only; the connection role (bid guard, admin) sees all.
+        """
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            other_inst = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.institution
+                  (id, name, legal_name, institution_type, country, approved,
+                   onboarding_stage, primary_contact_email)
+                VALUES (%s,'ZZ_TEST','ZZ Test','bank','MU',true,'approved','z@z.mu')
+            """, (other_inst,))
+            cur.execute("SELECT institution_id FROM institution.compliance")
+            assert {str(r[0]) for r in cur.fetchall()} >= {MCB_INSTITUTION_ID, other_inst}
+
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            cur.execute("SELECT institution_id FROM institution.compliance")
+            seen = {str(r[0]) for r in cur.fetchall()}
+            assert seen == {MCB_INSTITUTION_ID}, f"compliance leak: caller saw {seen}"
+
     def test_catalog_readable_under_authenticated(self):
         """
         Catalogue reference tables had RLS enabled with no policy (silent
