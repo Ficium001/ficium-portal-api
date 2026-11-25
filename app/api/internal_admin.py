@@ -8,7 +8,8 @@ endpoints here, both POST with a JSON body:
     POST /internal/admin/v1/commands  changes; idempotent by command_id
 
 Ops: compliance.overview, documents.list, document.download, institutions.list,
-entitlements.catalog, groups.list, audit.search, access_requests.list (queries);
+entitlements.catalog, groups.list, audit.search, access_requests.list, commission.rules,
+commission.statement, commission.preview (queries);
 document.review, access_request.review (one person); waiver.grant, waiver.revoke,
 institution.approve, institution.suspend, entitlement.set, institution.provision,
 institution.invite_admin (four-eyes).
@@ -298,7 +299,8 @@ def _q_audit_search(conn: Session, args: dict, actor: str) -> list[dict]:
 def _q_commission_rules(conn: Session, args: dict, actor: str) -> list[dict]:
     rows = conn.execute(text("""
         SELECT r.id AS rule_id, r.institution_id, i.name AS institution_name, r.product_code,
-               p.label AS product_name, r.rate, r.basis, r.effective_from, r.ended_on, r.reason,
+               p.label AS product_name, r.rate, r.basis, r.params, r.min_fee, r.max_fee, r.currency,
+               r.clawback_months, r.clawback_mode, r.effective_from, r.ended_on, r.reason,
                r.set_by, r.approved_by, r.created_at,
                (r.effective_from <= (now() AT TIME ZONE 'Indian/Mauritius')::date
                 AND (r.ended_on IS NULL
@@ -340,6 +342,7 @@ def _q_commission_statement(conn: Session, args: dict, actor: str) -> dict:
                (e.created_at AT TIME ZONE 'Indian/Mauritius')::date AS booked_on,
                p.code AS product_code, p.label AS product_name,
                e.deal_amount, e.commission_rate, e.commission_amt, e.currency,
+               e.basis, e.fee_base, e.calc, e.clawback_until,
                e.status, e.invoice_ref, e.invoiced_at, e.paid_at
           FROM portal_admin.commission_event e
           LEFT JOIN marketplace.request r ON r.id = e.request_id
@@ -352,16 +355,35 @@ def _q_commission_statement(conn: Session, args: dict, actor: str) -> dict:
          LIMIT 5000
     """), {"i": iid, "m": month}).fetchall()
     lines = [dict(r._mapping) for r in rows]
+    # Clawback credits fall in the month the account closed, whatever month it was booked in.
+    adj_rows = conn.execute(text("""
+        SELECT a.id AS adjustment_id, a.commission_id, a.pipeline_id, a.kind, a.amount, a.currency,
+               a.effective_on, a.reason, a.calc, p.code AS product_code, p.label AS product_name
+          FROM billing.commission_adjustment a
+          JOIN portal_admin.commission_event e ON e.id = a.commission_id
+          LEFT JOIN marketplace.request r ON r.id = e.request_id
+          LEFT JOIN catalog.product p ON p.id = r.product_id
+         WHERE a.institution_id = CAST(:i AS uuid)
+           AND a.effective_on >= CAST(:m || '-01' AS date)
+           AND a.effective_on <  CAST(:m || '-01' AS date) + interval '1 month'
+         ORDER BY a.effective_on, a.id
+         LIMIT 5000
+    """), {"i": iid, "m": month}).fetchall()
+    adjustments = [dict(r._mapping) for r in adj_rows]
     by_status: dict[str, Decimal] = {}
     total = Decimal("0")
     for ln in lines:
         amt = Decimal(str(ln["commission_amt"] or 0))
         total += amt
         by_status[ln["status"]] = by_status.get(ln["status"], Decimal("0")) + amt
-    currencies = sorted({ln["currency"] for ln in lines if ln["currency"]})
+    adj_total = sum((Decimal(str(a["amount"])) for a in adjustments), Decimal("0"))
+    currencies = sorted({ln["currency"] for ln in lines if ln["currency"]}
+                        | {a["currency"] for a in adjustments if a["currency"]})
     return {
         "institution": dict(inst._mapping), "month": month, "lines": lines,
+        "adjustments": adjustments,
         "totals": {"deals": len(lines), "commission": total, "by_status": by_status,
+                   "adjustments": adj_total, "net": total + adj_total,
                    "currencies": currencies or ["MUR"]},
     }
 
@@ -631,6 +653,9 @@ def _c_entitlement_set(conn: Session, args: dict, ctx: dict) -> dict:
 # mistakes get a clear message, then maps the functions' COMMISSION_* errors.
 
 COMMISSION_MAX_RATE = Decimal("0.05")
+FEE_BASES = ("booked_amount", "annualised", "amount_x_term", "tiered", "flat")
+RATED_BASES = ("booked_amount", "annualised", "amount_x_term")
+CLAWBACK_MODES = ("none", "full", "pro_rata")
 _COMMISSION_ERRORS = {
     "COMMISSION_FOUR_EYES": (403, "four_eyes", "The person who asked for this cannot approve it."),
     "COMMISSION_RATE_INVALID": (422, "invalid_field", "rate must be between 0 and 5%."),
@@ -643,13 +668,24 @@ _COMMISSION_ERRORS = {
     "COMMISSION_DEFAULT_CANNOT_END": (422, "default_cannot_end",
                                       "The platform default can be replaced, not ended."),
 }
+_RULE_INVALID = "COMMISSION_RULE_INVALID: "
+
+
+def _db_message(e: DBAPIError) -> str:
+    orig = getattr(e, "orig", e)
+    diag = getattr(orig, "diag", None)
+    primary = getattr(diag, "message_primary", None) if diag is not None else None
+    return str(primary or orig)
 
 
 def _commission_db(conn: Session, sql: str, params: dict) -> dict:
     try:
         row = conn.execute(text(sql), params).fetchone()
     except DBAPIError as e:
-        msg = str(getattr(e, "orig", e))
+        msg = _db_message(e)
+        if _RULE_INVALID in msg:
+            detail = msg.split(_RULE_INVALID, 1)[1].splitlines()[0].strip()
+            raise ChannelError(422, "invalid_field", detail[:300]) from e
         for key, (status, code, detail) in _COMMISSION_ERRORS.items():
             if key in msg:
                 raise ChannelError(status, code, detail) from e
@@ -666,6 +702,107 @@ def _date(v: Any, field: str) -> date:
         raise ChannelError(422, "invalid_field", f"{field} must be YYYY-MM-DD") from e
 
 
+def _fraction(v: Any, field: str) -> Decimal:
+    try:
+        d = Decimal(str(v))
+    except InvalidOperation as e:
+        raise ChannelError(422, "invalid_field", f"{field} must be a decimal fraction") from e
+    if not d.is_finite() or d < 0 or d > COMMISSION_MAX_RATE \
+            or d.as_tuple().exponent < -4:  # type: ignore[operator]
+        raise ChannelError(422, "invalid_field",
+                           f"{field} must be a fraction between 0 and 0.05 with at most 4 decimals")
+    return d
+
+
+def _money(v: Any, field: str) -> Decimal | None:
+    if v in (None, ""):
+        return None
+    try:
+        d = Decimal(str(v))
+    except InvalidOperation as e:
+        raise ChannelError(422, "invalid_field", f"{field} must be an amount") from e
+    if not d.is_finite() or d < 0 or d > Decimal("100000000") \
+            or d.as_tuple().exponent < -2:  # type: ignore[operator]
+        raise ChannelError(422, "invalid_field", f"{field} must be 0 to 100,000,000 with at most 2 decimals")
+    return d
+
+
+def _fee_model(args: dict) -> dict[str, Any]:
+    """Shape check of a fee model; the full rules are billing.rule_shape_error() (db/072),
+    which the database applies again, so this only exists to fail early and clearly."""
+    basis = args.get("basis") or "booked_amount"
+    if basis not in FEE_BASES:
+        raise ChannelError(422, "invalid_field", f"basis must be one of {', '.join(FEE_BASES)}")
+    rate = args.get("rate")
+    if basis in RATED_BASES:
+        rate = _fraction(rate, "rate")
+    elif rate not in (None, ""):
+        raise ChannelError(422, "invalid_field", f"a {basis} rule has no single rate")
+    else:
+        rate = None
+    params = args.get("params") or {}
+    if not isinstance(params, dict) or len(json.dumps(params)) > 2000:
+        raise ChannelError(422, "invalid_field", "params must be a small object")
+    claw_months = args.get("clawback_months") or 0
+    if isinstance(claw_months, bool) or not isinstance(claw_months, int) or not 0 <= claw_months <= 36:
+        raise ChannelError(422, "invalid_field", "clawback_months must be a whole number from 0 to 36")
+    claw_mode = args.get("clawback_mode") or ("none" if claw_months == 0 else None)
+    if claw_mode not in CLAWBACK_MODES:
+        raise ChannelError(422, "invalid_field", "clawback_mode must be none, full or pro_rata")
+    return {"basis": basis, "rate": rate, "params": params,
+            "min_fee": _money(args.get("min_fee"), "min_fee"),
+            "max_fee": _money(args.get("max_fee"), "max_fee"),
+            "clawback_months": claw_months, "clawback_mode": claw_mode}
+
+
+def _str(v: Decimal | None) -> str | None:
+    return None if v is None else str(v)
+
+
+def _q_commission_preview(conn: Session, args: dict, actor: str) -> dict:
+    """What a fee model would charge for given inputs. Same function the booking uses."""
+    m = _fee_model(args)
+    raw_in = args.get("inputs") or {}
+    if not isinstance(raw_in, dict):
+        raise ChannelError(422, "invalid_field", "inputs must be an object")
+    inputs: dict[str, Any] = {}
+    for key, kind in (("amount", "money"), ("monthly_amount", "money"), ("term_months", "int")):
+        v = raw_in.get(key)
+        if v in (None, ""):
+            continue
+        if kind == "int":
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 600:
+                raise ChannelError(422, "invalid_field", "term_months must be 1 to 600")
+            inputs[key] = v
+        else:
+            amt = _money(v, key)
+            inputs[key] = float(amt) if amt is not None else None
+    try:
+        err = conn.execute(text(
+            "SELECT billing.rule_shape_error(:b, CAST(:r AS numeric), CAST(:p AS jsonb), "
+            "CAST(:mn AS numeric), CAST(:mx AS numeric), :cm, :cmo)"
+        ), {"b": m["basis"], "r": _str(m["rate"]), "p": json.dumps(m["params"]),
+            "mn": _str(m["min_fee"]), "mx": _str(m["max_fee"]),
+            "cm": m["clawback_months"], "cmo": m["clawback_mode"]}).scalar()
+        if err:
+            raise ChannelError(422, "invalid_field", str(err))
+        calc = conn.execute(text(
+            "SELECT billing.compute_fee(:b, CAST(:r AS numeric), CAST(:p AS jsonb), "
+            "CAST(:mn AS numeric), CAST(:mx AS numeric), CAST(:i AS jsonb))"
+        ), {"b": m["basis"], "r": _str(m["rate"]), "p": json.dumps(m["params"]),
+            "mn": _str(m["min_fee"]), "mx": _str(m["max_fee"]), "i": json.dumps(inputs)}).scalar()
+    except DBAPIError as e:
+        msg = _db_message(e)
+        if "FEE_INPUT_MISSING:" in msg:
+            field = msg.split("FEE_INPUT_MISSING:", 1)[1].split()[0]
+            raise ChannelError(422, "input_missing", f"Enter {field.replace('_', ' ')} to preview this model") from e
+        raise
+    return {"calc": calc}
+
+
+SYNC_QUERIES["commission.preview"] = _q_commission_preview
+
+
 def _c_commission_set(conn: Session, args: dict, ctx: dict) -> dict:
     iid = args.get("institution_id")
     iid = None if iid in (None, "") else _uuid(iid, "institution_id")
@@ -674,25 +811,26 @@ def _c_commission_set(conn: Session, args: dict, ctx: dict) -> dict:
         product = None
     elif not isinstance(product, str) or not product.replace("_", "").isalnum() or len(product) > 40:
         raise ChannelError(422, "invalid_field", "product_code is not valid")
-    try:
-        rate = Decimal(str(args.get("rate")))
-    except InvalidOperation as e:
-        raise ChannelError(422, "invalid_field", "rate must be a decimal fraction") from e
-    if not rate.is_finite() or rate < 0 or rate > COMMISSION_MAX_RATE \
-            or rate.as_tuple().exponent < -4:  # type: ignore[operator]
-        raise ChannelError(422, "invalid_field",
-                           "rate must be a fraction between 0 and 0.05 with at most 4 decimals")
+    m = _fee_model(args)
     start = _date(args.get("effective_from"), "effective_from")
     reason = _reason(args.get("reason"))
     out = _commission_db(conn, """
         SELECT * FROM billing.set_commission_rule(
           CAST(:iid AS uuid), :product, CAST(:rate AS numeric), CAST(:start AS date), :reason,
-          CAST(:cmd AS uuid), CAST(:maker AS uuid), CAST(:checker AS uuid))
-    """, {"iid": iid, "product": product, "rate": str(rate), "start": start.isoformat(),
-          "reason": reason, "cmd": ctx["command_id"], "maker": ctx["maker"], "checker": ctx["checker"]})
+          CAST(:cmd AS uuid), CAST(:maker AS uuid), CAST(:checker AS uuid),
+          :basis, CAST(:params AS jsonb), CAST(:min_fee AS numeric), CAST(:max_fee AS numeric),
+          :claw_months, :claw_mode)
+    """, {"iid": iid, "product": product, "rate": _str(m["rate"]), "start": start.isoformat(),
+          "reason": reason, "cmd": ctx["command_id"], "maker": ctx["maker"], "checker": ctx["checker"],
+          "basis": m["basis"], "params": json.dumps(m["params"]), "min_fee": _str(m["min_fee"]),
+          "max_fee": _str(m["max_fee"]), "claw_months": m["clawback_months"],
+          "claw_mode": m["clawback_mode"]})
     _audit(conn, ctx["checker"], "commission.set", "commission_rule", str(out["id"]), iid,
            {"command_id": ctx["command_id"], "maker_sub": ctx["maker"], "product_code": product,
-            "rate": str(rate), "effective_from": start.isoformat(), "reason": reason})
+            "basis": m["basis"], "rate": _str(m["rate"]), "params": m["params"],
+            "min_fee": _str(m["min_fee"]), "max_fee": _str(m["max_fee"]),
+            "clawback_months": m["clawback_months"], "clawback_mode": m["clawback_mode"],
+            "effective_from": start.isoformat(), "reason": reason})
     return out
 
 
