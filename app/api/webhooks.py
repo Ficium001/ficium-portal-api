@@ -14,7 +14,8 @@
 # Supported event_types:
 #   request.new | bid.accepted | bid.rejected
 #   pipeline.stage_changed | identity.revealed
-#   deal.booked | deal.booking_corrected | deal.closed | deal.credit_decided
+#   deal.booked | deal.booking_corrected | deal.booking_closed | deal.closed
+#   deal.credit_decided
 # =============================================================================
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ _VALID_EVENTS = {
     "identity.revealed",
     "deal.booked",
     "deal.booking_corrected",
+    "deal.booking_closed",
     "deal.closed",
     "deal.credit_decided",
 }

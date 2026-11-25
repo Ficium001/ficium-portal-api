@@ -4,6 +4,8 @@
 #   GET  /pipelines/{id}/booking   the booking, or 404 if not recorded yet  (inst:pipeline)
 #   POST /pipelines/{id}/booking   record it                                 (inst:booking)
 #   PUT  /pipelines/{id}/booking   correct it (audited with previous values) (inst:booking)
+#   GET  /pipelines/{id}/booking/requirements  which fee inputs the booking needs (inst:pipeline)
+#   POST /pipelines/{id}/booking/closure       the account ended (clawback window) (inst:booking)
 #
 # The bank's own systems use /v1/pipeline/{id}/booking instead (API key,
 # pipeline:write). Rules and the commission event: app/core/booking.py and
@@ -17,7 +19,15 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..core.booking import BookingInput, get_booking, has_booking_permission, record_booking
+from ..core.booking import (
+    BookingInput,
+    ClosureInput,
+    fee_inputs,
+    get_booking,
+    has_booking_permission,
+    record_booking,
+    record_closure,
+)
 from ..core.db import service_session
 from ..deps import current_claims, require_module, tenant_conn
 
@@ -90,3 +100,35 @@ def correct_booking(
     claims: dict[str, Any] = Depends(current_claims),
 ) -> dict[str, Any]:
     return _write(pipeline_id, body, conn, claims, correction=True, background=background)
+
+
+@router.get("/{pipeline_id}/booking/requirements")
+def booking_requirements(
+    pipeline_id: str,
+    conn: Session = Depends(tenant_conn),
+    claims: dict[str, Any] = Depends(current_claims),
+) -> dict[str, Any]:
+    iid = _iid(claims)
+    with service_session() as svc:
+        needs = fee_inputs(svc, iid, pipeline_id)
+    if needs is None:
+        raise HTTPException(status_code=404, detail="Deal not found.")
+    return {"pipeline_id": pipeline_id, "requires": needs}
+
+
+@router.post("/{pipeline_id}/booking/closure")
+def close_booking(
+    pipeline_id: str,
+    background: BackgroundTasks,
+    body: ClosureInput = Body(...),
+    conn: Session = Depends(tenant_conn),
+    claims: dict[str, Any] = Depends(current_claims),
+) -> dict[str, Any]:
+    iid = _iid(claims)
+    _require_booking_permission(conn, claims)
+    with service_session() as svc:
+        return record_closure(
+            svc, institution_id=iid, pipeline_id=pipeline_id, body=body, source="portal",
+            actor_id=claims.get("sub"), actor_email=claims.get("email"), api_key_id=None,
+            background=background,
+        )
