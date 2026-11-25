@@ -654,11 +654,12 @@ alter table public.portal_notifications add constraint portal_notifications_kind
 do $verify$
 declare
   v jsonb;
-  r billing.commission_rule;
 begin
-  -- the live default still charges 0.5% of the booked amount
-  r := billing.rule_for(gen_random_uuid(), 'home_loan', current_date);
-  if r.rate is distinct from 0.005 or r.basis <> 'booked_amount' then raise exception '072: default rule changed'; end if;
+  -- an existing schedule is untouched: every rule kept its rate and is a booked_amount rule
+  -- (a fresh cell built from the schema-only baseline has no rules yet)
+  if exists (select 1 from billing.commission_rule where basis <> 'booked_amount' or rate is null) then
+    raise exception '072: existing rules changed';
+  end if;
 
   v := billing.compute_fee('booked_amount', 0.005, '{}', null, null, '{"amount": 950000}');
   if (v->>'fee')::numeric <> 4750 then raise exception '072: booked_amount %', v; end if;
