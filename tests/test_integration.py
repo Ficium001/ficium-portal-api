@@ -903,11 +903,11 @@ class TestAppOffers:
                                    "WHERE rolname = 'ficium_admin_app')")
 
     def test_sync_is_https_only(self):
-        """Since 2026-11-25 (ficium #164) the admin site has no login to the App DB: changes arrive
-        over HTTPS (op=admin-sync) and are applied by public.admin_sync_apply as the service role."""
+        """Since 2026-11-25 (ficium #164) the admin site has no login to the App DB: changes
+        arrive over HTTPS (op=admin-sync), applied by public.admin_sync_apply (service role)."""
         with rolled_back_tx(APP_DSN) as cur:
-            assert not scalar(cur, "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", (_SYNC_ROLE,)), \
-                "the old direct-sync login is back"
+            role_exists = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)"
+            assert not scalar(cur, role_exists, (_SYNC_ROLE,)), "the old direct-sync login is back"
             fn_priv = "SELECT has_function_privilege(%s, %s, 'EXECUTE')"
             for r in ("authenticated", "anon"):
                 assert not scalar(cur, fn_priv, (r, _SYNC_APPLY)), r
@@ -917,7 +917,7 @@ class TestAppOffers:
             entry = """SELECT bool_and(has_function_privilege(%s, p.oid, 'EXECUTE'))
                          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                         WHERE n.nspname = 'public' AND p.proname = 'admin_sync_apply'"""
-            assert scalar(cur, entry, ("service_role",)) is True, "service_role cannot apply admin changes"
+            assert scalar(cur, entry, ("service_role",)) is True, "service_role cannot apply"
             for r in ("authenticated", "anon"):
                 assert scalar(cur, entry, (r,)) is False, r
 
