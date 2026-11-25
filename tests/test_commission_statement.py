@@ -34,16 +34,21 @@ class _R:
 
 
 class Conn:
-    def __init__(self, inst: bool = True, lines: list[dict] | None = None) -> None:
-        self.inst, self.lines = inst, lines or []
+    def __init__(self, inst: bool = True, lines: list[dict] | None = None,
+                 adjustments: list[dict] | None = None) -> None:
+        self.inst, self.lines, self.adjustments = inst, lines or [], adjustments or []
         self.params: list[dict] = []
+        self.sql: list[str] = []
 
     def execute(self, stmt: Any, params: dict | None = None) -> _R:
         self.params.append(params or {})
         q = " ".join(str(stmt).split())
+        self.sql.append(q)
         if "FROM institution.institution" in q:
             row = _Row(id=IID, name="MCB", reg_number="C1", country="MU")
             return _R(row if self.inst else None)
+        if "billing.commission_adjustment" in q:
+            return _R(rows=[_Row(**a) for a in self.adjustments])
         return _R(rows=[_Row(**ln) for ln in self.lines])
 
 
@@ -51,7 +56,12 @@ LINE = dict(commission_id="c", pipeline_id="p", request_id="r", booked_on="2026-
             product_code="personal_loan", product_name="Personal loan",
             deal_amount=Decimal("500000"),
             commission_rate=Decimal("0.0090"), commission_amt=Decimal("4500.00"), currency="MUR",
+            basis="booked_amount", fee_base=Decimal("500000"), calc={}, clawback_until=None,
             status="pending", invoice_ref=None, invoiced_at=None, paid_at=None)
+CLAWBACK = dict(adjustment_id="a", commission_id="c0", pipeline_id="p0", kind="clawback",
+                amount=Decimal("-250.00"), currency="MUR", effective_on="2026-11-20",
+                reason="client stopped the plan", calc={"share": 1}, product_code="savings_plan",
+                product_name="Monthly Savings Plan")
 
 
 def test_totals_by_status_from_recorded_amounts() -> None:
@@ -62,6 +72,24 @@ def test_totals_by_status_from_recorded_amounts() -> None:
     assert out["totals"]["commission"] == Decimal("5500.50")
     assert out["totals"]["by_status"] == {"pending": Decimal("4500.00"), "paid": Decimal("1000.50")}
     assert c.params[-1] == {"i": IID, "m": "2026-11"}
+    assert out["totals"]["adjustments"] == 0 and out["totals"]["net"] == Decimal("5500.50")
+
+
+def test_clawbacks_are_credited_in_the_month_the_account_closed() -> None:
+    c = Conn(lines=[LINE], adjustments=[CLAWBACK])
+    out = ia._q_commission_statement(c, {"institution_id": IID, "month": "2026-11"}, "staff")
+    assert out["adjustments"][0]["amount"] == Decimal("-250.00")
+    assert out["totals"]["commission"] == Decimal("4500.00")
+    assert out["totals"]["adjustments"] == Decimal("-250.00")
+    assert out["totals"]["net"] == Decimal("4250.00")
+    adj_sql = next(q for q in c.sql if "billing.commission_adjustment" in q)
+    assert "a.effective_on >=" in adj_sql and "a.institution_id = CAST(:i AS uuid)" in adj_sql
+
+
+def test_a_month_with_only_a_clawback_is_negative() -> None:
+    c = Conn(adjustments=[CLAWBACK])
+    out = ia._q_commission_statement(c, {"institution_id": IID, "month": "2026-11"}, "staff")
+    assert out["lines"] == [] and out["totals"]["net"] == Decimal("-250.00")
 
 
 def test_empty_month_is_a_valid_statement() -> None:

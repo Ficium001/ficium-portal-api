@@ -52,6 +52,9 @@ class _Result:
     def scalar_one(self) -> Any:
         return self._scalar
 
+    def scalar(self) -> Any:
+        return self._scalar
+
     def first(self) -> Any:
         return self._first
 
@@ -68,16 +71,21 @@ class FakeSession:
     def __init__(self, fn_result: Any = None, fn_error: Exception | None = None,
                  modules: list[str] | None = None) -> None:
         self.fn_result, self.fn_error, self.modules = fn_result, fn_error, modules
+        self.fee_inputs: Any = {"monthly_amount": False, "term_months": False}
+        self.params: Any = None
         self.sql: list[str] = []
         self.committed = self.rolled_back = False
 
     def execute(self, stmt: Any, params: Any = None) -> _Result:
         q = str(stmt)
         self.sql.append(q)
-        if "record_loan_booking" in q:
+        if "record_loan_booking" in q or "record_booking_closure" in q:
+            self.params = params
             if self.fn_error:
                 raise self.fn_error
             return _Result(scalar=self.fn_result)
+        if "booking_fee_inputs" in q:
+            return _Result(scalar=self.fee_inputs)
         if "FROM institution.institution" in q:  # require_module("pipeline") licence check
             return _Result(first=_Row(modules=["pipeline"]))
         if "modules" in q:  # member's group permissions
@@ -105,6 +113,23 @@ def test_error_codes_map_to_http() -> None:
     for code, status in cases.items():
         mapped = svc._booking_error(_db_error(code))
         assert mapped is not None and mapped.status_code == status, code
+
+
+def test_fee_model_error_codes_map_to_http() -> None:
+    cases = {
+        "FEE_INPUT_MISSING:monthly_amount": (422, "monthly amount"),
+        "FEE_INPUT_MISSING:term_months": (422, "term"),
+        "BOOKING_CLOSED": (409, "closed"), "BOOKING_ALREADY_CLOSED": (409, "already"),
+        "BOOKING_CLOSURE_DATE_INVALID": (422, "closing date"),
+        "BOOKING_CLOSURE_REASON_INVALID": (422, "reason"),
+        "BOOKING_FEE_CURRENCY_MISMATCH": (409, "currency"),
+        "BOOKING_NO_COMMISSION_RULE": (409, "commission"),
+        "BOOKING_MONTHLY_INVALID": (422, "monthly"), "BOOKING_TERM_INVALID": (422, "term"),
+    }
+    for code, (status, word) in cases.items():
+        mapped = svc._booking_error(_db_error(code))
+        assert mapped is not None and mapped.status_code == status, code
+        assert word in str(mapped.detail).lower(), code
 
 
 def test_unknown_db_error_is_not_swallowed() -> None:
@@ -149,6 +174,77 @@ def test_correction_fires_correction_event() -> None:
                                "commission_status": "pending"})
     _, bg = _record(s, correction=True)
     assert bg.tasks[0].args[1] == "deal.booking_corrected"
+
+
+def test_fee_inputs_reach_the_booking_function() -> None:
+    s = FakeSession(fn_result={"booking": BOOKING, "previous": None,
+                               "commission_status": "pending"})
+    body = svc.BookingInput(**{**BODY, "monthly_amount": "500.00", "term_months": 24})
+    _, bg = _record(s, body=body)
+    assert str(s.params["monthly"]) == "500.00" and s.params["term"] == 24
+    assert any("CAST(:monthly AS numeric), CAST(:term AS integer)" in q for q in s.sql)
+
+
+def test_fee_inputs_default_to_none() -> None:
+    s = FakeSession(fn_result={"booking": BOOKING, "previous": None,
+                               "commission_status": "pending"})
+    _record(s)
+    assert s.params["monthly"] is None and s.params["term"] is None
+
+
+def _close(session: FakeSession) -> tuple[dict[str, Any], BackgroundTasks]:
+    bg = BackgroundTasks()
+    out = svc.record_closure(
+        session, institution_id=INST, pipeline_id=DEAL,  # type: ignore[arg-type]
+        body=svc.ClosureInput(closed_on="2026-11-20", reason="client stopped the plan"),
+        source="api", actor_id=None, actor_email=None, api_key_id="k-1", background=bg,
+    )
+    return out, bg
+
+
+CLOSED = {**BOOKING, "closed_on": "2026-11-20", "closure_reason": "client stopped the plan"}
+
+
+def test_closure_audits_the_clawback_but_does_not_return_it() -> None:
+    clawback = {"amount": -250.0, "currency": "MUR", "effective_on": "2026-11-20"}
+    s = FakeSession(fn_result={"booking": CLOSED, "clawback": clawback})
+    out, bg = _close(s)
+    assert "clawback" not in out and out["closed_on"] == "2026-11-20"
+    audit_params = s.params  # last captured is the function call; check the SQL text instead
+    assert audit_params["source"] == "api" and audit_params["key"] == "k-1"
+    assert any("'deal.booking_closed'" in q for q in s.sql)
+    assert any("'booking_closed'" in q and "portal_notifications" in q for q in s.sql)
+    assert s.committed
+    assert bg.tasks[0].args[1] == "deal.booking_closed"
+    assert "clawback" not in bg.tasks[0].args[2]
+
+
+def test_closure_rule_violation_rolls_back() -> None:
+    s = FakeSession(fn_error=_db_error("BOOKING_ALREADY_CLOSED"))
+    with pytest.raises(HTTPException) as e:
+        _close(s)
+    assert e.value.status_code == 409 and s.rolled_back and not s.committed
+
+
+@pytest.mark.parametrize("bad", [
+    {"closed_on": "2026-11-20", "reason": "x"},
+    {"closed_on": "2026-11-20", "reason": "y" * 501},
+    {"reason": "client stopped the plan"},
+])
+def test_closure_body_is_validated(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        svc.ClosureInput(**bad)
+
+
+@pytest.mark.parametrize("bad", [
+    {**BODY, "monthly_amount": "-1"},
+    {**BODY, "term_months": 0},
+    {**BODY, "term_months": 601},
+    {**BODY, "monthly_amount": "1.001"},
+])
+def test_booking_fee_inputs_are_validated(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        svc.BookingInput(**bad)
 
 
 def test_rule_violation_rolls_back_and_maps() -> None:
@@ -212,6 +308,38 @@ def test_portal_validates_body(bad: dict[str, Any]) -> None:
     assert r.status_code == 422
 
 
+def test_portal_requirements_say_which_fields_to_send() -> None:
+    with _portal(["inst:pipeline"]) as (client, s):
+        s.fee_inputs = {"monthly_amount": True, "term_months": False}
+        r = client.get(f"/pipelines/{DEAL}/booking/requirements")
+    assert r.status_code == 200, r.text
+    assert r.json()["requires"] == {"monthly_amount": True, "term_months": False}
+    assert "rate" not in r.text
+
+
+def test_portal_requirements_404_for_another_banks_deal() -> None:
+    with _portal(["inst:pipeline"]) as (client, s):
+        s.fee_inputs = None
+        r = client.get(f"/pipelines/{DEAL}/booking/requirements")
+    assert r.status_code == 404
+
+
+def test_portal_closure_needs_booking_permission() -> None:
+    with _portal(["inst:pipeline"]) as (client, _):
+        r = client.post(f"/pipelines/{DEAL}/booking/closure",
+                        json={"closed_on": "2026-11-20", "reason": "client stopped the plan"})
+    assert r.status_code == 403
+
+
+def test_portal_records_closure() -> None:
+    with _portal(["inst:booking"], fn_result={"booking": CLOSED, "clawback": None}) as (client, s):
+        r = client.post(f"/pipelines/{DEAL}/booking/closure",
+                        json={"closed_on": "2026-11-20", "reason": "client stopped the plan"})
+    assert r.status_code == 200, r.text
+    assert r.json()["closed_on"] == "2026-11-20"
+    assert s.params["source"] == "portal" and s.params["actor"] == USER
+
+
 # ── v1 (bank systems) ────────────────────────────────────────────────────────
 @contextmanager
 def _v1(claims: dict[str, Any], modules: list[str] | None = None, fn_result: Any = None):
@@ -253,6 +381,30 @@ def test_v1_api_key_books_as_api_source() -> None:
     assert r.json()["loan_id"] == DEAL
     kw = spy.call_args.kwargs
     assert kw["source"] == "api" and kw["api_key_id"] == "k-1" and kw["actor_id"] is None
+
+
+def test_v1_api_key_closes_as_api_source() -> None:
+    with _v1(API_KEY, fn_result={"booking": CLOSED, "clawback": None}) as (client, s):
+        r = client.post(f"/v1/pipeline/{DEAL}/booking/closure",
+                        json={"closed_on": "2026-11-20", "reason": "client stopped the plan"})
+    assert r.status_code == 200, r.text
+    assert r.json()["loan_id"] == DEAL
+    assert s.params["source"] == "api" and s.params["key"] == "k-1" and s.params["actor"] is None
+
+
+def test_v1_closure_requires_pipeline_write_scope() -> None:
+    with _v1({**API_KEY, "scopes": ["bids:read"]}) as (client, _):
+        r = client.post(f"/v1/pipeline/{DEAL}/booking/closure",
+                        json={"closed_on": "2026-11-20", "reason": "client stopped the plan"})
+    assert r.status_code == 403
+
+
+def test_v1_requirements() -> None:
+    with _v1(API_KEY) as (client, s):
+        s.fee_inputs = {"monthly_amount": False, "term_months": True}
+        r = client.get(f"/v1/pipeline/{DEAL}/booking/requirements")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"loan_id": DEAL, "requires": {"monthly_amount": False, "term_months": True}}
 
 
 def test_v1_jwt_user_needs_booking_permission() -> None:
@@ -335,7 +487,7 @@ def test_v1_advance_rejects_non_active_stage() -> None:
 
 def test_webhook_events_registered() -> None:
     from app.api.webhooks import _VALID_EVENTS
-    assert {"deal.booked", "deal.booking_corrected"} <= _VALID_EVENTS
+    assert {"deal.booked", "deal.booking_corrected", "deal.booking_closed"} <= _VALID_EVENTS
 
 
 _ = SimpleNamespace  # keep import for readers extending fakes
