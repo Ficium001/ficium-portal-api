@@ -234,6 +234,30 @@ class TestPortalTenantIsolation:
             assert seen == {MCB_INSTITUTION_ID}, \
                 f"tenant leak: caller saw {seen}"
 
+    def test_compliance_view_shows_only_own_bank(self):
+        """
+        institution.compliance runs with its owner's rights, so RLS under it
+        never applied: any member could read every bank's approval, missing
+        documents and can_bid (audit 2026-11-24; fixed by 074). A member sees
+        their own row only; the connection role (bid guard, admin) sees all.
+        """
+        with rolled_back_tx(PORTAL_DSN) as cur:
+            other_inst = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO institution.institution
+                  (id, name, legal_name, institution_type, country, approved,
+                   onboarding_stage, primary_contact_email)
+                VALUES (%s,'ZZ_TEST','ZZ Test','bank','MU',true,'approved','z@z.mu')
+            """, (other_inst,))
+            cur.execute("SELECT institution_id FROM institution.compliance")
+            assert {str(r[0]) for r in cur.fetchall()} >= {MCB_INSTITUTION_ID, other_inst}
+
+            become_authenticated(cur, sub=MCB_ADMIN_AUTH_UID,
+                                 institution_id=MCB_INSTITUTION_ID)
+            cur.execute("SELECT institution_id FROM institution.compliance")
+            seen = {str(r[0]) for r in cur.fetchall()}
+            assert seen == {MCB_INSTITUTION_ID}, f"compliance leak: caller saw {seen}"
+
     def test_catalog_readable_under_authenticated(self):
         """
         Catalogue reference tables had RLS enabled with no policy (silent
@@ -800,7 +824,7 @@ class TestFourEyesControls:
 # public.offer_listing only, live rows only. The old App DB write path
 # (admin.offer_*, role ficium_admin_app) is gone and must stay gone.
 # ===========================================================================
-_SYNC_ROLE = "ficium_admin_sync"
+_SYNC_ROLE = "ficium_admin_sync"  # dropped by ficium #164; must stay gone
 _SYNC_APPLY = "admin.sync_apply(uuid,text,text,text,bigint,jsonb)"
 _SYNC_HELPERS = (
     "admin._sync_offer_upsert(jsonb)",
@@ -878,19 +902,24 @@ class TestAppOffers:
             assert not scalar(cur, "SELECT EXISTS (SELECT 1 FROM pg_roles "
                                    "WHERE rolname = 'ficium_admin_app')")
 
-    def test_sync_role_can_only_apply(self):
+    def test_sync_is_https_only(self):
+        """Since 2026-11-25 (ficium #164) the admin site has no login to the App DB: changes
+        arrive over HTTPS (op=admin-sync), applied by public.admin_sync_apply (service role)."""
         with rolled_back_tx(APP_DSN) as cur:
+            role_exists = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)"
+            assert not scalar(cur, role_exists, (_SYNC_ROLE,)), "the old direct-sync login is back"
             fn_priv = "SELECT has_function_privilege(%s, %s, 'EXECUTE')"
-            assert scalar(cur, fn_priv, (_SYNC_ROLE, _SYNC_APPLY)), "sync role cannot apply"
             for r in ("authenticated", "anon"):
                 assert not scalar(cur, fn_priv, (r, _SYNC_APPLY)), r
-            for h in _SYNC_HELPERS:  # internals: not even the sync role calls them directly
-                for r in (_SYNC_ROLE, "authenticated", "anon"):
+            for h in _SYNC_HELPERS:  # internals: nobody outside the database calls them directly
+                for r in ("authenticated", "anon"):
                     assert not scalar(cur, fn_priv, (r, h)), (r, h)
-            tbl_priv = f"SELECT has_table_privilege('{_SYNC_ROLE}', %s, %s)"
-            for t in ("public.offer_listing", "admin.sync_log", "admin.sync_state"):
-                for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-                    assert not scalar(cur, tbl_priv, (t, priv)), (t, priv)
+            entry = """SELECT bool_and(has_function_privilege(%s, p.oid, 'EXECUTE'))
+                         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                        WHERE n.nspname = 'public' AND p.proname = 'admin_sync_apply'"""
+            assert scalar(cur, entry, ("service_role",)) is True, "service_role cannot apply"
+            for r in ("authenticated", "anon"):
+                assert scalar(cur, entry, (r,)) is False, r
 
     def test_sync_log_is_append_only(self):
         with rolled_back_tx(APP_DSN) as cur:
