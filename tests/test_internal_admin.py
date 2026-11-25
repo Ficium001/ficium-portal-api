@@ -20,6 +20,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.api import internal_admin  # noqa: E402
+from app.api import internal_admin as ia  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.security import TokenError  # noqa: E402
 from app.main import app  # noqa: E402
@@ -691,3 +692,126 @@ def test_commission_end_calls_the_schedule() -> None:
     sent = next(p for q, p in conn.sql if "billing.end_commission_rule" in q)
     assert sent["rid"] == rid
     assert conn.actions() == ["commission.ended"]
+
+
+# ── fee models (db/072) ──────────────────────────────────────────────────────
+
+
+def test_commission_set_sends_the_whole_fee_model() -> None:
+    conn = CommConn()
+    args = commission(product_code="savings_plan", basis="annualised", rate="0.01",
+                      params={"months": 12}, min_fee="250", max_fee="5000",
+                      clawback_months=6, clawback_mode="pro_rata")
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", args))
+    assert r.status_code == 200, r.text
+    sent = next(p for q, p in conn.sql if "billing.set_commission_rule" in q)
+    assert sent["basis"] == "annualised" and sent["rate"] == "0.01"
+    assert sent["params"] == '{"months": 12}'
+    assert sent["min_fee"] == "250" and sent["max_fee"] == "5000"
+    assert sent["claw_months"] == 6 and sent["claw_mode"] == "pro_rata"
+
+
+def test_commission_flat_fee_has_no_rate() -> None:
+    conn = CommConn()
+    args = commission(basis="flat", rate=None, params={"amount": 350})
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", args))
+    assert r.status_code == 200, r.text
+    sent = next(p for q, p in conn.sql if "billing.set_commission_rule" in q)
+    assert sent["rate"] is None and sent["basis"] == "flat"
+
+
+def test_commission_old_shape_still_means_rate_on_booked_amount() -> None:
+    conn = CommConn()
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", commission()))
+    assert r.status_code == 200
+    sent = next(p for q, p in conn.sql if "billing.set_commission_rule" in q)
+    assert sent["basis"] == "booked_amount" and sent["params"] == "{}"
+    assert sent["claw_months"] == 0 and sent["claw_mode"] == "none"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"basis": "balance_trail"},
+        {"basis": "flat", "rate": "0.01", "params": {"amount": 350}},
+        {"clawback_months": 40, "clawback_mode": "full"},
+        {"clawback_months": 6},                       # months without a mode
+        {"clawback_months": "6", "clawback_mode": "full"},
+        {"clawback_mode": "sometimes"},
+        {"min_fee": "-1"},
+        {"max_fee": "12.345"},
+        {"params": ["months", 12]},
+        {"params": {"x": "y" * 3000}},
+    ],
+)
+def test_fee_model_shape_is_checked_before_the_database(over: dict) -> None:
+    conn = CommConn()
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", commission(**over)))
+    assert r.status_code == 422, r.text
+    assert not any("billing." in q for q, _ in conn.sql)
+
+
+def test_database_rule_check_message_reaches_the_admin() -> None:
+    conn = CommConn(fail="COMMISSION_RULE_INVALID: months must be a whole number from 1 to 60")
+    args = commission(basis="annualised", rate="0.01", params={"months": 0})
+    with inst_channel(conn) as c:  # type: ignore[arg-type]
+        r = call(c, "commands", cmd("commission.set", args))
+    assert r.status_code == 422
+    assert r.json() == {"error": "invalid_field",
+                        "detail": "months must be a whole number from 1 to 60"}
+
+
+class _PreviewConn:
+    def __init__(self, shape_error: str | None = None, fail: str | None = None) -> None:
+        self.shape_error, self.fail = shape_error, fail
+        self.calls: list[tuple[str, dict]] = []
+
+    def execute(self, stmt: Any, params: dict | None = None) -> Any:
+        q, p = str(stmt), params or {}
+        self.calls.append((q, p))
+        if "rule_shape_error" in q:
+            return SimpleNamespace(scalar=lambda: self.shape_error)
+        if "compute_fee" in q:
+            if self.fail:
+                from sqlalchemy.exc import DBAPIError
+
+                raise DBAPIError(q, p, Exception(f"ERROR: {self.fail}"))
+            return SimpleNamespace(scalar=lambda: {"fee": 250, "floor_applied": True})
+        raise AssertionError(q)
+
+
+def test_preview_uses_the_database_calculation() -> None:
+    conn = _PreviewConn()
+    out = ia._q_commission_preview(conn, {  # type: ignore[arg-type]
+        "basis": "annualised", "rate": "0.01", "params": {"months": 12}, "min_fee": "250",
+        "inputs": {"amount": "1000", "monthly_amount": 500}}, "staff")
+    assert out == {"calc": {"fee": 250, "floor_applied": True}}
+    q, p = conn.calls[-1]
+    assert "billing.compute_fee" in q
+    assert json.loads(p["i"]) == {"amount": 1000.0, "monthly_amount": 500.0}
+
+
+def test_preview_refuses_a_malformed_model() -> None:
+    conn: Any = _PreviewConn(shape_error="months must be a whole number from 1 to 60")
+    args = {"basis": "annualised", "rate": "0.01", "params": {"months": 0}, "inputs": {"amount": 1}}
+    with pytest.raises(ia.ChannelError) as e:
+        ia._q_commission_preview(conn, args, "staff")
+    assert e.value.status == 422 and "months" in e.value.detail
+    assert not any("compute_fee" in q for q, _ in conn.calls)
+
+
+def test_preview_names_the_missing_input() -> None:
+    conn: Any = _PreviewConn(fail="FEE_INPUT_MISSING:monthly_amount")
+    args = {"basis": "annualised", "rate": "0.01", "params": {"months": 12},
+            "inputs": {"amount": 1000}}
+    with pytest.raises(ia.ChannelError) as e:
+        ia._q_commission_preview(conn, args, "staff")
+    assert e.value.code == "input_missing" and "monthly amount" in e.value.detail
+
+
+def test_preview_is_registered_as_a_query() -> None:
+    assert ia.SYNC_QUERIES["commission.preview"] is ia._q_commission_preview

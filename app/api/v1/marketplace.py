@@ -11,6 +11,8 @@
 #   PUT  /v1/pipeline/.../advance → pipeline:write
 #   POST /v1/pipeline/{id}/booking → pipeline:write  (record core banking booking)
 #   PUT  /v1/pipeline/{id}/booking → pipeline:write  (correct it)
+#   GET  /v1/pipeline/{id}/booking/requirements → pipeline:write (fee inputs to send)
+#   POST /v1/pipeline/{id}/booking/closure      → pipeline:write (account ended)
 #   GET  /v1/analytics/summary → analytics:read
 #
 # Response shape is stable — breaking changes increment to /v2/.
@@ -25,7 +27,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ...core.bidding import BidInput, BidPlacementError, place_bid
-from ...core.booking import BookingInput, has_booking_permission, record_booking
+from ...core.booking import (
+    BookingInput,
+    ClosureInput,
+    fee_inputs,
+    has_booking_permission,
+    record_booking,
+    record_closure,
+)
 from ...core.credit_decision import CreditDecisionInput, has_decision_permission, record_decision
 from ...core.db import service_session as _svc
 from ...core.ratelimit import limiter
@@ -428,11 +437,8 @@ def advance_pipeline_stage(
 # reports that the loan is booked (or corrects the record).
 # ---------------------------------------------------------------------------
 
-def _v1_booking(
-    loan_id: str, body: BookingInput, claims: dict[str, Any],
-    background: BackgroundTasks, correction: bool,
-) -> dict:
-    iid = _institution_id_from_claims(claims)
+def _v1_require_booking_permission(claims: dict[str, Any]) -> bool:
+    """Checks a portal-token caller's live permission; returns True for an API key."""
     is_api_key = claims.get("auth_method") == "api_key"
     if not is_api_key:
         # A person using a portal token: same permission as the portal endpoint.
@@ -450,6 +456,15 @@ def _v1_booking(
             ).first()
         if not has_booking_permission(list(row.modules) if row else [], claims.get("user_role")):
             raise HTTPException(status_code=403, detail="Requires 'inst:booking'.")
+    return is_api_key
+
+
+def _v1_booking(
+    loan_id: str, body: BookingInput, claims: dict[str, Any],
+    background: BackgroundTasks, correction: bool,
+) -> dict:
+    iid = _institution_id_from_claims(claims)
+    is_api_key = _v1_require_booking_permission(claims)
     with _svc() as conn:
         booking = record_booking(
             conn, institution_id=iid, pipeline_id=loan_id, body=body,
@@ -458,6 +473,56 @@ def _v1_booking(
             actor_email=None if is_api_key else claims.get("email"),
             api_key_id=claims.get("key_id") if is_api_key else None,
             correction=correction, background=background,
+        )
+    return {"loan_id": loan_id, **booking}
+
+
+@router.get(
+    "/pipeline/{loan_id}/booking/requirements",
+    dependencies=[Depends(require_scope("pipeline:write"))],
+)
+def pipeline_booking_requirements(
+    loan_id: str,
+    claims: dict[str, Any] = Depends(api_or_jwt_claims),
+) -> dict:
+    """
+    Which optional booking fields this deal needs: monthly_amount (regular
+    savings and investment plans) and/or term_months (term products). Send them
+    with the booking; without them the booking is refused with 422.
+    """
+    iid = _institution_id_from_claims(claims)
+    with _svc() as conn:
+        needs = fee_inputs(conn, iid, loan_id)
+    if needs is None:
+        raise HTTPException(status_code=404, detail="Deal not found.")
+    return {"loan_id": loan_id, "requires": needs}
+
+
+@router.post(
+    "/pipeline/{loan_id}/booking/closure",
+    dependencies=[Depends(require_scope("pipeline:write"))],
+)
+def close_pipeline_booking(
+    loan_id: str,
+    background: BackgroundTasks,
+    body: Annotated[ClosureInput, Body()],
+    claims: dict[str, Any] = Depends(api_or_jwt_claims),
+) -> dict:
+    """
+    Report that the booked account ended: the client stopped the plan, closed
+    the deposit or cancelled the loan. Once only; a closed booking can no
+    longer be corrected. Fires the deal.booking_closed webhook.
+    """
+    iid = _institution_id_from_claims(claims)
+    is_api_key = _v1_require_booking_permission(claims)
+    with _svc() as conn:
+        booking = record_closure(
+            conn, institution_id=iid, pipeline_id=loan_id, body=body,
+            source="api" if is_api_key else "portal",
+            actor_id=None if is_api_key else claims.get("sub"),
+            actor_email=None if is_api_key else claims.get("email"),
+            api_key_id=claims.get("key_id") if is_api_key else None,
+            background=background,
         )
     return {"loan_id": loan_id, **booking}
 
