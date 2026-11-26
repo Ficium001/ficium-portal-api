@@ -1,5 +1,5 @@
 -- Ficium Portal DB schema baseline. GENERATED: do not edit by hand.
--- Schema only (no rows), through 064_api_traffic.sql. Regenerate with the
+-- Schema only (no rows), through 075_partitions_and_duplicate_indexes.sql. Regenerate with the
 -- schema-baseline workflow on a schema-baseline/* branch; see db/README.md.
 
 --
@@ -17,12 +17,6 @@ SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
-
---
--- Name: admin; Type: SCHEMA; Schema: -; Owner: -
---
-
-CREATE SCHEMA admin;
 
 --
 -- Name: audit; Type: SCHEMA; Schema: -; Owner: -
@@ -65,12 +59,6 @@ CREATE SCHEMA entitlements;
 --
 
 CREATE SCHEMA governance;
-
---
--- Name: identity; Type: SCHEMA; Schema: -; Owner: -
---
-
-CREATE SCHEMA identity;
 
 --
 -- Name: institution; Type: SCHEMA; Schema: -; Owner: -
@@ -214,62 +202,6 @@ CREATE TYPE portal_admin.dual_control_status AS ENUM (
 );
 
 --
--- Name: check_failed_logins(); Type: FUNCTION; Schema: admin; Owner: -
---
-
-CREATE FUNCTION admin.check_failed_logins() RETURNS trigger
-    LANGUAGE plpgsql
-    SET search_path TO 'pg_catalog', 'public', 'extensions', 'pg_temp'
-    AS $$
-BEGIN
-  IF NEW.failed_login_count >= 5 AND OLD.status = 'active' THEN
-    NEW.status        := 'locked';
-    NEW.locked_at     := now();
-    NEW.locked_reason := 'Auto-locked: 5 consecutive failed login attempts';
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
---
--- Name: current_user_id(); Type: FUNCTION; Schema: admin; Owner: -
---
-
-CREATE FUNCTION admin.current_user_id() RETURNS uuid
-    LANGUAGE sql STABLE SECURITY DEFINER
-    SET search_path TO 'pg_catalog', 'public', 'extensions', 'pg_temp'
-    AS $$
-  SELECT id FROM admin.user WHERE auth_user_id = auth.uid() AND status = 'active' LIMIT 1
-$$;
-
---
--- Name: get_user_display_name(uuid); Type: FUNCTION; Schema: admin; Owner: -
---
-
-CREATE FUNCTION admin.get_user_display_name(p_auth_user_id uuid) RETURNS text
-    LANGUAGE sql STABLE SECURITY DEFINER
-    SET search_path TO 'portal_admin', 'pg_temp'
-    AS $$ SELECT portal_admin.get_user_display_name(p_auth_user_id) $$;
-
---
--- Name: has_permission(text); Type: FUNCTION; Schema: admin; Owner: -
---
-
-CREATE FUNCTION admin.has_permission(p_key text) RETURNS boolean
-    LANGUAGE sql STABLE SECURITY DEFINER
-    SET search_path TO 'portal_admin', 'pg_temp'
-    AS $$ SELECT portal_admin.has_permission(p_key) $$;
-
---
--- Name: is_admin(); Type: FUNCTION; Schema: admin; Owner: -
---
-
-CREATE FUNCTION admin.is_admin() RETURNS boolean
-    LANGUAGE sql STABLE SECURITY DEFINER
-    SET search_path TO 'portal_admin', 'pg_temp'
-    AS $$ SELECT portal_admin.is_admin() $$;
-
---
 -- Name: block_mutation(); Type: FUNCTION; Schema: audit; Owner: -
 --
 
@@ -341,23 +273,19 @@ CREATE FUNCTION autobid.ensure_execution_partition(p_month date) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO 'autobid', 'pg_temp'
     AS $$
-DECLARE
+declare
   part_start date := date_trunc('month', p_month)::date;
   part_end   date := (date_trunc('month', p_month) + interval '1 month')::date;
   part_name  text := format('execution_%s', to_char(part_start, 'YYYY_MM'));
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'autobid' AND c.relname = part_name
-  ) THEN
-    EXECUTE format(
-      'CREATE TABLE autobid.%I PARTITION OF autobid.execution
-         FOR VALUES FROM (%L) TO (%L)',
-      part_name, part_start, part_end
-    );
-  END IF;
-END $$;
+begin
+  if not exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                  where n.nspname = 'autobid' and c.relname = part_name) then
+    execute format('create table autobid.%I partition of autobid.execution
+                      for values from (%L) to (%L)', part_name, part_start, part_end);
+    execute format('alter table autobid.%I enable row level security', part_name);
+    execute format('alter table autobid.%I force row level security', part_name);
+  end if;
+end $$;
 
 --
 -- Name: ensure_execution_partitions(); Type: FUNCTION; Schema: autobid; Owner: -
@@ -397,21 +325,236 @@ BEGIN
 END $$;
 
 --
--- Name: commission_for(uuid, text, date); Type: FUNCTION; Schema: billing; Owner: -
+-- Name: adjustment_is_append_only(); Type: FUNCTION; Schema: billing; Owner: -
 --
 
-CREATE FUNCTION billing.commission_for(p_institution_id uuid, p_product_code text, p_on date) RETURNS TABLE(rule_id uuid, rate numeric)
-    LANGUAGE sql STABLE
+CREATE FUNCTION billing.adjustment_is_append_only() RETURNS trigger
+    LANGUAGE plpgsql
     SET search_path TO ''
     AS $$
-  select r.id, r.rate
-    from billing.commission_rule r
-   where r.effective_from <= p_on
-     and (r.ended_on is null or r.ended_on > p_on)
-     and (r.institution_id is null or r.institution_id = p_institution_id)
-     and (r.product_code   is null or r.product_code   = p_product_code)
-   order by (r.institution_id is not null) desc, (r.product_code is not null) desc, r.effective_from desc
-   limit 1
+begin
+  raise exception using errcode = 'P0001', message = 'COMMISSION_ADJUSTMENT_APPEND_ONLY';
+end
+$$;
+
+--
+-- Name: compute_fee(text, numeric, jsonb, numeric, numeric, jsonb); Type: FUNCTION; Schema: billing; Owner: -
+--
+
+CREATE FUNCTION billing.compute_fee(p_basis text, p_rate numeric, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_in jsonb) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE
+    SET search_path TO ''
+    AS $$
+declare
+  v_amount  numeric := (p_in->>'amount')::numeric;
+  v_monthly numeric := (p_in->>'monthly_amount')::numeric;
+  v_term    numeric := (p_in->>'term_months')::numeric;
+  v_base    numeric;
+  v_raw     numeric;
+  v_fee     numeric;
+  v_years   numeric;
+  v_steps   jsonb := '[]'::jsonb;
+  v_tier    jsonb;
+  v_lower   numeric := 0;
+  v_upper   numeric;
+  v_part    numeric;
+  v_floor   boolean := false;
+  v_cap     boolean := false;
+begin
+  if v_amount is null or v_amount <= 0 then
+    raise exception using errcode = 'P0001', message = 'FEE_INPUT_MISSING:amount';
+  end if;
+
+  case p_basis
+  when 'booked_amount' then
+    v_base := v_amount;
+    v_raw  := v_base * p_rate;
+  when 'annualised' then
+    if v_monthly is null or v_monthly < 0 then
+      raise exception using errcode = 'P0001', message = 'FEE_INPUT_MISSING:monthly_amount';
+    end if;
+    v_base := v_amount * coalesce((p_params->>'lump_weight')::numeric, 1)
+              + v_monthly * (p_params->>'months')::numeric;
+    v_raw  := v_base * p_rate;
+  when 'amount_x_term' then
+    if v_term is null or v_term <= 0 then
+      raise exception using errcode = 'P0001', message = 'FEE_INPUT_MISSING:term_months';
+    end if;
+    v_years := least(v_term / 12.0, (p_params->>'max_years')::numeric);
+    v_base  := v_amount * v_years;
+    v_raw   := v_base * p_rate;
+  when 'flat' then
+    v_base := null;
+    v_raw  := (p_params->>'amount')::numeric;
+  when 'tiered' then
+    v_base := v_amount;
+    v_raw  := 0;
+    for v_tier in select t from jsonb_array_elements(p_params->'tiers') t loop
+      v_upper := (v_tier->>'up_to')::numeric;   -- null on the last tier
+      if p_params->>'mode' = 'whole' then
+        if v_upper is null or v_amount <= v_upper then
+          v_raw   := v_amount * (v_tier->>'rate')::numeric;
+          v_steps := jsonb_build_array(jsonb_build_object(
+                       'from', v_lower, 'up_to', v_upper, 'rate', (v_tier->>'rate')::numeric,
+                       'on', v_amount, 'fee', round(v_raw, 2)));
+          exit;
+        end if;
+      else
+        v_part := least(v_amount, coalesce(v_upper, v_amount)) - v_lower;
+        if v_part > 0 then
+          v_raw   := v_raw + v_part * (v_tier->>'rate')::numeric;
+          v_steps := v_steps || jsonb_build_object(
+                       'from', v_lower, 'up_to', v_upper, 'rate', (v_tier->>'rate')::numeric,
+                       'on', v_part, 'fee', round(v_part * (v_tier->>'rate')::numeric, 2));
+        end if;
+        exit when v_upper is null or v_amount <= v_upper;
+      end if;
+      v_lower := v_upper;
+    end loop;
+  else
+    raise exception using errcode = 'P0001', message = 'FEE_BASIS_UNKNOWN';
+  end case;
+
+  v_raw := round(v_raw, 2);
+  v_fee := v_raw;
+  if p_min_fee is not null and v_fee < p_min_fee then v_fee := p_min_fee; v_floor := true; end if;
+  if p_max_fee is not null and v_fee > p_max_fee then v_fee := p_max_fee; v_cap := true; end if;
+
+  return jsonb_strip_nulls(jsonb_build_object(
+    'basis', p_basis, 'rate', p_rate, 'params', p_params, 'min_fee', p_min_fee, 'max_fee', p_max_fee,
+    'inputs', jsonb_strip_nulls(jsonb_build_object('amount', v_amount, 'monthly_amount', v_monthly,
+                                                   'term_months', v_term)),
+    'years', round(v_years, 4), 'base', round(v_base, 2),
+    'tiers', case when p_basis = 'tiered' then v_steps end,
+    'raw_fee', v_raw, 'fee', v_fee, 'floor_applied', v_floor, 'cap_applied', v_cap));
+end
+$$;
+
+--
+-- Name: rule_shape_error(text, numeric, jsonb, numeric, numeric, integer, text); Type: FUNCTION; Schema: billing; Owner: -
+--
+
+CREATE FUNCTION billing.rule_shape_error(p_basis text, p_rate numeric, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_clawback_months integer, p_clawback_mode text) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE
+    SET search_path TO ''
+    AS $$
+declare
+  v_keys    text[];
+  v_allowed text[];
+  v_tier    jsonb;
+  v_prev    numeric := 0;
+  v_n       integer;
+  v_i       integer := 0;
+  v_num     numeric;
+begin
+  if p_basis is null or p_basis not in ('booked_amount', 'annualised', 'amount_x_term', 'tiered', 'flat') then
+    return 'basis must be booked_amount, annualised, amount_x_term, tiered or flat';
+  end if;
+  if p_params is null or jsonb_typeof(p_params) <> 'object' then
+    return 'params must be an object';
+  end if;
+
+  v_allowed := case p_basis
+    when 'booked_amount' then array[]::text[]
+    when 'annualised'    then array['months', 'lump_weight']
+    when 'amount_x_term' then array['max_years']
+    when 'tiered'        then array['mode', 'tiers']
+    when 'flat'          then array['amount'] end;
+  select coalesce(array_agg(k), array[]::text[]) into v_keys from jsonb_object_keys(p_params) k;
+  if not v_keys <@ v_allowed then
+    return format('params for %s may only contain: %s', p_basis,
+                  coalesce(nullif(array_to_string(v_allowed, ', '), ''), 'nothing'));
+  end if;
+
+  -- rate: a fraction, max 5%, only where the basis multiplies by one
+  if p_basis in ('booked_amount', 'annualised', 'amount_x_term') then
+    if p_rate is null or p_rate < 0 or p_rate > 0.05 then
+      return 'rate must be from 0 to 5%';
+    end if;
+  elsif p_rate is not null then
+    return format('a %s rule has no single rate', p_basis);
+  end if;
+
+  if p_basis = 'annualised' then
+    v_num := billing.json_num(p_params->'months');
+    if v_num is null or v_num not between 1 and 60 or v_num <> trunc(v_num) then
+      return 'months must be a whole number from 1 to 60';
+    end if;
+    if p_params ? 'lump_weight' then
+      v_num := billing.json_num(p_params->'lump_weight');
+      if v_num is null or v_num not between 0 and 1 then
+        return 'lump_weight must be between 0 and 1';
+      end if;
+    end if;
+  elsif p_basis = 'amount_x_term' then
+    v_num := billing.json_num(p_params->'max_years');
+    if v_num is null or v_num not between 1 and 30 then
+      return 'max_years must be from 1 to 30';
+    end if;
+  elsif p_basis = 'flat' then
+    v_num := billing.json_num(p_params->'amount');
+    if v_num is null or v_num <= 0 or v_num > 1000000 or round(v_num, 2) <> v_num then
+      return 'amount must be above 0 and at most 1,000,000, with at most 2 decimals';
+    end if;
+    if p_min_fee is not null or p_max_fee is not null then
+      return 'a flat fee has no minimum or maximum';
+    end if;
+  elsif p_basis = 'tiered' then
+    if coalesce(p_params->>'mode', '') not in ('marginal', 'whole') then
+      return 'mode must be marginal or whole';
+    end if;
+    if jsonb_typeof(p_params->'tiers') is distinct from 'array' then
+      return 'tiers must be a list';
+    end if;
+    v_n := jsonb_array_length(p_params->'tiers');
+    if v_n not between 1 and 10 then
+      return 'give 1 to 10 tiers';
+    end if;
+    for v_tier in select t from jsonb_array_elements(p_params->'tiers') t loop
+      v_i := v_i + 1;
+      if jsonb_typeof(v_tier) <> 'object' then
+        return format('tier %s must be an object', v_i);
+      end if;
+      if not (select coalesce(array_agg(k), array[]::text[]) from jsonb_object_keys(v_tier) k) <@ array['up_to', 'rate'] then
+        return format('tier %s may only have up_to and rate', v_i);
+      end if;
+      v_num := billing.json_num(v_tier->'rate');
+      if v_num is null or v_num < 0 or v_num > 0.05 or round(v_num, 4) <> v_num then
+        return format('tier %s rate must be from 0 to 5%% with at most 4 decimals', v_i);
+      end if;
+      if v_i < v_n then
+        v_num := billing.json_num(v_tier->'up_to');
+        if v_num is null or v_num <= v_prev then
+          return format('tier %s needs an upper limit above the one before it', v_i);
+        end if;
+        v_prev := v_num;
+      elsif v_tier ? 'up_to' and jsonb_typeof(v_tier->'up_to') <> 'null' then
+        return 'the last tier has no upper limit';
+      end if;
+    end loop;
+  end if;
+
+  if p_min_fee is not null and (p_min_fee < 0 or round(p_min_fee, 2) <> p_min_fee) then
+    return 'the minimum fee must be 0 or more, with at most 2 decimals';
+  end if;
+  if p_max_fee is not null and (p_max_fee <= 0 or round(p_max_fee, 2) <> p_max_fee) then
+    return 'the maximum fee must be above 0, with at most 2 decimals';
+  end if;
+  if p_min_fee is not null and p_max_fee is not null and p_min_fee > p_max_fee then
+    return 'the minimum fee cannot be above the maximum';
+  end if;
+
+  if p_clawback_months is null or p_clawback_months not between 0 and 36 then
+    return 'clawback months must be from 0 to 36';
+  end if;
+  if p_clawback_months = 0 and p_clawback_mode is distinct from 'none' then
+    return 'with no clawback months the clawback mode is none';
+  end if;
+  if p_clawback_months > 0 and p_clawback_mode not in ('full', 'pro_rata') then
+    return 'clawback mode must be full or pro_rata';
+  end if;
+  return null;
+end
 $$;
 
 SET default_table_access_method = heap;
@@ -424,7 +567,7 @@ CREATE TABLE billing.commission_rule (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     institution_id uuid,
     product_code text,
-    rate numeric(6,4) NOT NULL,
+    rate numeric(6,4),
     basis text DEFAULT 'booked_amount'::text NOT NULL,
     effective_from date NOT NULL,
     ended_on date,
@@ -435,10 +578,16 @@ CREATE TABLE billing.commission_rule (
     ended_by uuid,
     end_command_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT commission_rule_basis_check CHECK ((basis = 'booked_amount'::text)),
+    params jsonb DEFAULT '{}'::jsonb NOT NULL,
+    min_fee numeric(15,2),
+    max_fee numeric(15,2),
+    currency character(3) DEFAULT 'MUR'::bpchar NOT NULL,
+    clawback_months smallint DEFAULT 0 NOT NULL,
+    clawback_mode text DEFAULT 'none'::text NOT NULL,
     CONSTRAINT commission_rule_check CHECK (((ended_on IS NULL) OR (ended_on > effective_from))),
-    CONSTRAINT commission_rule_rate_check CHECK (((rate >= (0)::numeric) AND (rate <= 0.05))),
-    CONSTRAINT commission_rule_reason_check CHECK ((char_length(btrim(reason)) >= 10))
+    CONSTRAINT commission_rule_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT commission_rule_reason_check CHECK ((char_length(btrim(reason)) >= 10)),
+    CONSTRAINT commission_rule_shape CHECK ((billing.rule_shape_error(basis, rate, params, min_fee, max_fee, (clawback_months)::integer, clawback_mode) IS NULL))
 );
 
 ALTER TABLE ONLY billing.commission_rule FORCE ROW LEVEL SECURITY;
@@ -477,10 +626,37 @@ end
 $$;
 
 --
--- Name: set_commission_rule(uuid, text, numeric, date, text, uuid, uuid, uuid); Type: FUNCTION; Schema: billing; Owner: -
+-- Name: json_num(jsonb); Type: FUNCTION; Schema: billing; Owner: -
 --
 
-CREATE FUNCTION billing.set_commission_rule(p_institution_id uuid, p_product_code text, p_rate numeric, p_effective_from date, p_reason text, p_command_id uuid, p_maker uuid, p_checker uuid) RETURNS billing.commission_rule
+CREATE FUNCTION billing.json_num(p jsonb) RETURNS numeric
+    LANGUAGE sql IMMUTABLE
+    SET search_path TO ''
+    AS $$ select case when jsonb_typeof(p) = 'number' then (p #>> '{}')::numeric end $$;
+
+--
+-- Name: rule_for(uuid, text, date); Type: FUNCTION; Schema: billing; Owner: -
+--
+
+CREATE FUNCTION billing.rule_for(p_institution_id uuid, p_product_code text, p_on date) RETURNS billing.commission_rule
+    LANGUAGE sql STABLE
+    SET search_path TO ''
+    AS $$
+  select r.*
+    from billing.commission_rule r
+   where r.effective_from <= p_on
+     and (r.ended_on is null or r.ended_on > p_on)
+     and (r.institution_id is null or r.institution_id = p_institution_id)
+     and (r.product_code   is null or r.product_code   = p_product_code)
+   order by (r.institution_id is not null) desc, (r.product_code is not null) desc, r.effective_from desc
+   limit 1
+$$;
+
+--
+-- Name: set_commission_rule(uuid, text, numeric, date, text, uuid, uuid, uuid, text, jsonb, numeric, numeric, integer, text); Type: FUNCTION; Schema: billing; Owner: -
+--
+
+CREATE FUNCTION billing.set_commission_rule(p_institution_id uuid, p_product_code text, p_rate numeric, p_effective_from date, p_reason text, p_command_id uuid, p_maker uuid, p_checker uuid, p_basis text DEFAULT 'booked_amount'::text, p_params jsonb DEFAULT '{}'::jsonb, p_min_fee numeric DEFAULT NULL::numeric, p_max_fee numeric DEFAULT NULL::numeric, p_clawback_months integer DEFAULT 0, p_clawback_mode text DEFAULT 'none'::text) RETURNS billing.commission_rule
     LANGUAGE plpgsql
     SET search_path TO ''
     AS $$
@@ -488,12 +664,19 @@ declare
   v_today date := (now() at time zone 'Indian/Mauritius')::date;
   v_open  billing.commission_rule;
   v_new   billing.commission_rule;
+  v_err   text;
 begin
   if p_maker = p_checker then
     raise exception using errcode = 'P0001', message = 'COMMISSION_FOUR_EYES';
   end if;
-  if p_rate is null or p_rate < 0 or p_rate > 0.05 then
+  if p_basis in ('booked_amount', 'annualised', 'amount_x_term')
+     and (p_rate is null or p_rate < 0 or p_rate > 0.05) then
     raise exception using errcode = 'P0001', message = 'COMMISSION_RATE_INVALID';
+  end if;
+  v_err := billing.rule_shape_error(p_basis, p_rate, coalesce(p_params, '{}'::jsonb), p_min_fee, p_max_fee,
+                                    p_clawback_months, p_clawback_mode);
+  if v_err is not null then
+    raise exception using errcode = 'P0001', message = 'COMMISSION_RULE_INVALID: ' || v_err;
   end if;
   if p_effective_from is null or p_effective_from < v_today then
     raise exception using errcode = 'P0001', message = 'COMMISSION_DATE_IN_PAST';
@@ -523,9 +706,11 @@ begin
      where id = v_open.id;
   end if;
 
-  insert into billing.commission_rule (institution_id, product_code, rate, effective_from, reason,
+  insert into billing.commission_rule (institution_id, product_code, rate, basis, params, min_fee, max_fee,
+                                       clawback_months, clawback_mode, effective_from, reason,
                                        command_id, set_by, approved_by)
-  values (p_institution_id, p_product_code, p_rate, p_effective_from, btrim(p_reason),
+  values (p_institution_id, p_product_code, p_rate, p_basis, coalesce(p_params, '{}'::jsonb), p_min_fee, p_max_fee,
+          p_clawback_months, p_clawback_mode, p_effective_from, btrim(p_reason),
           p_command_id, p_maker, p_checker)
   returning * into v_new;
   return v_new;
@@ -573,23 +758,19 @@ CREATE FUNCTION entitlements.ensure_usage_partition(p_month date) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO 'entitlements', 'pg_temp'
     AS $$
-DECLARE
+declare
   part_start date := date_trunc('month', p_month)::date;
   part_end   date := (date_trunc('month', p_month) + interval '1 month')::date;
   part_name  text := format('usage_event_%s', to_char(part_start, 'YYYY_MM'));
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'entitlements' AND c.relname = part_name
-  ) THEN
-    EXECUTE format(
-      'CREATE TABLE entitlements.%I PARTITION OF entitlements.usage_event
-         FOR VALUES FROM (%L) TO (%L)',
-      part_name, part_start, part_end
-    );
-  END IF;
-END $$;
+begin
+  if not exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                  where n.nspname = 'entitlements' and c.relname = part_name) then
+    execute format('create table entitlements.%I partition of entitlements.usage_event
+                      for values from (%L) to (%L)', part_name, part_start, part_end);
+    execute format('alter table entitlements.%I enable row level security', part_name);
+    execute format('alter table entitlements.%I force row level security', part_name);
+  end if;
+end $$;
 
 --
 -- Name: ensure_usage_partitions(); Type: FUNCTION; Schema: entitlements; Owner: -
@@ -1142,26 +1323,6 @@ begin
     'success', v_id, jsonb_build_object('maker_id', v_ctx.member_id, 'control', 'single'));
   return v_id;
 end
-$$;
-
---
--- Name: handle_new_user(); Type: FUNCTION; Schema: identity; Owner: -
---
-
-CREATE FUNCTION identity.handle_new_user() RETURNS trigger
-    LANGUAGE plpgsql SECURITY DEFINER
-    SET search_path TO 'identity'
-    AS $$
-BEGIN
-  INSERT INTO identity.profile (id, email, display_name)
-  VALUES (
-    NEW.id,
-    NEW.email,
-    COALESCE(NEW.raw_user_meta_data->>'display_name', split_part(NEW.email,'@',1))
-  )
-  ON CONFLICT (id) DO NOTHING;
-  RETURN NEW;
-END;
 $$;
 
 --
@@ -1762,6 +1923,7 @@ CREATE FUNCTION institution.approvals_route(p_institution_id uuid, p_entity_type
     SET search_path TO 'institution', 'public'
     AS $$
 DECLARE v_instance uuid; v_version int; v_stage record; v_first_due timestamptz;
+        v_step record; v_voters int; v_needed int; v_available int; c record;
 BEGIN
   PERFORM 1 FROM approval_template
    WHERE id = p_template_id AND institution_id = p_institution_id AND status = 'active';
@@ -1785,6 +1947,50 @@ BEGIN
             CASE WHEN v_stage.seq = 1 THEN now() END,
             CASE WHEN v_stage.seq = 1 AND v_stage.sla_hours IS NOT NULL
                  THEN now() + make_interval(hours => v_stage.sla_hours) END);
+  END LOOP;
+
+  -- 065: every step must be approvable by someone other than the maker.
+  FOR v_step IN
+    SELECT si.id, si.seq, sd.name, sd.stage_type, sd.committee_id, sd.approver_role
+      FROM approval_stage_instance si
+      JOIN approval_stage_def sd ON sd.id = si.stage_def_id
+     WHERE si.instance_id = v_instance
+     ORDER BY si.seq
+  LOOP
+    SELECT count(*) INTO v_available
+      FROM member m
+     WHERE m.institution_id = p_institution_id AND m.active
+       AND m.auth_user_id IS DISTINCT FROM p_entity_maker
+       AND institution.approvals_is_eligible(v_step.id, m.auth_user_id);
+
+    IF v_step.stage_type = 'dual' THEN
+      v_needed := 2;
+    ELSIF v_step.stage_type = 'committee' THEN
+      SELECT * INTO c FROM approval_committee WHERE id = v_step.committee_id;
+      SELECT count(*) INTO v_voters FROM committee_member cm
+       WHERE cm.committee_id = v_step.committee_id AND cm.is_voting
+         AND cm.valid_from <= current_date
+         AND (cm.valid_to IS NULL OR cm.valid_to >= current_date);
+      v_needed := CASE c.quorum_type
+        WHEN 'count'     THEN c.quorum_value::int
+        WHEN 'fraction'  THEN GREATEST(1, ceil(v_voters * c.quorum_value)::int)
+        WHEN 'unanimous' THEN v_voters END;
+      v_needed := GREATEST(COALESCE(v_needed, 1), 1);
+    ELSE
+      v_needed := 1;
+    END IF;
+
+    IF v_available < v_needed THEN
+      RAISE EXCEPTION 'APPROVALS_NO_APPROVER'
+        USING DETAIL = format(
+          'Step %s "%s" needs %s approver(s) other than the submitter%s; %s can act.',
+          v_step.seq, v_step.name, v_needed,
+          CASE WHEN v_step.stage_type = 'committee' THEN ' on its committee'
+               WHEN v_step.approver_role IS NOT NULL
+               THEN format(' with the %s role', v_step.approver_role)
+               ELSE '' END,
+          v_available);
+    END IF;
   END LOOP;
 
   INSERT INTO approval_outbox (institution_id, event, payload)
@@ -3312,6 +3518,24 @@ END;
 $$;
 
 --
+-- Name: booking_fee_inputs(uuid, uuid); Type: FUNCTION; Schema: marketplace; Owner: -
+--
+
+CREATE FUNCTION marketplace.booking_fee_inputs(p_pipeline_id uuid, p_institution_id uuid) RETURNS jsonb
+    LANGUAGE sql STABLE
+    SET search_path TO ''
+    AS $$
+  select jsonb_build_object(
+           'monthly_amount', coalesce(r.basis = 'annualised', false),
+           'term_months',    coalesce(r.basis = 'amount_x_term', false))
+    from marketplace.loan_pipeline lp
+    join marketplace.request rq on rq.id = lp.request_id
+    join catalog.product p on p.id = rq.product_id
+    left join lateral billing.rule_for(lp.institution_id, p.code, (now() at time zone 'Indian/Mauritius')::date) r on true
+   where lp.id = p_pipeline_id and lp.institution_id = p_institution_id
+$$;
+
+--
 -- Name: chat_thread_state(uuid, uuid); Type: FUNCTION; Schema: marketplace; Owner: -
 --
 
@@ -4058,6 +4282,76 @@ BEGIN
 END $$;
 
 --
+-- Name: record_booking_closure(uuid, uuid, date, text, text, uuid, uuid); Type: FUNCTION; Schema: marketplace; Owner: -
+--
+
+CREATE FUNCTION marketplace.record_booking_closure(p_pipeline_id uuid, p_institution_id uuid, p_closed_on date, p_reason text, p_source text, p_actor_id uuid, p_api_key_id uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+declare
+  v_today   date := (now() at time zone 'Indian/Mauritius')::date;
+  v_bk      marketplace.loan_booking%rowtype;
+  v_ev      portal_admin.commission_event%rowtype;
+  v_reason  text := btrim(p_reason);
+  v_elapsed integer;
+  v_share   numeric;
+  v_back    numeric;
+  v_already numeric;
+  v_adj     billing.commission_adjustment;
+begin
+  select * into v_bk from marketplace.loan_booking
+   where pipeline_id = p_pipeline_id and institution_id = p_institution_id for update;
+  if not found then raise exception 'BOOKING_NOT_FOUND'; end if;
+  if v_bk.closed_on is not null then raise exception 'BOOKING_ALREADY_CLOSED'; end if;
+  if p_closed_on is null or p_closed_on > v_today or p_closed_on < v_bk.booked_on then
+    raise exception 'BOOKING_CLOSURE_DATE_INVALID';
+  end if;
+  if v_reason is null or char_length(v_reason) not between 5 and 500 then
+    raise exception 'BOOKING_CLOSURE_REASON_INVALID';
+  end if;
+  if p_source not in ('portal', 'api') then raise exception 'BOOKING_SOURCE_INVALID'; end if;
+
+  update marketplace.loan_booking
+     set closed_on = p_closed_on, closure_reason = v_reason, closed_source = p_source,
+         closed_by = p_actor_id, closed_api_key_id = p_api_key_id, updated_at = now()
+   where pipeline_id = p_pipeline_id
+  returning * into v_bk;
+
+  select * into v_ev from portal_admin.commission_event where pipeline_id = p_pipeline_id for update;
+  if found and v_ev.clawback_until is not null and p_closed_on < v_ev.clawback_until
+     and v_ev.status <> 'waived' and coalesce(v_ev.commission_amt, 0) > 0 then
+    -- whole months the account ran, counted from the booking date
+    v_elapsed := (extract(year from age(p_closed_on, v_bk.booked_on)) * 12
+                  + extract(month from age(p_closed_on, v_bk.booked_on)))::integer;
+    v_share := case v_ev.clawback_mode
+                 when 'full' then 1
+                 else greatest(v_ev.clawback_months - v_elapsed, 0)::numeric / v_ev.clawback_months end;
+    select coalesce(-sum(a.amount), 0) into v_already
+      from billing.commission_adjustment a where a.commission_id = v_ev.id;
+    v_back := least(round(v_ev.commission_amt * v_share, 2), v_ev.commission_amt - v_already);
+    if v_back > 0 then
+      insert into billing.commission_adjustment (commission_id, pipeline_id, institution_id, kind, amount,
+                                                 currency, effective_on, reason, calc)
+      values (v_ev.id, p_pipeline_id, p_institution_id, 'clawback', -v_back, v_ev.currency, p_closed_on,
+              v_reason,
+              jsonb_build_object('fee', v_ev.commission_amt, 'mode', v_ev.clawback_mode,
+                                 'window_months', v_ev.clawback_months, 'months_run', v_elapsed,
+                                 'share', round(v_share, 4), 'clawback', v_back,
+                                 'booked_on', v_bk.booked_on, 'closed_on', p_closed_on,
+                                 'commission_status', v_ev.status))
+      returning * into v_adj;
+    end if;
+  end if;
+
+  return jsonb_build_object(
+    'booking', to_jsonb(v_bk),
+    'clawback', case when v_adj.id is not null then jsonb_build_object(
+                  'amount', v_adj.amount, 'currency', v_adj.currency, 'effective_on', v_adj.effective_on) end);
+end
+$$;
+
+--
 -- Name: record_credit_decision(uuid, uuid, text, jsonb, text, text, timestamp with time zone, text, uuid, uuid); Type: FUNCTION; Schema: marketplace; Owner: -
 --
 
@@ -4178,105 +4472,131 @@ BEGIN
 END $$;
 
 --
--- Name: record_loan_booking(uuid, uuid, text, date, numeric, date, text, text, uuid, uuid, boolean); Type: FUNCTION; Schema: marketplace; Owner: -
+-- Name: record_loan_booking(uuid, uuid, text, date, numeric, date, text, text, uuid, uuid, boolean, numeric, integer); Type: FUNCTION; Schema: marketplace; Owner: -
 --
 
-CREATE FUNCTION marketplace.record_loan_booking(p_pipeline_id uuid, p_institution_id uuid, p_core_reference text, p_booked_on date, p_disbursed_amount numeric, p_disbursed_on date, p_notes text, p_source text, p_actor_id uuid, p_api_key_id uuid, p_correction boolean DEFAULT false) RETURNS jsonb
+CREATE FUNCTION marketplace.record_loan_booking(p_pipeline_id uuid, p_institution_id uuid, p_core_reference text, p_booked_on date, p_disbursed_amount numeric, p_disbursed_on date, p_notes text, p_source text, p_actor_id uuid, p_api_key_id uuid, p_correction boolean DEFAULT false, p_monthly_amount numeric DEFAULT NULL::numeric, p_term_months integer DEFAULT NULL::integer) RETURNS jsonb
     LANGUAGE plpgsql
     SET search_path TO 'marketplace', 'portal_admin', 'pg_temp'
     AS $$
-DECLARE
-    v_deal     marketplace.loan_pipeline%ROWTYPE;
-    v_prev     marketplace.loan_booking%ROWTYPE;
-    v_row      marketplace.loan_booking%ROWTYPE;
+declare
+    v_deal     marketplace.loan_pipeline%rowtype;
+    v_prev     marketplace.loan_booking%rowtype;
+    v_row      marketplace.loan_booking%rowtype;
     v_ref      text := btrim(p_core_reference);
-    v_today    date := (now() AT TIME ZONE 'Indian/Mauritius')::date;
+    v_today    date := (now() at time zone 'Indian/Mauritius')::date;
     v_comm     text;
     v_product  text;
-    v_rule     uuid;
-    v_rate     numeric;
-BEGIN
-    SELECT * INTO v_deal FROM marketplace.loan_pipeline
-     WHERE id = p_pipeline_id AND institution_id = p_institution_id
-     FOR UPDATE;
-    IF NOT FOUND THEN RAISE EXCEPTION 'BOOKING_DEAL_NOT_FOUND'; END IF;
-    IF v_deal.status <> 'completed' THEN RAISE EXCEPTION 'BOOKING_DEAL_NOT_COMPLETE'; END IF;
+    v_currency text;
+    v_rule     billing.commission_rule;
+    v_calc     jsonb;
+begin
+    select * into v_deal from marketplace.loan_pipeline
+     where id = p_pipeline_id and institution_id = p_institution_id
+     for update;
+    if not found then raise exception 'BOOKING_DEAL_NOT_FOUND'; end if;
+    if v_deal.status <> 'completed' then raise exception 'BOOKING_DEAL_NOT_COMPLETE'; end if;
 
-    IF v_ref IS NULL OR v_ref = '' OR char_length(v_ref) > 64 THEN
-        RAISE EXCEPTION 'BOOKING_REFERENCE_INVALID';
-    END IF;
-    IF p_disbursed_amount IS NULL OR p_disbursed_amount <= 0 THEN
-        RAISE EXCEPTION 'BOOKING_AMOUNT_INVALID';
-    END IF;
-    IF v_deal.deal_amount IS NOT NULL AND p_disbursed_amount > v_deal.deal_amount THEN
-        RAISE EXCEPTION 'BOOKING_AMOUNT_EXCEEDS_DEAL';
-    END IF;
-    IF p_booked_on IS NULL OR p_booked_on > v_today THEN
-        RAISE EXCEPTION 'BOOKING_DATE_INVALID';
-    END IF;
-    IF p_booked_on < v_deal.started_at::date THEN
-        RAISE EXCEPTION 'BOOKING_DATE_BEFORE_DEAL';
-    END IF;
-    IF p_disbursed_on IS NOT NULL AND (p_disbursed_on > v_today OR p_disbursed_on < v_deal.started_at::date) THEN
-        RAISE EXCEPTION 'BOOKING_DISBURSED_DATE_INVALID';
-    END IF;
-    IF p_source NOT IN ('portal', 'api') THEN RAISE EXCEPTION 'BOOKING_SOURCE_INVALID'; END IF;
+    if v_ref is null or v_ref = '' or char_length(v_ref) > 64 then
+        raise exception 'BOOKING_REFERENCE_INVALID';
+    end if;
+    if p_disbursed_amount is null or p_disbursed_amount <= 0 then
+        raise exception 'BOOKING_AMOUNT_INVALID';
+    end if;
+    if v_deal.deal_amount is not null and p_disbursed_amount > v_deal.deal_amount then
+        raise exception 'BOOKING_AMOUNT_EXCEEDS_DEAL';
+    end if;
+    if p_monthly_amount is not null and (p_monthly_amount < 0 or p_monthly_amount > 1e12) then
+        raise exception 'BOOKING_MONTHLY_INVALID';
+    end if;
+    if p_term_months is not null and p_term_months not between 1 and 600 then
+        raise exception 'BOOKING_TERM_INVALID';
+    end if;
+    if p_booked_on is null or p_booked_on > v_today then
+        raise exception 'BOOKING_DATE_INVALID';
+    end if;
+    if p_booked_on < v_deal.started_at::date then
+        raise exception 'BOOKING_DATE_BEFORE_DEAL';
+    end if;
+    if p_disbursed_on is not null and (p_disbursed_on > v_today or p_disbursed_on < v_deal.started_at::date) then
+        raise exception 'BOOKING_DISBURSED_DATE_INVALID';
+    end if;
+    if p_source not in ('portal', 'api') then raise exception 'BOOKING_SOURCE_INVALID'; end if;
 
-    SELECT * INTO v_prev FROM marketplace.loan_booking WHERE pipeline_id = p_pipeline_id FOR UPDATE;
-    IF FOUND AND NOT p_correction THEN RAISE EXCEPTION 'BOOKING_ALREADY_RECORDED'; END IF;
-    IF NOT FOUND AND p_correction THEN RAISE EXCEPTION 'BOOKING_NOT_FOUND'; END IF;
+    select * into v_prev from marketplace.loan_booking where pipeline_id = p_pipeline_id for update;
+    if found and not p_correction then raise exception 'BOOKING_ALREADY_RECORDED'; end if;
+    if not found and p_correction then raise exception 'BOOKING_NOT_FOUND'; end if;
+    if found and v_prev.closed_on is not null then raise exception 'BOOKING_CLOSED'; end if;
 
-    BEGIN
-        IF p_correction THEN
-            UPDATE marketplace.loan_booking
-               SET core_reference   = v_ref,
+    begin
+        if p_correction then
+            update marketplace.loan_booking
+               set core_reference   = v_ref,
                    booked_on        = p_booked_on,
                    disbursed_amount = p_disbursed_amount,
                    disbursed_on     = p_disbursed_on,
+                   monthly_amount   = p_monthly_amount,
+                   term_months      = p_term_months,
                    notes            = p_notes,
                    source           = p_source,
                    recorded_by      = p_actor_id,
                    api_key_id       = p_api_key_id,
                    corrected_count  = corrected_count + 1,
                    updated_at       = now()
-             WHERE pipeline_id = p_pipeline_id
-            RETURNING * INTO v_row;
-        ELSE
-            INSERT INTO marketplace.loan_booking
+             where pipeline_id = p_pipeline_id
+            returning * into v_row;
+        else
+            insert into marketplace.loan_booking
                 (pipeline_id, institution_id, core_reference, booked_on, disbursed_amount,
-                 disbursed_on, notes, source, recorded_by, api_key_id)
-            VALUES
+                 disbursed_on, monthly_amount, term_months, notes, source, recorded_by, api_key_id)
+            values
                 (p_pipeline_id, p_institution_id, v_ref, p_booked_on, p_disbursed_amount,
-                 p_disbursed_on, p_notes, p_source, p_actor_id, p_api_key_id)
-            RETURNING * INTO v_row;
-        END IF;
-    EXCEPTION WHEN unique_violation THEN
-        RAISE EXCEPTION 'BOOKING_REFERENCE_IN_USE';
-    END;
+                 p_disbursed_on, p_monthly_amount, p_term_months, p_notes, p_source, p_actor_id, p_api_key_id)
+            returning * into v_row;
+        end if;
+    exception when unique_violation then
+        raise exception 'BOOKING_REFERENCE_IN_USE';
+    end;
 
-    -- Rate in force on the booking date for this bank and product (db/058).
-    SELECT p.code INTO v_product
-      FROM marketplace.request r JOIN catalog.product p ON p.id = r.product_id
-     WHERE r.id = v_deal.request_id;
-    SELECT c.rule_id, c.rate INTO v_rule, v_rate
-      FROM billing.commission_for(p_institution_id, v_product, p_booked_on) c;
-    IF v_rule IS NULL THEN RAISE EXCEPTION 'BOOKING_NO_COMMISSION_RULE'; END IF;
+    -- The rule in force on the booking date for this bank and product, and its model.
+    select p.code, coalesce(r.currency, p.currency, 'MUR') into v_product, v_currency
+      from marketplace.request r join catalog.product p on p.id = r.product_id
+     where r.id = v_deal.request_id;
+    v_rule := billing.rule_for(p_institution_id, v_product, p_booked_on);
+    if v_rule.id is null then raise exception 'BOOKING_NO_COMMISSION_RULE'; end if;
+    if v_currency is distinct from v_rule.currency
+       and (v_rule.basis = 'flat' or v_rule.min_fee is not null or v_rule.max_fee is not null) then
+        raise exception 'BOOKING_FEE_CURRENCY_MISMATCH';
+    end if;
+    v_calc := billing.compute_fee(v_rule.basis, v_rule.rate, v_rule.params, v_rule.min_fee, v_rule.max_fee,
+                jsonb_build_object('amount', p_disbursed_amount, 'monthly_amount', p_monthly_amount,
+                                   'term_months', coalesce(p_term_months, v_deal.deal_term_months)));
 
-    INSERT INTO portal_admin.commission_event (pipeline_id, request_id, institution_id, deal_amount,
-                                               commission_rate, rule_id)
-    VALUES (p_pipeline_id, v_deal.request_id, p_institution_id, p_disbursed_amount, v_rate, v_rule)
-    ON CONFLICT (pipeline_id) DO UPDATE
-        SET deal_amount = EXCLUDED.deal_amount, commission_rate = EXCLUDED.commission_rate,
-            rule_id = EXCLUDED.rule_id, updated_at = now()
-        WHERE portal_admin.commission_event.status = 'pending';
-    SELECT status INTO v_comm FROM portal_admin.commission_event WHERE pipeline_id = p_pipeline_id;
+    insert into portal_admin.commission_event (pipeline_id, request_id, institution_id, deal_amount,
+                                               commission_rate, commission_amt, currency, rule_id,
+                                               basis, fee_base, calc, clawback_months, clawback_mode,
+                                               clawback_until)
+    values (p_pipeline_id, v_deal.request_id, p_institution_id, p_disbursed_amount,
+            v_rule.rate, (v_calc->>'fee')::numeric, v_currency, v_rule.id,
+            v_rule.basis, (v_calc->>'base')::numeric, v_calc, v_rule.clawback_months, v_rule.clawback_mode,
+            case when v_rule.clawback_months > 0
+                 then (p_booked_on + make_interval(months => v_rule.clawback_months))::date end)
+    on conflict (pipeline_id) do update
+        set deal_amount = excluded.deal_amount, commission_rate = excluded.commission_rate,
+            commission_amt = excluded.commission_amt, currency = excluded.currency,
+            rule_id = excluded.rule_id, basis = excluded.basis, fee_base = excluded.fee_base,
+            calc = excluded.calc, clawback_months = excluded.clawback_months,
+            clawback_mode = excluded.clawback_mode, clawback_until = excluded.clawback_until,
+            updated_at = now()
+        where portal_admin.commission_event.status = 'pending';
+    select status into v_comm from portal_admin.commission_event where pipeline_id = p_pipeline_id;
 
-    RETURN jsonb_build_object(
+    return jsonb_build_object(
         'booking', to_jsonb(v_row),
-        'previous', CASE WHEN p_correction THEN to_jsonb(v_prev) END,
+        'previous', case when p_correction then to_jsonb(v_prev) end,
         'commission_status', v_comm
     );
-END;
+end;
 $$;
 
 --
@@ -5156,99 +5476,6 @@ BEGIN NEW.updated_at = now(); RETURN NEW; END;
 $$;
 
 --
--- Name: notification_log; Type: TABLE; Schema: admin; Owner: -
---
-
-CREATE TABLE admin.notification_log (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    event_type text NOT NULL,
-    recipient_type text NOT NULL,
-    recipient_ref text NOT NULL,
-    related_id uuid,
-    status text DEFAULT 'sent'::text NOT NULL,
-    error_detail text,
-    sent_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT notification_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text])))
-);
-
---
--- Name: role; Type: TABLE; Schema: admin; Owner: -
---
-
-CREATE TABLE admin.role (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    slug text NOT NULL,
-    label text NOT NULL,
-    description text DEFAULT ''::text NOT NULL,
-    permissions text[] DEFAULT '{}'::text[] NOT NULL,
-    is_system boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
---
--- Name: session; Type: TABLE; Schema: admin; Owner: -
---
-
-CREATE TABLE admin.session (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    ip_address inet NOT NULL,
-    user_agent text DEFAULT ''::text NOT NULL,
-    country text,
-    city text,
-    started_at timestamp with time zone DEFAULT now() NOT NULL,
-    last_active_at timestamp with time zone DEFAULT now() NOT NULL,
-    ended_at timestamp with time zone,
-    end_reason text,
-    is_active boolean DEFAULT true NOT NULL,
-    CONSTRAINT session_end_reason_check CHECK ((end_reason = ANY (ARRAY['logout'::text, 'timeout'::text, 'forced'::text, 'expired'::text])))
-);
-
---
--- Name: system_group; Type: TABLE; Schema: admin; Owner: -
---
-
-CREATE TABLE admin.system_group (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    slug text NOT NULL,
-    label text NOT NULL,
-    description text DEFAULT ''::text NOT NULL,
-    side text DEFAULT 'institution'::text NOT NULL,
-    module_permissions text[] DEFAULT '{}'::text[] NOT NULL,
-    is_system boolean DEFAULT true NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT system_group_side_check CHECK ((side = ANY (ARRAY['institution'::text, 'admin'::text, 'both'::text])))
-);
-
---
--- Name: user; Type: TABLE; Schema: admin; Owner: -
---
-
-CREATE TABLE admin."user" (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    auth_user_id uuid NOT NULL,
-    email text NOT NULL,
-    display_name text NOT NULL,
-    role_id uuid,
-    role_slug text DEFAULT 'support'::text NOT NULL,
-    system_group_id uuid,
-    status text DEFAULT 'pending_mfa'::text NOT NULL,
-    mfa_enabled boolean DEFAULT false NOT NULL,
-    mfa_verified_at timestamp with time zone,
-    failed_login_count integer DEFAULT 0 NOT NULL,
-    locked_at timestamp with time zone,
-    locked_reason text,
-    force_password_reset boolean DEFAULT true NOT NULL,
-    last_login_at timestamp with time zone,
-    last_login_ip inet,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT user_role_slug_check CHECK ((role_slug = ANY (ARRAY['super_admin'::text, 'institution_mgr'::text, 'compliance'::text, 'support'::text, 'auditor'::text, 'custom'::text]))),
-    CONSTRAINT user_status_check CHECK ((status = ANY (ARRAY['active'::text, 'locked'::text, 'suspended'::text, 'pending_mfa'::text, 'deactivated'::text])))
-);
-
---
 -- Name: event; Type: TABLE; Schema: audit; Owner: -
 --
 
@@ -5414,10 +5641,10 @@ PARTITION BY RANGE (occurred_at);
 ALTER TABLE ONLY autobid.execution FORCE ROW LEVEL SECURITY;
 
 --
--- Name: execution_2026_08; Type: TABLE; Schema: autobid; Owner: -
+-- Name: execution_default; Type: TABLE; Schema: autobid; Owner: -
 --
 
-CREATE TABLE autobid.execution_2026_08 (
+CREATE TABLE autobid.execution_default (
     id bigint NOT NULL,
     institution_id uuid NOT NULL,
     rule_id uuid NOT NULL,
@@ -5431,41 +5658,7 @@ CREATE TABLE autobid.execution_2026_08 (
     CONSTRAINT execution_outcome_check CHECK ((outcome = ANY (ARRAY['bid_placed'::text, 'suppressed_guardrail'::text, 'suppressed_exposure'::text, 'no_match'::text, 'error'::text])))
 );
 
---
--- Name: execution_2026_09; Type: TABLE; Schema: autobid; Owner: -
---
-
-CREATE TABLE autobid.execution_2026_09 (
-    id bigint NOT NULL,
-    institution_id uuid NOT NULL,
-    rule_id uuid NOT NULL,
-    rule_version_id uuid NOT NULL,
-    loan_request_id uuid NOT NULL,
-    outcome text NOT NULL,
-    bid_id uuid,
-    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
-    idempotency_key text NOT NULL,
-    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT execution_outcome_check CHECK ((outcome = ANY (ARRAY['bid_placed'::text, 'suppressed_guardrail'::text, 'suppressed_exposure'::text, 'no_match'::text, 'error'::text])))
-);
-
---
--- Name: execution_2026_10; Type: TABLE; Schema: autobid; Owner: -
---
-
-CREATE TABLE autobid.execution_2026_10 (
-    id bigint NOT NULL,
-    institution_id uuid NOT NULL,
-    rule_id uuid NOT NULL,
-    rule_version_id uuid NOT NULL,
-    loan_request_id uuid NOT NULL,
-    outcome text NOT NULL,
-    bid_id uuid,
-    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
-    idempotency_key text NOT NULL,
-    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT execution_outcome_check CHECK ((outcome = ANY (ARRAY['bid_placed'::text, 'suppressed_guardrail'::text, 'suppressed_exposure'::text, 'no_match'::text, 'error'::text])))
-);
+ALTER TABLE ONLY autobid.execution_default FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: execution_id_seq; Type: SEQUENCE; Schema: autobid; Owner: -
@@ -5546,6 +5739,29 @@ CREATE TABLE autobid.rule_version (
 );
 
 ALTER TABLE ONLY autobid.rule_version FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: commission_adjustment; Type: TABLE; Schema: billing; Owner: -
+--
+
+CREATE TABLE billing.commission_adjustment (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    commission_id uuid NOT NULL,
+    pipeline_id uuid NOT NULL,
+    institution_id uuid NOT NULL,
+    kind text NOT NULL,
+    amount numeric(15,2) NOT NULL,
+    currency character(3) NOT NULL,
+    effective_on date NOT NULL,
+    reason text NOT NULL,
+    calc jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT commission_adjustment_amount_check CHECK ((amount < (0)::numeric)),
+    CONSTRAINT commission_adjustment_kind_check CHECK ((kind = 'clawback'::text)),
+    CONSTRAINT commission_adjustment_reason_check CHECK (((char_length(btrim(reason)) >= 5) AND (char_length(btrim(reason)) <= 500)))
+);
+
+ALTER TABLE ONLY billing.commission_adjustment FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: country; Type: TABLE; Schema: catalog; Owner: -
@@ -5777,10 +5993,10 @@ PARTITION BY RANGE (occurred_at);
 ALTER TABLE ONLY entitlements.usage_event FORCE ROW LEVEL SECURITY;
 
 --
--- Name: usage_event_2026_08; Type: TABLE; Schema: entitlements; Owner: -
+-- Name: usage_event_default; Type: TABLE; Schema: entitlements; Owner: -
 --
 
-CREATE TABLE entitlements.usage_event_2026_08 (
+CREATE TABLE entitlements.usage_event_default (
     id bigint NOT NULL,
     institution_id uuid NOT NULL,
     module_code text NOT NULL,
@@ -5792,37 +6008,7 @@ CREATE TABLE entitlements.usage_event_2026_08 (
     CONSTRAINT usage_event_quantity_check CHECK ((quantity > (0)::numeric))
 );
 
---
--- Name: usage_event_2026_09; Type: TABLE; Schema: entitlements; Owner: -
---
-
-CREATE TABLE entitlements.usage_event_2026_09 (
-    id bigint NOT NULL,
-    institution_id uuid NOT NULL,
-    module_code text NOT NULL,
-    unit text NOT NULL,
-    quantity numeric DEFAULT 1 NOT NULL,
-    idempotency_key text NOT NULL,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT usage_event_quantity_check CHECK ((quantity > (0)::numeric))
-);
-
---
--- Name: usage_event_2026_10; Type: TABLE; Schema: entitlements; Owner: -
---
-
-CREATE TABLE entitlements.usage_event_2026_10 (
-    id bigint NOT NULL,
-    institution_id uuid NOT NULL,
-    module_code text NOT NULL,
-    unit text NOT NULL,
-    quantity numeric DEFAULT 1 NOT NULL,
-    idempotency_key text NOT NULL,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT usage_event_quantity_check CHECK ((quantity > (0)::numeric))
-);
+ALTER TABLE ONLY entitlements.usage_event_default FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: usage_event_id_seq; Type: SEQUENCE; Schema: entitlements; Owner: -
@@ -5910,101 +6096,6 @@ CREATE TABLE governance.four_eyes_policy (
     changed_by uuid,
     changed_at timestamp with time zone DEFAULT now() NOT NULL,
     via_action_id uuid
-);
-
---
--- Name: email_verification_token; Type: TABLE; Schema: identity; Owner: -
---
-
-CREATE TABLE identity.email_verification_token (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    email text NOT NULL,
-    token_hash text NOT NULL,
-    expires_at timestamp with time zone DEFAULT (now() + '24:00:00'::interval) NOT NULL,
-    verified_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
---
--- Name: ip_allowlist; Type: TABLE; Schema: identity; Owner: -
---
-
-CREATE TABLE identity.ip_allowlist (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    cidr cidr NOT NULL,
-    label text DEFAULT ''::text NOT NULL,
-    created_by uuid,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
---
--- Name: login_event; Type: TABLE; Schema: identity; Owner: -
---
-
-CREATE TABLE identity.login_event (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid,
-    email text,
-    ip inet,
-    user_agent text,
-    country text,
-    city text,
-    outcome text NOT NULL,
-    failure_reason text,
-    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT login_event_outcome_check CHECK ((outcome = ANY (ARRAY['success'::text, 'failed'::text, 'blocked'::text, 'mfa_required'::text, 'mfa_failed'::text, 'ip_blocked'::text, 'account_locked'::text])))
-);
-
---
--- Name: mfa_backup_code; Type: TABLE; Schema: identity; Owner: -
---
-
-CREATE TABLE identity.mfa_backup_code (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    code_hash text NOT NULL,
-    used_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
---
--- Name: password_reset_token; Type: TABLE; Schema: identity; Owner: -
---
-
-CREATE TABLE identity.password_reset_token (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    token_hash text NOT NULL,
-    expires_at timestamp with time zone DEFAULT (now() + '01:00:00'::interval) NOT NULL,
-    used_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
---
--- Name: profile; Type: TABLE; Schema: identity; Owner: -
---
-
-CREATE TABLE identity.profile (
-    id uuid NOT NULL,
-    email text NOT NULL,
-    display_name text DEFAULT ''::text NOT NULL,
-    phone text,
-    avatar_url text,
-    preferred_locale text DEFAULT 'en'::text NOT NULL,
-    status text DEFAULT 'active'::text NOT NULL,
-    mfa_totp_enabled boolean DEFAULT false NOT NULL,
-    mfa_totp_verified_at timestamp with time zone,
-    failed_login_count integer DEFAULT 0 NOT NULL,
-    locked_at timestamp with time zone,
-    locked_reason text,
-    force_password_reset boolean DEFAULT false NOT NULL,
-    last_login_at timestamp with time zone,
-    last_login_ip inet,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT profile_status_check CHECK ((status = ANY (ARRAY['active'::text, 'locked'::text, 'suspended'::text, 'deactivated'::text])))
 );
 
 --
@@ -6424,7 +6515,7 @@ ALTER TABLE ONLY institution.institution FORCE ROW LEVEL SECURITY;
 -- Name: compliance; Type: VIEW; Schema: institution; Owner: -
 --
 
-CREATE VIEW institution.compliance AS
+CREATE VIEW institution.compliance WITH (security_barrier='true') AS
  WITH base AS (
          SELECT i.id AS institution_id,
             ((i.approved = true) AND (i.suspended_at IS NULL)) AS is_approved,
@@ -6437,6 +6528,7 @@ CREATE VIEW institution.compliance AS
                    FROM institution.compliance_waiver w
                   WHERE ((w.institution_id = i.id) AND (w.revoked_at IS NULL) AND (w.waived_until > now()))) AS waived_until
            FROM institution.institution i
+          WHERE ((CURRENT_USER <> ALL (ARRAY['authenticated'::name, 'anon'::name])) OR (i.id = ( SELECT (NULLIF(((NULLIF(current_setting('request.jwt.claims'::text, true), ''::text))::jsonb ->> 'institution_id'::text), ''::text))::uuid AS "nullif")))
         )
  SELECT institution_id,
     is_approved,
@@ -7504,10 +7596,22 @@ CREATE TABLE marketplace.loan_booking (
     corrected_count integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    monthly_amount numeric(18,2),
+    term_months integer,
+    closed_on date,
+    closure_reason text,
+    closed_source text,
+    closed_by uuid,
+    closed_api_key_id uuid,
+    CONSTRAINT loan_booking_closed_consistent CHECK ((((closed_on IS NULL) = (closure_reason IS NULL)) AND ((closed_on IS NULL) = (closed_source IS NULL)) AND ((closed_on IS NULL) OR (closed_on >= booked_on)))),
+    CONSTRAINT loan_booking_closed_source_check CHECK (((closed_source IS NULL) OR (closed_source = ANY (ARRAY['portal'::text, 'api'::text])))),
+    CONSTRAINT loan_booking_closure_reason_check CHECK (((closure_reason IS NULL) OR ((char_length(closure_reason) >= 5) AND (char_length(closure_reason) <= 500)))),
     CONSTRAINT loan_booking_core_reference_check CHECK (((char_length(btrim(core_reference)) >= 1) AND (char_length(btrim(core_reference)) <= 64))),
     CONSTRAINT loan_booking_disbursed_amount_check CHECK ((disbursed_amount > (0)::numeric)),
+    CONSTRAINT loan_booking_monthly_amount_check CHECK (((monthly_amount IS NULL) OR (monthly_amount >= (0)::numeric))),
     CONSTRAINT loan_booking_notes_check CHECK (((notes IS NULL) OR (char_length(notes) <= 1000))),
-    CONSTRAINT loan_booking_source_check CHECK ((source = ANY (ARRAY['portal'::text, 'api'::text])))
+    CONSTRAINT loan_booking_source_check CHECK ((source = ANY (ARRAY['portal'::text, 'api'::text]))),
+    CONSTRAINT loan_booking_term_months_check CHECK (((term_months IS NULL) OR ((term_months >= 1) AND (term_months <= 600))))
 );
 
 ALTER TABLE ONLY marketplace.loan_booking FORCE ROW LEVEL SECURITY;
@@ -7793,8 +7897,8 @@ CREATE TABLE portal_admin.commission_event (
     request_id uuid NOT NULL,
     institution_id uuid NOT NULL,
     deal_amount numeric(15,2) NOT NULL,
-    commission_rate numeric(6,4) DEFAULT 0.005 NOT NULL,
-    commission_amt numeric(15,2) GENERATED ALWAYS AS (round((deal_amount * commission_rate), 2)) STORED,
+    commission_rate numeric(6,4),
+    commission_amt numeric(15,2),
     currency character(3) DEFAULT 'MUR'::bpchar NOT NULL,
     status text DEFAULT 'pending'::text NOT NULL,
     invoice_ref text,
@@ -7803,6 +7907,13 @@ CREATE TABLE portal_admin.commission_event (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     rule_id uuid,
+    basis text,
+    fee_base numeric(18,2),
+    calc jsonb,
+    clawback_until date,
+    clawback_mode text DEFAULT 'none'::text NOT NULL,
+    clawback_months smallint DEFAULT 0 NOT NULL,
+    CONSTRAINT commission_event_clawback_mode_check CHECK ((clawback_mode = ANY (ARRAY['none'::text, 'full'::text, 'pro_rata'::text]))),
     CONSTRAINT commission_event_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'invoiced'::text, 'paid'::text, 'waived'::text])))
 );
 
@@ -7871,44 +7982,20 @@ CREATE TABLE public.portal_notifications (
     metadata jsonb,
     read_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT portal_notifications_kind_check CHECK ((kind = ANY (ARRAY['bid_accepted'::text, 'bid_rejected'::text, 'bid_expired'::text, 'request_closed'::text, 'pipeline_advanced'::text, 'pipeline_approved'::text, 'approval_needed'::text, 'compliance_expiring'::text, 'system'::text, 'deal_booked'::text, 'deal_closed'::text])))
+    CONSTRAINT portal_notifications_kind_check CHECK ((kind = ANY (ARRAY['bid_accepted'::text, 'bid_rejected'::text, 'bid_expired'::text, 'request_closed'::text, 'pipeline_advanced'::text, 'pipeline_approved'::text, 'approval_needed'::text, 'compliance_expiring'::text, 'system'::text, 'deal_booked'::text, 'deal_closed'::text, 'booking_closed'::text])))
 );
 
 --
--- Name: execution_2026_08; Type: TABLE ATTACH; Schema: autobid; Owner: -
+-- Name: execution_default; Type: TABLE ATTACH; Schema: autobid; Owner: -
 --
 
-ALTER TABLE ONLY autobid.execution ATTACH PARTITION autobid.execution_2026_08 FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+ALTER TABLE ONLY autobid.execution ATTACH PARTITION autobid.execution_default DEFAULT;
 
 --
--- Name: execution_2026_09; Type: TABLE ATTACH; Schema: autobid; Owner: -
+-- Name: usage_event_default; Type: TABLE ATTACH; Schema: entitlements; Owner: -
 --
 
-ALTER TABLE ONLY autobid.execution ATTACH PARTITION autobid.execution_2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
-
---
--- Name: execution_2026_10; Type: TABLE ATTACH; Schema: autobid; Owner: -
---
-
-ALTER TABLE ONLY autobid.execution ATTACH PARTITION autobid.execution_2026_10 FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00');
-
---
--- Name: usage_event_2026_08; Type: TABLE ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event ATTACH PARTITION entitlements.usage_event_2026_08 FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
-
---
--- Name: usage_event_2026_09; Type: TABLE ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event ATTACH PARTITION entitlements.usage_event_2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
-
---
--- Name: usage_event_2026_10; Type: TABLE ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event ATTACH PARTITION entitlements.usage_event_2026_10 FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00');
+ALTER TABLE ONLY entitlements.usage_event ATTACH PARTITION entitlements.usage_event_default DEFAULT;
 
 --
 -- Name: approval_outbox id; Type: DEFAULT; Schema: institution; Owner: -
@@ -7939,69 +8026,6 @@ ALTER TABLE ONLY marketplace.deal_document_event ALTER COLUMN id SET DEFAULT nex
 --
 
 ALTER TABLE ONLY public._identity_migration_log ALTER COLUMN id SET DEFAULT nextval('public._identity_migration_log_id_seq'::regclass);
-
---
--- Name: notification_log notification_log_pkey; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.notification_log
-    ADD CONSTRAINT notification_log_pkey PRIMARY KEY (id);
-
---
--- Name: role role_pkey; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.role
-    ADD CONSTRAINT role_pkey PRIMARY KEY (id);
-
---
--- Name: role role_slug_key; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.role
-    ADD CONSTRAINT role_slug_key UNIQUE (slug);
-
---
--- Name: session session_pkey; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.session
-    ADD CONSTRAINT session_pkey PRIMARY KEY (id);
-
---
--- Name: system_group system_group_pkey; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.system_group
-    ADD CONSTRAINT system_group_pkey PRIMARY KEY (id);
-
---
--- Name: system_group system_group_slug_key; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.system_group
-    ADD CONSTRAINT system_group_slug_key UNIQUE (slug);
-
---
--- Name: user user_auth_user_id_key; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin."user"
-    ADD CONSTRAINT user_auth_user_id_key UNIQUE (auth_user_id);
-
---
--- Name: user user_email_key; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin."user"
-    ADD CONSTRAINT user_email_key UNIQUE (email);
-
---
--- Name: user user_pkey; Type: CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin."user"
-    ADD CONSTRAINT user_pkey PRIMARY KEY (id);
 
 --
 -- Name: event event_pkey; Type: CONSTRAINT; Schema: audit; Owner: -
@@ -8095,11 +8119,11 @@ ALTER TABLE ONLY autobid.execution
     ADD CONSTRAINT execution_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
 
 --
--- Name: execution_2026_08 execution_2026_08_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: autobid; Owner: -
+-- Name: execution_default execution_default_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: autobid; Owner: -
 --
 
-ALTER TABLE ONLY autobid.execution_2026_08
-    ADD CONSTRAINT execution_2026_08_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
+ALTER TABLE ONLY autobid.execution_default
+    ADD CONSTRAINT execution_default_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
 
 --
 -- Name: execution execution_pkey; Type: CONSTRAINT; Schema: autobid; Owner: -
@@ -8109,39 +8133,11 @@ ALTER TABLE ONLY autobid.execution
     ADD CONSTRAINT execution_pkey PRIMARY KEY (id, occurred_at);
 
 --
--- Name: execution_2026_08 execution_2026_08_pkey; Type: CONSTRAINT; Schema: autobid; Owner: -
+-- Name: execution_default execution_default_pkey; Type: CONSTRAINT; Schema: autobid; Owner: -
 --
 
-ALTER TABLE ONLY autobid.execution_2026_08
-    ADD CONSTRAINT execution_2026_08_pkey PRIMARY KEY (id, occurred_at);
-
---
--- Name: execution_2026_09 execution_2026_09_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: autobid; Owner: -
---
-
-ALTER TABLE ONLY autobid.execution_2026_09
-    ADD CONSTRAINT execution_2026_09_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
-
---
--- Name: execution_2026_09 execution_2026_09_pkey; Type: CONSTRAINT; Schema: autobid; Owner: -
---
-
-ALTER TABLE ONLY autobid.execution_2026_09
-    ADD CONSTRAINT execution_2026_09_pkey PRIMARY KEY (id, occurred_at);
-
---
--- Name: execution_2026_10 execution_2026_10_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: autobid; Owner: -
---
-
-ALTER TABLE ONLY autobid.execution_2026_10
-    ADD CONSTRAINT execution_2026_10_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
-
---
--- Name: execution_2026_10 execution_2026_10_pkey; Type: CONSTRAINT; Schema: autobid; Owner: -
---
-
-ALTER TABLE ONLY autobid.execution_2026_10
-    ADD CONSTRAINT execution_2026_10_pkey PRIMARY KEY (id, occurred_at);
+ALTER TABLE ONLY autobid.execution_default
+    ADD CONSTRAINT execution_default_pkey PRIMARY KEY (id, occurred_at);
 
 --
 -- Name: exposure exposure_pkey; Type: CONSTRAINT; Schema: autobid; Owner: -
@@ -8177,6 +8173,13 @@ ALTER TABLE ONLY autobid.rule_version
 
 ALTER TABLE ONLY autobid.rule_version
     ADD CONSTRAINT rule_version_rule_id_version_no_key UNIQUE (rule_id, version_no);
+
+--
+-- Name: commission_adjustment commission_adjustment_pkey; Type: CONSTRAINT; Schema: billing; Owner: -
+--
+
+ALTER TABLE ONLY billing.commission_adjustment
+    ADD CONSTRAINT commission_adjustment_pkey PRIMARY KEY (id);
 
 --
 -- Name: commission_rule commission_rule_command_id_key; Type: CONSTRAINT; Schema: billing; Owner: -
@@ -8347,11 +8350,11 @@ ALTER TABLE ONLY entitlements.usage_event
     ADD CONSTRAINT usage_event_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
 
 --
--- Name: usage_event_2026_08 usage_event_2026_08_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: entitlements; Owner: -
+-- Name: usage_event_default usage_event_default_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: entitlements; Owner: -
 --
 
-ALTER TABLE ONLY entitlements.usage_event_2026_08
-    ADD CONSTRAINT usage_event_2026_08_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
+ALTER TABLE ONLY entitlements.usage_event_default
+    ADD CONSTRAINT usage_event_default_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
 
 --
 -- Name: usage_event usage_event_pkey; Type: CONSTRAINT; Schema: entitlements; Owner: -
@@ -8361,39 +8364,11 @@ ALTER TABLE ONLY entitlements.usage_event
     ADD CONSTRAINT usage_event_pkey PRIMARY KEY (id, occurred_at);
 
 --
--- Name: usage_event_2026_08 usage_event_2026_08_pkey; Type: CONSTRAINT; Schema: entitlements; Owner: -
+-- Name: usage_event_default usage_event_default_pkey; Type: CONSTRAINT; Schema: entitlements; Owner: -
 --
 
-ALTER TABLE ONLY entitlements.usage_event_2026_08
-    ADD CONSTRAINT usage_event_2026_08_pkey PRIMARY KEY (id, occurred_at);
-
---
--- Name: usage_event_2026_09 usage_event_2026_09_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event_2026_09
-    ADD CONSTRAINT usage_event_2026_09_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
-
---
--- Name: usage_event_2026_09 usage_event_2026_09_pkey; Type: CONSTRAINT; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event_2026_09
-    ADD CONSTRAINT usage_event_2026_09_pkey PRIMARY KEY (id, occurred_at);
-
---
--- Name: usage_event_2026_10 usage_event_2026_10_idempotency_key_occurred_at_key; Type: CONSTRAINT; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event_2026_10
-    ADD CONSTRAINT usage_event_2026_10_idempotency_key_occurred_at_key UNIQUE (idempotency_key, occurred_at);
-
---
--- Name: usage_event_2026_10 usage_event_2026_10_pkey; Type: CONSTRAINT; Schema: entitlements; Owner: -
---
-
-ALTER TABLE ONLY entitlements.usage_event_2026_10
-    ADD CONSTRAINT usage_event_2026_10_pkey PRIMARY KEY (id, occurred_at);
+ALTER TABLE ONLY entitlements.usage_event_default
+    ADD CONSTRAINT usage_event_default_pkey PRIMARY KEY (id, occurred_at);
 
 --
 -- Name: action action_pkey; Type: CONSTRAINT; Schema: governance; Owner: -
@@ -8415,76 +8390,6 @@ ALTER TABLE ONLY governance.four_eyes_catalog
 
 ALTER TABLE ONLY governance.four_eyes_policy
     ADD CONSTRAINT four_eyes_policy_pkey PRIMARY KEY (institution_id, category);
-
---
--- Name: email_verification_token email_verification_token_pkey; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.email_verification_token
-    ADD CONSTRAINT email_verification_token_pkey PRIMARY KEY (id);
-
---
--- Name: email_verification_token email_verification_token_token_hash_key; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.email_verification_token
-    ADD CONSTRAINT email_verification_token_token_hash_key UNIQUE (token_hash);
-
---
--- Name: ip_allowlist ip_allowlist_pkey; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.ip_allowlist
-    ADD CONSTRAINT ip_allowlist_pkey PRIMARY KEY (id);
-
---
--- Name: ip_allowlist ip_allowlist_user_id_cidr_key; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.ip_allowlist
-    ADD CONSTRAINT ip_allowlist_user_id_cidr_key UNIQUE (user_id, cidr);
-
---
--- Name: login_event login_event_pkey; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.login_event
-    ADD CONSTRAINT login_event_pkey PRIMARY KEY (id);
-
---
--- Name: mfa_backup_code mfa_backup_code_pkey; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.mfa_backup_code
-    ADD CONSTRAINT mfa_backup_code_pkey PRIMARY KEY (id);
-
---
--- Name: password_reset_token password_reset_token_pkey; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.password_reset_token
-    ADD CONSTRAINT password_reset_token_pkey PRIMARY KEY (id);
-
---
--- Name: password_reset_token password_reset_token_token_hash_key; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.password_reset_token
-    ADD CONSTRAINT password_reset_token_token_hash_key UNIQUE (token_hash);
-
---
--- Name: profile profile_email_key; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.profile
-    ADD CONSTRAINT profile_email_key UNIQUE (email);
-
---
--- Name: profile profile_pkey; Type: CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.profile
-    ADD CONSTRAINT profile_pkey PRIMARY KEY (id);
 
 --
 -- Name: access_request access_request_pkey; Type: CONSTRAINT; Schema: institution; Owner: -
@@ -9299,48 +9204,6 @@ ALTER TABLE ONLY public.portal_notifications
     ADD CONSTRAINT portal_notifications_pkey PRIMARY KEY (id);
 
 --
--- Name: idx_admin_session_active; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE INDEX idx_admin_session_active ON admin.session USING btree (is_active, last_active_at) WHERE (is_active = true);
-
---
--- Name: idx_admin_session_user; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE INDEX idx_admin_session_user ON admin.session USING btree (user_id, is_active);
-
---
--- Name: idx_admin_user_auth; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE INDEX idx_admin_user_auth ON admin."user" USING btree (auth_user_id);
-
---
--- Name: idx_admin_user_status; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE INDEX idx_admin_user_status ON admin."user" USING btree (status);
-
---
--- Name: idx_notif_log_event; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE INDEX idx_notif_log_event ON admin.notification_log USING btree (event_type, recipient_ref);
-
---
--- Name: idx_notif_log_related; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE INDEX idx_notif_log_related ON admin.notification_log USING btree (related_id);
-
---
--- Name: uq_notif_log_idempotency; Type: INDEX; Schema: admin; Owner: -
---
-
-CREATE UNIQUE INDEX uq_notif_log_idempotency ON admin.notification_log USING btree (event_type, recipient_ref, related_id) WHERE (status = 'sent'::text);
-
---
 -- Name: idx_audit_action; Type: INDEX; Schema: audit; Owner: -
 --
 
@@ -9377,6 +9240,12 @@ CREATE INDEX idx_audit_occurred ON audit.event USING btree (occurred_at DESC);
 CREATE UNIQUE INDEX auth_users_username_lower_unique ON auth_portal.auth_users USING btree (lower(username)) WHERE (username IS NOT NULL);
 
 --
+-- Name: email_verification_tokens_user_id_fk_idx; Type: INDEX; Schema: auth_portal; Owner: -
+--
+
+CREATE INDEX email_verification_tokens_user_id_fk_idx ON auth_portal.email_verification_tokens USING btree (user_id);
+
+--
 -- Name: ix_auth_audit_created_at; Type: INDEX; Schema: auth_portal; Owner: -
 --
 
@@ -9407,34 +9276,16 @@ CREATE INDEX ix_auth_audit_user_id ON auth_portal.auth_audit_events USING btree 
 CREATE INDEX ix_auth_sessions_expires_at ON auth_portal.auth_sessions USING btree (expires_at);
 
 --
--- Name: ix_auth_sessions_refresh_token_hash; Type: INDEX; Schema: auth_portal; Owner: -
---
-
-CREATE INDEX ix_auth_sessions_refresh_token_hash ON auth_portal.auth_sessions USING btree (refresh_token_hash);
-
---
 -- Name: ix_auth_sessions_user_id; Type: INDEX; Schema: auth_portal; Owner: -
 --
 
 CREATE INDEX ix_auth_sessions_user_id ON auth_portal.auth_sessions USING btree (user_id);
 
 --
--- Name: ix_auth_users_email; Type: INDEX; Schema: auth_portal; Owner: -
---
-
-CREATE INDEX ix_auth_users_email ON auth_portal.auth_users USING btree (email);
-
---
 -- Name: ix_auth_users_institution_id; Type: INDEX; Schema: auth_portal; Owner: -
 --
 
 CREATE INDEX ix_auth_users_institution_id ON auth_portal.auth_users USING btree (institution_id);
-
---
--- Name: ix_email_verify_token_hash; Type: INDEX; Schema: auth_portal; Owner: -
---
-
-CREATE INDEX ix_email_verify_token_hash ON auth_portal.email_verification_tokens USING btree (token_hash);
 
 --
 -- Name: ix_ip_allowlist_institution_id; Type: INDEX; Schema: auth_portal; Owner: -
@@ -9449,12 +9300,6 @@ CREATE INDEX ix_ip_allowlist_institution_id ON auth_portal.ip_allowlist USING bt
 CREATE INDEX ix_mfa_backup_codes_user_id ON auth_portal.mfa_backup_codes USING btree (user_id);
 
 --
--- Name: ix_pwd_reset_token_hash; Type: INDEX; Schema: auth_portal; Owner: -
---
-
-CREATE INDEX ix_pwd_reset_token_hash ON auth_portal.password_reset_tokens USING btree (token_hash);
-
---
 -- Name: ix_pwd_reset_user_id; Type: INDEX; Schema: auth_portal; Owner: -
 --
 
@@ -9467,10 +9312,10 @@ CREATE INDEX ix_pwd_reset_user_id ON auth_portal.password_reset_tokens USING btr
 CREATE INDEX idx_ab_exec_inst_request ON ONLY autobid.execution USING btree (institution_id, loan_request_id);
 
 --
--- Name: execution_2026_08_institution_id_loan_request_id_idx; Type: INDEX; Schema: autobid; Owner: -
+-- Name: execution_default_institution_id_loan_request_id_idx; Type: INDEX; Schema: autobid; Owner: -
 --
 
-CREATE INDEX execution_2026_08_institution_id_loan_request_id_idx ON autobid.execution_2026_08 USING btree (institution_id, loan_request_id);
+CREATE INDEX execution_default_institution_id_loan_request_id_idx ON autobid.execution_default USING btree (institution_id, loan_request_id);
 
 --
 -- Name: idx_ab_exec_inst_time; Type: INDEX; Schema: autobid; Owner: -
@@ -9479,34 +9324,10 @@ CREATE INDEX execution_2026_08_institution_id_loan_request_id_idx ON autobid.exe
 CREATE INDEX idx_ab_exec_inst_time ON ONLY autobid.execution USING btree (institution_id, occurred_at DESC);
 
 --
--- Name: execution_2026_08_institution_id_occurred_at_idx; Type: INDEX; Schema: autobid; Owner: -
+-- Name: execution_default_institution_id_occurred_at_idx; Type: INDEX; Schema: autobid; Owner: -
 --
 
-CREATE INDEX execution_2026_08_institution_id_occurred_at_idx ON autobid.execution_2026_08 USING btree (institution_id, occurred_at DESC);
-
---
--- Name: execution_2026_09_institution_id_loan_request_id_idx; Type: INDEX; Schema: autobid; Owner: -
---
-
-CREATE INDEX execution_2026_09_institution_id_loan_request_id_idx ON autobid.execution_2026_09 USING btree (institution_id, loan_request_id);
-
---
--- Name: execution_2026_09_institution_id_occurred_at_idx; Type: INDEX; Schema: autobid; Owner: -
---
-
-CREATE INDEX execution_2026_09_institution_id_occurred_at_idx ON autobid.execution_2026_09 USING btree (institution_id, occurred_at DESC);
-
---
--- Name: execution_2026_10_institution_id_loan_request_id_idx; Type: INDEX; Schema: autobid; Owner: -
---
-
-CREATE INDEX execution_2026_10_institution_id_loan_request_id_idx ON autobid.execution_2026_10 USING btree (institution_id, loan_request_id);
-
---
--- Name: execution_2026_10_institution_id_occurred_at_idx; Type: INDEX; Schema: autobid; Owner: -
---
-
-CREATE INDEX execution_2026_10_institution_id_occurred_at_idx ON autobid.execution_2026_10 USING btree (institution_id, occurred_at DESC);
+CREATE INDEX execution_default_institution_id_occurred_at_idx ON autobid.execution_default USING btree (institution_id, occurred_at DESC);
 
 --
 -- Name: idx_ab_rule_inst_priority; Type: INDEX; Schema: autobid; Owner: -
@@ -9527,6 +9348,30 @@ CREATE INDEX idx_ab_rule_inst_status ON autobid.rule USING btree (institution_id
 CREATE INDEX idx_ab_rv_inst_rule ON autobid.rule_version USING btree (institution_id, rule_id, version_no DESC);
 
 --
+-- Name: rule_current_version_id_fk_idx; Type: INDEX; Schema: autobid; Owner: -
+--
+
+CREATE INDEX rule_current_version_id_fk_idx ON autobid.rule USING btree (current_version_id);
+
+--
+-- Name: commission_adjustment_inst_month; Type: INDEX; Schema: billing; Owner: -
+--
+
+CREATE INDEX commission_adjustment_inst_month ON billing.commission_adjustment USING btree (institution_id, effective_on);
+
+--
+-- Name: commission_adjustment_one_clawback; Type: INDEX; Schema: billing; Owner: -
+--
+
+CREATE UNIQUE INDEX commission_adjustment_one_clawback ON billing.commission_adjustment USING btree (commission_id) WHERE (kind = 'clawback'::text);
+
+--
+-- Name: commission_adjustment_pipeline; Type: INDEX; Schema: billing; Owner: -
+--
+
+CREATE INDEX commission_adjustment_pipeline ON billing.commission_adjustment USING btree (pipeline_id);
+
+--
 -- Name: commission_rule_lookup; Type: INDEX; Schema: billing; Owner: -
 --
 
@@ -9545,6 +9390,24 @@ CREATE UNIQUE INDEX commission_rule_open_scope ON billing.commission_rule USING 
 CREATE INDEX idx_catalog_product_family ON catalog.product USING btree (family_id, active);
 
 --
+-- Name: product_currency_fk_idx; Type: INDEX; Schema: catalog; Owner: -
+--
+
+CREATE INDEX product_currency_fk_idx ON catalog.product USING btree (currency);
+
+--
+-- Name: product_eligibility_country_fk_idx; Type: INDEX; Schema: catalog; Owner: -
+--
+
+CREATE INDEX product_eligibility_country_fk_idx ON catalog.product_eligibility USING btree (country);
+
+--
+-- Name: product_eligibility_product_id_fk_idx; Type: INDEX; Schema: catalog; Owner: -
+--
+
+CREATE INDEX product_eligibility_product_id_fk_idx ON catalog.product_eligibility USING btree (product_id);
+
+--
 -- Name: idx_ie_inst_module_status; Type: INDEX; Schema: entitlements; Owner: -
 --
 
@@ -9557,22 +9420,16 @@ CREATE INDEX idx_ie_inst_module_status ON entitlements.institution_entitlement U
 CREATE INDEX idx_ue_inst_module_time ON ONLY entitlements.usage_event USING btree (institution_id, module_code, occurred_at);
 
 --
--- Name: usage_event_2026_08_institution_id_module_code_occurred_at_idx; Type: INDEX; Schema: entitlements; Owner: -
+-- Name: institution_entitlement_module_code_fk_idx; Type: INDEX; Schema: entitlements; Owner: -
 --
 
-CREATE INDEX usage_event_2026_08_institution_id_module_code_occurred_at_idx ON entitlements.usage_event_2026_08 USING btree (institution_id, module_code, occurred_at);
+CREATE INDEX institution_entitlement_module_code_fk_idx ON entitlements.institution_entitlement USING btree (module_code);
 
 --
--- Name: usage_event_2026_09_institution_id_module_code_occurred_at_idx; Type: INDEX; Schema: entitlements; Owner: -
+-- Name: usage_event_default_institution_id_module_code_occurred_at_idx; Type: INDEX; Schema: entitlements; Owner: -
 --
 
-CREATE INDEX usage_event_2026_09_institution_id_module_code_occurred_at_idx ON entitlements.usage_event_2026_09 USING btree (institution_id, module_code, occurred_at);
-
---
--- Name: usage_event_2026_10_institution_id_module_code_occurred_at_idx; Type: INDEX; Schema: entitlements; Owner: -
---
-
-CREATE INDEX usage_event_2026_10_institution_id_module_code_occurred_at_idx ON entitlements.usage_event_2026_10 USING btree (institution_id, module_code, occurred_at);
+CREATE INDEX usage_event_default_institution_id_module_code_occurred_at_idx ON entitlements.usage_event_default USING btree (institution_id, module_code, occurred_at);
 
 --
 -- Name: action_pending_expiry_idx; Type: INDEX; Schema: governance; Owner: -
@@ -9581,10 +9438,16 @@ CREATE INDEX usage_event_2026_10_institution_id_module_code_occurred_at_idx ON e
 CREATE INDEX action_pending_expiry_idx ON governance.action USING btree (expires_at) WHERE (status = 'pending'::text);
 
 --
--- Name: idx_governance_expiry; Type: INDEX; Schema: governance; Owner: -
+-- Name: four_eyes_policy_category_fk_idx; Type: INDEX; Schema: governance; Owner: -
 --
 
-CREATE INDEX idx_governance_expiry ON governance.action USING btree (expires_at) WHERE (status = 'pending'::text);
+CREATE INDEX four_eyes_policy_category_fk_idx ON governance.four_eyes_policy USING btree (category);
+
+--
+-- Name: four_eyes_policy_via_action_id_fk_idx; Type: INDEX; Schema: governance; Owner: -
+--
+
+CREATE INDEX four_eyes_policy_via_action_id_fk_idx ON governance.four_eyes_policy USING btree (via_action_id);
 
 --
 -- Name: idx_governance_inst; Type: INDEX; Schema: governance; Owner: -
@@ -9605,28 +9468,10 @@ CREATE INDEX idx_governance_maker ON governance.action USING btree (maker_id, cr
 CREATE INDEX idx_governance_platform ON governance.action USING btree (scope, status) WHERE (scope = 'platform'::text);
 
 --
--- Name: idx_identity_login_at; Type: INDEX; Schema: identity; Owner: -
+-- Name: access_request_institution_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
 --
 
-CREATE INDEX idx_identity_login_at ON identity.login_event USING btree (occurred_at DESC);
-
---
--- Name: idx_identity_login_user; Type: INDEX; Schema: identity; Owner: -
---
-
-CREATE INDEX idx_identity_login_user ON identity.login_event USING btree (user_id, occurred_at DESC);
-
---
--- Name: idx_identity_mfa_backup; Type: INDEX; Schema: identity; Owner: -
---
-
-CREATE INDEX idx_identity_mfa_backup ON identity.mfa_backup_code USING btree (user_id) WHERE (used_at IS NULL);
-
---
--- Name: idx_identity_reset; Type: INDEX; Schema: identity; Owner: -
---
-
-CREATE INDEX idx_identity_reset ON identity.password_reset_token USING btree (user_id) WHERE (used_at IS NULL);
+CREATE INDEX access_request_institution_id_fk_idx ON institution.access_request USING btree (institution_id);
 
 --
 -- Name: access_request_one_open_per_email; Type: INDEX; Schema: institution; Owner: -
@@ -9647,6 +9492,54 @@ CREATE INDEX access_request_status_idx ON institution.access_request USING btree
 CREATE UNIQUE INDEX access_request_verify_token ON institution.access_request USING btree (verify_token_hash) WHERE (verify_token_hash IS NOT NULL);
 
 --
+-- Name: api_key_revoked_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX api_key_revoked_by_fk_idx ON institution.api_key USING btree (revoked_by);
+
+--
+-- Name: approval_instance_doa_rule_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX approval_instance_doa_rule_id_fk_idx ON institution.approval_instance USING btree (doa_rule_id);
+
+--
+-- Name: approval_instance_template_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX approval_instance_template_id_fk_idx ON institution.approval_instance USING btree (template_id);
+
+--
+-- Name: approval_stage_def_committee_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX approval_stage_def_committee_id_fk_idx ON institution.approval_stage_def USING btree (committee_id);
+
+--
+-- Name: approval_stage_def_escalate_to_template_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX approval_stage_def_escalate_to_template_id_fk_idx ON institution.approval_stage_def USING btree (escalate_to_template_id);
+
+--
+-- Name: approval_stage_instance_stage_def_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX approval_stage_instance_stage_def_id_fk_idx ON institution.approval_stage_instance USING btree (stage_def_id);
+
+--
+-- Name: benefit_cat_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX benefit_cat_id_fk_idx ON institution.benefit USING btree (cat_id);
+
+--
+-- Name: benefit_created_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX benefit_created_by_fk_idx ON institution.benefit USING btree (created_by);
+
+--
 -- Name: benefit_institution_id_idx; Type: INDEX; Schema: institution; Owner: -
 --
 
@@ -9659,10 +9552,46 @@ CREATE INDEX benefit_institution_id_idx ON institution.benefit USING btree (inst
 CREATE INDEX benefit_institution_id_product_id_idx ON institution.benefit USING btree (institution_id, product_id) WHERE (is_active = true);
 
 --
+-- Name: benefit_product_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX benefit_product_id_fk_idx ON institution.benefit USING btree (product_id);
+
+--
+-- Name: compliance_waiver_granted_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX compliance_waiver_granted_by_fk_idx ON institution.compliance_waiver USING btree (granted_by);
+
+--
+-- Name: compliance_waiver_revoked_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX compliance_waiver_revoked_by_fk_idx ON institution.compliance_waiver USING btree (revoked_by);
+
+--
+-- Name: doa_rule_template_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doa_rule_template_id_fk_idx ON institution.doa_rule USING btree (template_id);
+
+--
+-- Name: doc_doc_type_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_doc_type_id_fk_idx ON institution.doc USING btree (doc_type_id);
+
+--
 -- Name: doc_generation_entity_idx; Type: INDEX; Schema: institution; Owner: -
 --
 
 CREATE INDEX doc_generation_entity_idx ON institution.doc_generation USING btree (entity_type, entity_id);
+
+--
+-- Name: doc_generation_generated_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_generation_generated_by_fk_idx ON institution.doc_generation USING btree (generated_by);
 
 --
 -- Name: doc_generation_institution_idx; Type: INDEX; Schema: institution; Owner: -
@@ -9671,10 +9600,22 @@ CREATE INDEX doc_generation_entity_idx ON institution.doc_generation USING btree
 CREATE INDEX doc_generation_institution_idx ON institution.doc_generation USING btree (institution_id);
 
 --
+-- Name: doc_generation_stage_instance_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_generation_stage_instance_id_fk_idx ON institution.doc_generation USING btree (stage_instance_id);
+
+--
 -- Name: doc_generation_template_idx; Type: INDEX; Schema: institution; Owner: -
 --
 
 CREATE INDEX doc_generation_template_idx ON institution.doc_generation USING btree (template_id);
+
+--
+-- Name: doc_generation_template_version_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_generation_template_version_id_fk_idx ON institution.doc_generation USING btree (template_version_id);
 
 --
 -- Name: doc_institution_id_idx; Type: INDEX; Schema: institution; Owner: -
@@ -9689,10 +9630,58 @@ CREATE INDEX doc_institution_id_idx ON institution.doc USING btree (institution_
 CREATE INDEX doc_institution_id_status_idx ON institution.doc USING btree (institution_id, status);
 
 --
+-- Name: doc_requirement_institution_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_requirement_institution_id_fk_idx ON institution.doc_requirement USING btree (institution_id);
+
+--
+-- Name: doc_requirement_stage_def_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_requirement_stage_def_id_fk_idx ON institution.doc_requirement USING btree (stage_def_id);
+
+--
+-- Name: doc_reviewed_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_reviewed_by_fk_idx ON institution.doc USING btree (reviewed_by);
+
+--
+-- Name: doc_reviewed_by_staff_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_reviewed_by_staff_fk_idx ON institution.doc USING btree (reviewed_by_staff);
+
+--
+-- Name: doc_template_created_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_template_created_by_fk_idx ON institution.doc_template USING btree (created_by);
+
+--
 -- Name: doc_template_institution_idx; Type: INDEX; Schema: institution; Owner: -
 --
 
 CREATE INDEX doc_template_institution_idx ON institution.doc_template USING btree (institution_id);
+
+--
+-- Name: doc_template_product_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_template_product_id_fk_idx ON institution.doc_template USING btree (product_id);
+
+--
+-- Name: doc_template_version_approved_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_template_version_approved_by_fk_idx ON institution.doc_template_version USING btree (approved_by);
+
+--
+-- Name: doc_template_version_created_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_template_version_created_by_fk_idx ON institution.doc_template_version USING btree (created_by);
 
 --
 -- Name: doc_template_version_institution_idx; Type: INDEX; Schema: institution; Owner: -
@@ -9705,6 +9694,30 @@ CREATE INDEX doc_template_version_institution_idx ON institution.doc_template_ve
 --
 
 CREATE INDEX doc_template_version_template_idx ON institution.doc_template_version USING btree (template_id);
+
+--
+-- Name: doc_uploaded_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX doc_uploaded_by_fk_idx ON institution.doc USING btree (uploaded_by);
+
+--
+-- Name: esign_envelope_approval_instance_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX esign_envelope_approval_instance_id_fk_idx ON institution.esign_envelope USING btree (approval_instance_id);
+
+--
+-- Name: esign_event_signer_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX esign_event_signer_id_fk_idx ON institution.esign_event USING btree (signer_id);
+
+--
+-- Name: group_created_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX group_created_by_fk_idx ON institution."group" USING btree (created_by);
 
 --
 -- Name: idx_aa_stage; Type: INDEX; Schema: institution; Owner: -
@@ -9749,30 +9762,6 @@ CREATE INDEX idx_asi_due ON institution.approval_stage_instance USING btree (due
 CREATE INDEX idx_cm_committee ON institution.committee_member USING btree (committee_id);
 
 --
--- Name: idx_dg_entity; Type: INDEX; Schema: institution; Owner: -
---
-
-CREATE INDEX idx_dg_entity ON institution.doc_generation USING btree (entity_type, entity_id);
-
---
--- Name: idx_dg_inst; Type: INDEX; Schema: institution; Owner: -
---
-
-CREATE INDEX idx_dg_inst ON institution.doc_generation USING btree (institution_id);
-
---
--- Name: idx_dt_inst; Type: INDEX; Schema: institution; Owner: -
---
-
-CREATE INDEX idx_dt_inst ON institution.doc_template USING btree (institution_id);
-
---
--- Name: idx_dtv_tmpl; Type: INDEX; Schema: institution; Owner: -
---
-
-CREATE INDEX idx_dtv_tmpl ON institution.doc_template_version USING btree (template_id);
-
---
 -- Name: idx_ee_env; Type: INDEX; Schema: institution; Owner: -
 --
 
@@ -9789,12 +9778,6 @@ CREATE INDEX idx_es_env ON institution.esign_signer USING btree (envelope_id);
 --
 
 CREATE INDEX idx_groups_inst ON institution."group" USING btree (institution_id);
-
---
--- Name: idx_inst_groups_institution; Type: INDEX; Schema: institution; Owner: -
---
-
-CREATE INDEX idx_inst_groups_institution ON institution."group" USING btree (institution_id, slug);
 
 --
 -- Name: idx_inst_members_group; Type: INDEX; Schema: institution; Owner: -
@@ -9863,12 +9846,6 @@ CREATE INDEX idx_pending_actions_institution ON institution.pending_actions USIN
 CREATE INDEX idx_pending_inst_status ON institution.pending_actions USING btree (institution_id, action_status, initiated_at DESC);
 
 --
--- Name: idx_prod_config_inst; Type: INDEX; Schema: institution; Owner: -
---
-
-CREATE INDEX idx_prod_config_inst ON institution.product_config USING btree (institution_id, product_id);
-
---
 -- Name: idx_product_config_inst; Type: INDEX; Schema: institution; Owner: -
 --
 
@@ -9899,6 +9876,24 @@ CREATE INDEX idx_webhook_inst ON institution.webhook USING btree (institution_id
 CREATE INDEX idx_webhooks_inst ON institution.webhook USING btree (institution_id);
 
 --
+-- Name: institution_compliance_reviewed_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX institution_compliance_reviewed_by_fk_idx ON institution.institution USING btree (compliance_reviewed_by);
+
+--
+-- Name: institution_sla_config_product_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX institution_sla_config_product_id_fk_idx ON institution.institution_sla_config USING btree (product_id);
+
+--
+-- Name: institution_suspended_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX institution_suspended_by_fk_idx ON institution.institution USING btree (suspended_by);
+
+--
 -- Name: ix_doc_requirement_template; Type: INDEX; Schema: institution; Owner: -
 --
 
@@ -9917,10 +9912,46 @@ CREATE INDEX ix_institutions_approved ON institution.institution USING btree (ap
 CREATE INDEX ix_members_auth_user_id ON institution.member USING btree (auth_user_id);
 
 --
--- Name: ix_members_institution_id; Type: INDEX; Schema: institution; Owner: -
+-- Name: kyb_document_reviewed_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
 --
 
-CREATE INDEX ix_members_institution_id ON institution.member USING btree (institution_id);
+CREATE INDEX kyb_document_reviewed_by_fk_idx ON institution.kyb_document USING btree (reviewed_by);
+
+--
+-- Name: kyb_document_uploaded_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX kyb_document_uploaded_by_fk_idx ON institution.kyb_document USING btree (uploaded_by);
+
+--
+-- Name: member_custom_group_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX member_custom_group_id_fk_idx ON institution.member USING btree (custom_group_id);
+
+--
+-- Name: onboarding_pref_submitted_by_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX onboarding_pref_submitted_by_fk_idx ON institution.onboarding_pref USING btree (submitted_by);
+
+--
+-- Name: pending_actions_checker_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX pending_actions_checker_id_fk_idx ON institution.pending_actions USING btree (checker_id);
+
+--
+-- Name: pending_actions_maker_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX pending_actions_maker_id_fk_idx ON institution.pending_actions USING btree (maker_id);
+
+--
+-- Name: product_config_product_id_fk_idx; Type: INDEX; Schema: institution; Owner: -
+--
+
+CREATE INDEX product_config_product_id_fk_idx ON institution.product_config USING btree (product_id);
 
 --
 -- Name: uq_live_envelope_per_entity; Type: INDEX; Schema: institution; Owner: -
@@ -9953,6 +9984,12 @@ CREATE UNIQUE INDEX uq_pipeline_template_default ON institution.pipeline_templat
 CREATE INDEX api_traffic_hour_hour_idx ON integration.api_traffic_hour USING btree (hour);
 
 --
+-- Name: document_upload_pipeline_id_fk_idx; Type: INDEX; Schema: integration; Owner: -
+--
+
+CREATE INDEX document_upload_pipeline_id_fk_idx ON integration.document_upload USING btree (pipeline_id);
+
+--
 -- Name: ix_document_upload_doc; Type: INDEX; Schema: integration; Owner: -
 --
 
@@ -9965,10 +10002,58 @@ CREATE INDEX ix_document_upload_doc ON integration.document_upload USING btree (
 CREATE INDEX outbox_due_idx ON integration.outbox USING btree (status, next_attempt_at) WHERE (status = ANY (ARRAY['pending'::text, 'sending'::text]));
 
 --
+-- Name: bid_acceptance_bid_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX bid_acceptance_bid_id_fk_idx ON marketplace.bid_acceptance USING btree (bid_id);
+
+--
+-- Name: bid_allocation_product_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX bid_allocation_product_id_fk_idx ON marketplace.bid_allocation USING btree (product_id);
+
+--
+-- Name: bid_benefit_benefit_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX bid_benefit_benefit_id_fk_idx ON marketplace.bid_benefit USING btree (benefit_id);
+
+--
 -- Name: bid_benefit_bid_id_idx; Type: INDEX; Schema: marketplace; Owner: -
 --
 
 CREATE INDEX bid_benefit_bid_id_idx ON marketplace.bid_benefit USING btree (bid_id);
+
+--
+-- Name: bid_event_actor_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX bid_event_actor_id_fk_idx ON marketplace.bid_event USING btree (actor_id);
+
+--
+-- Name: bid_submitted_by_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX bid_submitted_by_fk_idx ON marketplace.bid USING btree (submitted_by);
+
+--
+-- Name: credit_decision_approval_instance_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX credit_decision_approval_instance_id_fk_idx ON marketplace.credit_decision USING btree (approval_instance_id);
+
+--
+-- Name: credit_decision_stage_instance_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX credit_decision_stage_instance_id_fk_idx ON marketplace.credit_decision USING btree (stage_instance_id);
+
+--
+-- Name: deal_document_requirement_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX deal_document_requirement_id_fk_idx ON marketplace.deal_document USING btree (requirement_id);
 
 --
 -- Name: idx_bid_event_bid; Type: INDEX; Schema: marketplace; Owner: -
@@ -10049,6 +10134,90 @@ CREATE INDEX ix_request_message_thread ON marketplace.request_message USING btre
 CREATE INDEX ix_stage_instance_approval ON marketplace.pipeline_stage_instance USING btree (approval_instance_id) WHERE (approval_instance_id IS NOT NULL);
 
 --
+-- Name: loan_pipeline_current_stage_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX loan_pipeline_current_stage_id_fk_idx ON marketplace.loan_pipeline USING btree (current_stage_id);
+
+--
+-- Name: loan_pipeline_request_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX loan_pipeline_request_id_fk_idx ON marketplace.loan_pipeline USING btree (request_id);
+
+--
+-- Name: loan_pipeline_template_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX loan_pipeline_template_id_fk_idx ON marketplace.loan_pipeline USING btree (template_id);
+
+--
+-- Name: pipeline_stage_instance_stage_def_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX pipeline_stage_instance_stage_def_id_fk_idx ON marketplace.pipeline_stage_instance USING btree (stage_def_id);
+
+--
+-- Name: request_allocation_product_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX request_allocation_product_id_fk_idx ON marketplace.request_allocation USING btree (product_id);
+
+--
+-- Name: request_country_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX request_country_fk_idx ON marketplace.request USING btree (country);
+
+--
+-- Name: request_currency_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX request_currency_fk_idx ON marketplace.request USING btree (currency);
+
+--
+-- Name: request_relisted_from_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX request_relisted_from_fk_idx ON marketplace.request USING btree (relisted_from);
+
+--
+-- Name: request_winning_bid_id_fk_idx; Type: INDEX; Schema: marketplace; Owner: -
+--
+
+CREATE INDEX request_winning_bid_id_fk_idx ON marketplace.request USING btree (winning_bid_id);
+
+--
+-- Name: admin_audit_log_session_id_fk_idx; Type: INDEX; Schema: portal_admin; Owner: -
+--
+
+CREATE INDEX admin_audit_log_session_id_fk_idx ON portal_admin.admin_audit_log USING btree (session_id);
+
+--
+-- Name: admin_dual_control_actions_checker_id_fk_idx; Type: INDEX; Schema: portal_admin; Owner: -
+--
+
+CREATE INDEX admin_dual_control_actions_checker_id_fk_idx ON portal_admin.admin_dual_control_actions USING btree (checker_id);
+
+--
+-- Name: admin_users_custom_role_id_fk_idx; Type: INDEX; Schema: portal_admin; Owner: -
+--
+
+CREATE INDEX admin_users_custom_role_id_fk_idx ON portal_admin.admin_users USING btree (custom_role_id);
+
+--
+-- Name: admin_users_suspended_by_fk_idx; Type: INDEX; Schema: portal_admin; Owner: -
+--
+
+CREATE INDEX admin_users_suspended_by_fk_idx ON portal_admin.admin_users USING btree (suspended_by);
+
+--
+-- Name: commission_event_rule_id_fk_idx; Type: INDEX; Schema: portal_admin; Owner: -
+--
+
+CREATE INDEX commission_event_rule_id_fk_idx ON portal_admin.commission_event USING btree (rule_id);
+
+--
 -- Name: idx_admin_sessions_active; Type: INDEX; Schema: portal_admin; Owner: -
 --
 
@@ -10065,18 +10234,6 @@ CREATE INDEX idx_admin_sessions_started ON portal_admin.admin_sessions USING btr
 --
 
 CREATE INDEX idx_admin_sessions_user ON portal_admin.admin_sessions USING btree (admin_user_id);
-
---
--- Name: idx_admin_users_auth; Type: INDEX; Schema: portal_admin; Owner: -
---
-
-CREATE INDEX idx_admin_users_auth ON portal_admin.admin_users USING btree (auth_user_id);
-
---
--- Name: idx_admin_users_email; Type: INDEX; Schema: portal_admin; Owner: -
---
-
-CREATE INDEX idx_admin_users_email ON portal_admin.admin_users USING btree (email);
 
 --
 -- Name: idx_admin_users_group; Type: INDEX; Schema: portal_admin; Owner: -
@@ -10145,12 +10302,6 @@ CREATE INDEX idx_dc_maker ON portal_admin.admin_dual_control_actions USING btree
 CREATE INDEX idx_dc_status ON portal_admin.admin_dual_control_actions USING btree (status);
 
 --
--- Name: idx_user_groups_slug; Type: INDEX; Schema: portal_admin; Owner: -
---
-
-CREATE INDEX idx_user_groups_slug ON portal_admin.user_groups USING btree (slug);
-
---
 -- Name: idx_user_groups_user_type; Type: INDEX; Schema: portal_admin; Owner: -
 --
 
@@ -10175,130 +10326,46 @@ CREATE INDEX idx_portal_notifs_institution_created ON public.portal_notification
 CREATE INDEX idx_portal_notifs_unread ON public.portal_notifications USING btree (institution_id, read_at) WHERE (read_at IS NULL);
 
 --
--- Name: execution_2026_08_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: execution_default_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: autobid; Owner: -
 --
 
-ALTER INDEX autobid.execution_idempotency_key_occurred_at_key ATTACH PARTITION autobid.execution_2026_08_idempotency_key_occurred_at_key;
+ALTER INDEX autobid.execution_idempotency_key_occurred_at_key ATTACH PARTITION autobid.execution_default_idempotency_key_occurred_at_key;
 
 --
--- Name: execution_2026_08_institution_id_loan_request_id_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: execution_default_institution_id_loan_request_id_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
 --
 
-ALTER INDEX autobid.idx_ab_exec_inst_request ATTACH PARTITION autobid.execution_2026_08_institution_id_loan_request_id_idx;
+ALTER INDEX autobid.idx_ab_exec_inst_request ATTACH PARTITION autobid.execution_default_institution_id_loan_request_id_idx;
 
 --
--- Name: execution_2026_08_institution_id_occurred_at_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: execution_default_institution_id_occurred_at_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
 --
 
-ALTER INDEX autobid.idx_ab_exec_inst_time ATTACH PARTITION autobid.execution_2026_08_institution_id_occurred_at_idx;
+ALTER INDEX autobid.idx_ab_exec_inst_time ATTACH PARTITION autobid.execution_default_institution_id_occurred_at_idx;
 
 --
--- Name: execution_2026_08_pkey; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: execution_default_pkey; Type: INDEX ATTACH; Schema: autobid; Owner: -
 --
 
-ALTER INDEX autobid.execution_pkey ATTACH PARTITION autobid.execution_2026_08_pkey;
+ALTER INDEX autobid.execution_pkey ATTACH PARTITION autobid.execution_default_pkey;
 
 --
--- Name: execution_2026_09_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: usage_event_default_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: entitlements; Owner: -
 --
 
-ALTER INDEX autobid.execution_idempotency_key_occurred_at_key ATTACH PARTITION autobid.execution_2026_09_idempotency_key_occurred_at_key;
+ALTER INDEX entitlements.usage_event_idempotency_key_occurred_at_key ATTACH PARTITION entitlements.usage_event_default_idempotency_key_occurred_at_key;
 
 --
--- Name: execution_2026_09_institution_id_loan_request_id_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: usage_event_default_institution_id_module_code_occurred_at_idx; Type: INDEX ATTACH; Schema: entitlements; Owner: -
 --
 
-ALTER INDEX autobid.idx_ab_exec_inst_request ATTACH PARTITION autobid.execution_2026_09_institution_id_loan_request_id_idx;
+ALTER INDEX entitlements.idx_ue_inst_module_time ATTACH PARTITION entitlements.usage_event_default_institution_id_module_code_occurred_at_idx;
 
 --
--- Name: execution_2026_09_institution_id_occurred_at_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
+-- Name: usage_event_default_pkey; Type: INDEX ATTACH; Schema: entitlements; Owner: -
 --
 
-ALTER INDEX autobid.idx_ab_exec_inst_time ATTACH PARTITION autobid.execution_2026_09_institution_id_occurred_at_idx;
-
---
--- Name: execution_2026_09_pkey; Type: INDEX ATTACH; Schema: autobid; Owner: -
---
-
-ALTER INDEX autobid.execution_pkey ATTACH PARTITION autobid.execution_2026_09_pkey;
-
---
--- Name: execution_2026_10_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: autobid; Owner: -
---
-
-ALTER INDEX autobid.execution_idempotency_key_occurred_at_key ATTACH PARTITION autobid.execution_2026_10_idempotency_key_occurred_at_key;
-
---
--- Name: execution_2026_10_institution_id_loan_request_id_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
---
-
-ALTER INDEX autobid.idx_ab_exec_inst_request ATTACH PARTITION autobid.execution_2026_10_institution_id_loan_request_id_idx;
-
---
--- Name: execution_2026_10_institution_id_occurred_at_idx; Type: INDEX ATTACH; Schema: autobid; Owner: -
---
-
-ALTER INDEX autobid.idx_ab_exec_inst_time ATTACH PARTITION autobid.execution_2026_10_institution_id_occurred_at_idx;
-
---
--- Name: execution_2026_10_pkey; Type: INDEX ATTACH; Schema: autobid; Owner: -
---
-
-ALTER INDEX autobid.execution_pkey ATTACH PARTITION autobid.execution_2026_10_pkey;
-
---
--- Name: usage_event_2026_08_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.usage_event_idempotency_key_occurred_at_key ATTACH PARTITION entitlements.usage_event_2026_08_idempotency_key_occurred_at_key;
-
---
--- Name: usage_event_2026_08_institution_id_module_code_occurred_at_idx; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.idx_ue_inst_module_time ATTACH PARTITION entitlements.usage_event_2026_08_institution_id_module_code_occurred_at_idx;
-
---
--- Name: usage_event_2026_08_pkey; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.usage_event_pkey ATTACH PARTITION entitlements.usage_event_2026_08_pkey;
-
---
--- Name: usage_event_2026_09_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.usage_event_idempotency_key_occurred_at_key ATTACH PARTITION entitlements.usage_event_2026_09_idempotency_key_occurred_at_key;
-
---
--- Name: usage_event_2026_09_institution_id_module_code_occurred_at_idx; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.idx_ue_inst_module_time ATTACH PARTITION entitlements.usage_event_2026_09_institution_id_module_code_occurred_at_idx;
-
---
--- Name: usage_event_2026_09_pkey; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.usage_event_pkey ATTACH PARTITION entitlements.usage_event_2026_09_pkey;
-
---
--- Name: usage_event_2026_10_idempotency_key_occurred_at_key; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.usage_event_idempotency_key_occurred_at_key ATTACH PARTITION entitlements.usage_event_2026_10_idempotency_key_occurred_at_key;
-
---
--- Name: usage_event_2026_10_institution_id_module_code_occurred_at_idx; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.idx_ue_inst_module_time ATTACH PARTITION entitlements.usage_event_2026_10_institution_id_module_code_occurred_at_idx;
-
---
--- Name: usage_event_2026_10_pkey; Type: INDEX ATTACH; Schema: entitlements; Owner: -
---
-
-ALTER INDEX entitlements.usage_event_pkey ATTACH PARTITION entitlements.usage_event_2026_10_pkey;
+ALTER INDEX entitlements.usage_event_pkey ATTACH PARTITION entitlements.usage_event_default_pkey;
 
 --
 -- Name: auth_audit_events no_delete_audit; Type: RULE; Schema: auth_portal; Owner: -
@@ -10313,20 +10380,6 @@ CREATE RULE no_delete_audit AS
 
 CREATE RULE no_update_audit AS
     ON UPDATE TO auth_portal.auth_audit_events DO INSTEAD NOTHING;
-
---
--- Name: login_event identity_login_event_no_delete; Type: RULE; Schema: identity; Owner: -
---
-
-CREATE RULE identity_login_event_no_delete AS
-    ON DELETE TO identity.login_event DO INSTEAD NOTHING;
-
---
--- Name: login_event identity_login_event_no_update; Type: RULE; Schema: identity; Owner: -
---
-
-CREATE RULE identity_login_event_no_update AS
-    ON UPDATE TO identity.login_event DO INSTEAD NOTHING;
 
 --
 -- Name: bid_event marketplace_bid_event_no_delete; Type: RULE; Schema: marketplace; Owner: -
@@ -10357,24 +10410,6 @@ CREATE RULE audit_log_no_update AS
     ON UPDATE TO portal_admin.admin_audit_log DO INSTEAD NOTHING;
 
 --
--- Name: system_group admin_system_group_updated_at; Type: TRIGGER; Schema: admin; Owner: -
---
-
-CREATE TRIGGER admin_system_group_updated_at BEFORE UPDATE ON admin.system_group FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
-
---
--- Name: user admin_user_failed_login_lock; Type: TRIGGER; Schema: admin; Owner: -
---
-
-CREATE TRIGGER admin_user_failed_login_lock BEFORE UPDATE OF failed_login_count ON admin."user" FOR EACH ROW EXECUTE FUNCTION admin.check_failed_logins();
-
---
--- Name: user admin_user_updated_at; Type: TRIGGER; Schema: admin; Owner: -
---
-
-CREATE TRIGGER admin_user_updated_at BEFORE UPDATE ON admin."user" FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
-
---
 -- Name: event audit_event_no_delete; Type: TRIGGER; Schema: audit; Owner: -
 --
 
@@ -10399,6 +10434,12 @@ CREATE TRIGGER trg_auth_users_updated_at BEFORE UPDATE ON auth_portal.auth_users
 CREATE TRIGGER trg_rule_version_freeze BEFORE UPDATE ON autobid.rule_version FOR EACH ROW EXECUTE FUNCTION autobid.rule_version_freeze();
 
 --
+-- Name: commission_adjustment commission_adjustment_append_only; Type: TRIGGER; Schema: billing; Owner: -
+--
+
+CREATE TRIGGER commission_adjustment_append_only BEFORE DELETE OR UPDATE ON billing.commission_adjustment FOR EACH ROW EXECUTE FUNCTION billing.adjustment_is_append_only();
+
+--
 -- Name: product_family catalog_product_family_updated_at; Type: TRIGGER; Schema: catalog; Owner: -
 --
 
@@ -10421,12 +10462,6 @@ CREATE TRIGGER governance_action_updated_at BEFORE UPDATE ON governance.action F
 --
 
 CREATE TRIGGER trg_guard_member_action BEFORE INSERT ON governance.action FOR EACH ROW WHEN ((new.category = ANY (ARRAY['user.update'::text, 'user.deactivate'::text, 'user.reset_password'::text]))) EXECUTE FUNCTION governance.guard_member_action();
-
---
--- Name: profile identity_profile_updated_at; Type: TRIGGER; Schema: identity; Owner: -
---
-
-CREATE TRIGGER identity_profile_updated_at BEFORE UPDATE ON identity.profile FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 --
 -- Name: doc_template doc_template_updated_at; Type: TRIGGER; Schema: institution; Owner: -
@@ -10651,27 +10686,6 @@ CREATE TRIGGER admin_users_updated_at BEFORE UPDATE ON portal_admin.admin_users 
 CREATE TRIGGER user_groups_updated_at BEFORE UPDATE ON portal_admin.user_groups FOR EACH ROW EXECUTE FUNCTION portal_admin.set_updated_at();
 
 --
--- Name: session session_user_id_fkey; Type: FK CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin.session
-    ADD CONSTRAINT session_user_id_fkey FOREIGN KEY (user_id) REFERENCES admin."user"(id) ON DELETE CASCADE;
-
---
--- Name: user user_role_id_fkey; Type: FK CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin."user"
-    ADD CONSTRAINT user_role_id_fkey FOREIGN KEY (role_id) REFERENCES admin.role(id);
-
---
--- Name: user user_system_group_id_fkey; Type: FK CONSTRAINT; Schema: admin; Owner: -
---
-
-ALTER TABLE ONLY admin."user"
-    ADD CONSTRAINT user_system_group_id_fkey FOREIGN KEY (system_group_id) REFERENCES admin.system_group(id);
-
---
 -- Name: event event_governance_action_id_fkey; Type: FK CONSTRAINT; Schema: audit; Owner: -
 --
 
@@ -10733,6 +10747,27 @@ ALTER TABLE ONLY autobid.rule
 
 ALTER TABLE ONLY autobid.rule_version
     ADD CONSTRAINT rule_version_rule_id_fkey FOREIGN KEY (rule_id) REFERENCES autobid.rule(id);
+
+--
+-- Name: commission_adjustment commission_adjustment_commission_id_fkey; Type: FK CONSTRAINT; Schema: billing; Owner: -
+--
+
+ALTER TABLE ONLY billing.commission_adjustment
+    ADD CONSTRAINT commission_adjustment_commission_id_fkey FOREIGN KEY (commission_id) REFERENCES portal_admin.commission_event(id);
+
+--
+-- Name: commission_adjustment commission_adjustment_institution_id_fkey; Type: FK CONSTRAINT; Schema: billing; Owner: -
+--
+
+ALTER TABLE ONLY billing.commission_adjustment
+    ADD CONSTRAINT commission_adjustment_institution_id_fkey FOREIGN KEY (institution_id) REFERENCES institution.institution(id);
+
+--
+-- Name: commission_adjustment commission_adjustment_pipeline_id_fkey; Type: FK CONSTRAINT; Schema: billing; Owner: -
+--
+
+ALTER TABLE ONLY billing.commission_adjustment
+    ADD CONSTRAINT commission_adjustment_pipeline_id_fkey FOREIGN KEY (pipeline_id) REFERENCES marketplace.loan_pipeline(id);
 
 --
 -- Name: commission_rule commission_rule_institution_id_fkey; Type: FK CONSTRAINT; Schema: billing; Owner: -
@@ -10831,55 +10866,6 @@ ALTER TABLE ONLY governance.four_eyes_policy
 
 ALTER TABLE ONLY governance.four_eyes_policy
     ADD CONSTRAINT four_eyes_policy_via_action_id_fkey FOREIGN KEY (via_action_id) REFERENCES governance.action(id);
-
---
--- Name: email_verification_token email_verification_token_user_id_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.email_verification_token
-    ADD CONSTRAINT email_verification_token_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
-
---
--- Name: ip_allowlist ip_allowlist_created_by_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.ip_allowlist
-    ADD CONSTRAINT ip_allowlist_created_by_fkey FOREIGN KEY (created_by) REFERENCES auth.users(id);
-
---
--- Name: ip_allowlist ip_allowlist_user_id_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.ip_allowlist
-    ADD CONSTRAINT ip_allowlist_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
-
---
--- Name: login_event login_event_user_id_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.login_event
-    ADD CONSTRAINT login_event_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
-
---
--- Name: mfa_backup_code mfa_backup_code_user_id_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.mfa_backup_code
-    ADD CONSTRAINT mfa_backup_code_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
-
---
--- Name: password_reset_token password_reset_token_user_id_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.password_reset_token
-    ADD CONSTRAINT password_reset_token_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
-
---
--- Name: profile profile_id_fkey; Type: FK CONSTRAINT; Schema: identity; Owner: -
---
-
-ALTER TABLE ONLY identity.profile
-    ADD CONSTRAINT profile_id_fkey FOREIGN KEY (id) REFERENCES auth.users(id) ON DELETE CASCADE;
 
 --
 -- Name: access_request access_request_institution_id_fkey; Type: FK CONSTRAINT; Schema: institution; Owner: -
@@ -11701,72 +11687,6 @@ ALTER TABLE ONLY public.portal_notifications
     ADD CONSTRAINT portal_notifications_institution_id_fkey FOREIGN KEY (institution_id) REFERENCES institution.institution(id) ON DELETE CASCADE;
 
 --
--- Name: role admin_role_select; Type: POLICY; Schema: admin; Owner: -
---
-
-CREATE POLICY admin_role_select ON admin.role FOR SELECT TO authenticated USING (admin.is_admin());
-
---
--- Name: session admin_session_select; Type: POLICY; Schema: admin; Owner: -
---
-
-CREATE POLICY admin_session_select ON admin.session FOR SELECT TO authenticated USING (admin.is_admin());
-
---
--- Name: session admin_session_write; Type: POLICY; Schema: admin; Owner: -
---
-
-CREATE POLICY admin_session_write ON admin.session TO authenticated USING (admin.is_admin());
-
---
--- Name: system_group admin_system_group_select; Type: POLICY; Schema: admin; Owner: -
---
-
-CREATE POLICY admin_system_group_select ON admin.system_group FOR SELECT TO authenticated USING (true);
-
---
--- Name: user admin_user_select; Type: POLICY; Schema: admin; Owner: -
---
-
-CREATE POLICY admin_user_select ON admin."user" FOR SELECT TO authenticated USING (admin.is_admin());
-
---
--- Name: user admin_user_write; Type: POLICY; Schema: admin; Owner: -
---
-
-CREATE POLICY admin_user_write ON admin."user" TO authenticated USING ((auth.role() = 'service_role'::text));
-
---
--- Name: notification_log; Type: ROW SECURITY; Schema: admin; Owner: -
---
-
-ALTER TABLE admin.notification_log ENABLE ROW LEVEL SECURITY;
-
---
--- Name: role; Type: ROW SECURITY; Schema: admin; Owner: -
---
-
-ALTER TABLE admin.role ENABLE ROW LEVEL SECURITY;
-
---
--- Name: session; Type: ROW SECURITY; Schema: admin; Owner: -
---
-
-ALTER TABLE admin.session ENABLE ROW LEVEL SECURITY;
-
---
--- Name: system_group; Type: ROW SECURITY; Schema: admin; Owner: -
---
-
-ALTER TABLE admin.system_group ENABLE ROW LEVEL SECURITY;
-
---
--- Name: user; Type: ROW SECURITY; Schema: admin; Owner: -
---
-
-ALTER TABLE admin."user" ENABLE ROW LEVEL SECURITY;
-
---
 -- Name: event audit_admin_select; Type: POLICY; Schema: audit; Owner: -
 --
 
@@ -11776,7 +11696,7 @@ CREATE POLICY audit_admin_select ON audit.event FOR SELECT TO authenticated USIN
 -- Name: event audit_insert; Type: POLICY; Schema: audit; Owner: -
 --
 
-CREATE POLICY audit_insert ON audit.event FOR INSERT TO authenticated WITH CHECK (((auth.role() = 'service_role'::text) OR portal_admin.is_admin() OR (institution_id = ( SELECT ctx.institution_id
+CREATE POLICY audit_insert ON audit.event FOR INSERT TO authenticated WITH CHECK (((( SELECT auth.role() AS role) = 'service_role'::text) OR portal_admin.is_admin() OR (institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx() ctx(member_id, institution_id, is_admin, member_role, modules)))));
 
 --
@@ -11838,21 +11758,21 @@ ALTER TABLE auth_portal.password_reset_tokens ENABLE ROW LEVEL SECURITY;
 -- Name: execution ab_exec_tenant_read; Type: POLICY; Schema: autobid; Owner: -
 --
 
-CREATE POLICY ab_exec_tenant_read ON autobid.execution FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ab_exec_tenant_read ON autobid.execution FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: exposure ab_exposure_tenant_read; Type: POLICY; Schema: autobid; Owner: -
 --
 
-CREATE POLICY ab_exposure_tenant_read ON autobid.exposure FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ab_exposure_tenant_read ON autobid.exposure FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: rule ab_rule_tenant; Type: POLICY; Schema: autobid; Owner: -
 --
 
-CREATE POLICY ab_rule_tenant ON autobid.rule USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ab_rule_tenant ON autobid.rule TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)))) WITH CHECK ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
@@ -11860,7 +11780,7 @@ CREATE POLICY ab_rule_tenant ON autobid.rule USING ((institution_id = ( SELECT c
 -- Name: rule_version ab_rv_tenant; Type: POLICY; Schema: autobid; Owner: -
 --
 
-CREATE POLICY ab_rv_tenant ON autobid.rule_version USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ab_rv_tenant ON autobid.rule_version TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)))) WITH CHECK ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
@@ -11869,6 +11789,12 @@ CREATE POLICY ab_rv_tenant ON autobid.rule_version USING ((institution_id = ( SE
 --
 
 ALTER TABLE autobid.execution ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: execution_default; Type: ROW SECURITY; Schema: autobid; Owner: -
+--
+
+ALTER TABLE autobid.execution_default ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: exposure; Type: ROW SECURITY; Schema: autobid; Owner: -
@@ -11887,6 +11813,12 @@ ALTER TABLE autobid.rule ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE autobid.rule_version ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: commission_adjustment; Type: ROW SECURITY; Schema: billing; Owner: -
+--
+
+ALTER TABLE billing.commission_adjustment ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: commission_rule; Type: ROW SECURITY; Schema: billing; Owner: -
@@ -12030,7 +11962,7 @@ ALTER TABLE catalog.regulator ENABLE ROW LEVEL SECURITY;
 -- Name: institution_entitlement ie_tenant_read; Type: POLICY; Schema: entitlements; Owner: -
 --
 
-CREATE POLICY ie_tenant_read ON entitlements.institution_entitlement FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ie_tenant_read ON entitlements.institution_entitlement FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12055,7 +11987,7 @@ CREATE POLICY module_read_all ON entitlements.module FOR SELECT USING (true);
 -- Name: usage_event ue_tenant_read; Type: POLICY; Schema: entitlements; Owner: -
 --
 
-CREATE POLICY ue_tenant_read ON entitlements.usage_event FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ue_tenant_read ON entitlements.usage_event FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12063,6 +11995,12 @@ CREATE POLICY ue_tenant_read ON entitlements.usage_event FOR SELECT USING ((inst
 --
 
 ALTER TABLE entitlements.usage_event ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: usage_event_default; Type: ROW SECURITY; Schema: entitlements; Owner: -
+--
+
+ALTER TABLE entitlements.usage_event_default ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: action; Type: ROW SECURITY; Schema: governance; Owner: -
@@ -12123,82 +12061,10 @@ CREATE POLICY governance_platform_select ON governance.action FOR SELECT TO auth
 CREATE POLICY governance_platform_update ON governance.action FOR UPDATE TO authenticated USING (((scope = 'platform'::text) AND portal_admin.has_permission('dual_control:approve'::text)));
 
 --
--- Name: email_verification_token; Type: ROW SECURITY; Schema: identity; Owner: -
---
-
-ALTER TABLE identity.email_verification_token ENABLE ROW LEVEL SECURITY;
-
---
--- Name: ip_allowlist identity_ip_own; Type: POLICY; Schema: identity; Owner: -
---
-
-CREATE POLICY identity_ip_own ON identity.ip_allowlist FOR SELECT TO authenticated USING ((user_id = auth.uid()));
-
---
--- Name: login_event identity_login_own; Type: POLICY; Schema: identity; Owner: -
---
-
-CREATE POLICY identity_login_own ON identity.login_event FOR SELECT TO authenticated USING ((user_id = auth.uid()));
-
---
--- Name: mfa_backup_code identity_mfa_own; Type: POLICY; Schema: identity; Owner: -
---
-
-CREATE POLICY identity_mfa_own ON identity.mfa_backup_code FOR SELECT TO authenticated USING ((user_id = auth.uid()));
-
---
--- Name: profile identity_profile_own; Type: POLICY; Schema: identity; Owner: -
---
-
-CREATE POLICY identity_profile_own ON identity.profile FOR SELECT TO authenticated USING ((id = auth.uid()));
-
---
--- Name: password_reset_token identity_reset_own; Type: POLICY; Schema: identity; Owner: -
---
-
-CREATE POLICY identity_reset_own ON identity.password_reset_token FOR SELECT TO authenticated USING ((user_id = auth.uid()));
-
---
--- Name: email_verification_token identity_verify_own; Type: POLICY; Schema: identity; Owner: -
---
-
-CREATE POLICY identity_verify_own ON identity.email_verification_token FOR SELECT TO authenticated USING ((user_id = auth.uid()));
-
---
--- Name: ip_allowlist; Type: ROW SECURITY; Schema: identity; Owner: -
---
-
-ALTER TABLE identity.ip_allowlist ENABLE ROW LEVEL SECURITY;
-
---
--- Name: login_event; Type: ROW SECURITY; Schema: identity; Owner: -
---
-
-ALTER TABLE identity.login_event ENABLE ROW LEVEL SECURITY;
-
---
--- Name: mfa_backup_code; Type: ROW SECURITY; Schema: identity; Owner: -
---
-
-ALTER TABLE identity.mfa_backup_code ENABLE ROW LEVEL SECURITY;
-
---
--- Name: password_reset_token; Type: ROW SECURITY; Schema: identity; Owner: -
---
-
-ALTER TABLE identity.password_reset_token ENABLE ROW LEVEL SECURITY;
-
---
--- Name: profile; Type: ROW SECURITY; Schema: identity; Owner: -
---
-
-ALTER TABLE identity.profile ENABLE ROW LEVEL SECURITY;
-
---
 -- Name: approval_action aa_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY aa_tenant ON institution.approval_action USING ((stage_instance_id IN ( SELECT si.id
+CREATE POLICY aa_tenant ON institution.approval_action TO authenticated USING ((stage_instance_id IN ( SELECT si.id
    FROM (institution.approval_stage_instance si
      JOIN institution.approval_instance i ON ((i.id = si.instance_id)))
   WHERE (i.institution_id = ( SELECT ctx.institution_id
@@ -12214,28 +12080,28 @@ ALTER TABLE institution.access_request ENABLE ROW LEVEL SECURITY;
 -- Name: approval_delegation ad_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY ad_tenant ON institution.approval_delegation USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ad_tenant ON institution.approval_delegation TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: approval_instance ai_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY ai_tenant ON institution.approval_instance USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ai_tenant ON institution.approval_instance TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: approval_outbox ao_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY ao_tenant ON institution.approval_outbox USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ao_tenant ON institution.approval_outbox TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: approval_committee apc_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY apc_tenant ON institution.approval_committee USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY apc_tenant ON institution.approval_committee TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12324,7 +12190,7 @@ ALTER TABLE institution.approval_template ENABLE ROW LEVEL SECURITY;
 -- Name: approval_stage_def asd_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY asd_tenant ON institution.approval_stage_def USING ((template_id IN ( SELECT approval_template.id
+CREATE POLICY asd_tenant ON institution.approval_stage_def TO authenticated USING ((template_id IN ( SELECT approval_template.id
    FROM institution.approval_template
   WHERE (approval_template.institution_id = ( SELECT ctx.institution_id
            FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))))));
@@ -12333,7 +12199,7 @@ CREATE POLICY asd_tenant ON institution.approval_stage_def USING ((template_id I
 -- Name: approval_stage_instance asi_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY asi_tenant ON institution.approval_stage_instance USING ((instance_id IN ( SELECT approval_instance.id
+CREATE POLICY asi_tenant ON institution.approval_stage_instance TO authenticated USING ((instance_id IN ( SELECT approval_instance.id
    FROM institution.approval_instance
   WHERE (approval_instance.institution_id = ( SELECT ctx.institution_id
            FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))))));
@@ -12342,7 +12208,7 @@ CREATE POLICY asi_tenant ON institution.approval_stage_instance USING ((instance
 -- Name: approval_template at_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY at_tenant ON institution.approval_template USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY at_tenant ON institution.approval_template TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12367,19 +12233,19 @@ CREATE POLICY benefit_cat_select_all ON institution.benefit_cat FOR SELECT USING
 -- Name: benefit benefit_delete_own; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY benefit_delete_own ON institution.benefit FOR DELETE USING ((institution_id = (((current_setting('request.jwt.claims'::text, true))::jsonb ->> 'institution_id'::text))::uuid));
+CREATE POLICY benefit_delete_own ON institution.benefit FOR DELETE TO authenticated USING ((institution_id = (((( SELECT current_setting('request.jwt.claims'::text, true) AS current_setting))::jsonb ->> 'institution_id'::text))::uuid));
 
 --
 -- Name: benefit benefit_select_own; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY benefit_select_own ON institution.benefit FOR SELECT USING ((institution_id = (((current_setting('request.jwt.claims'::text, true))::jsonb ->> 'institution_id'::text))::uuid));
+CREATE POLICY benefit_select_own ON institution.benefit FOR SELECT TO authenticated USING ((institution_id = (((( SELECT current_setting('request.jwt.claims'::text, true) AS current_setting))::jsonb ->> 'institution_id'::text))::uuid));
 
 --
 -- Name: committee_member cm_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY cm_tenant ON institution.committee_member USING ((committee_id IN ( SELECT approval_committee.id
+CREATE POLICY cm_tenant ON institution.committee_member TO authenticated USING ((committee_id IN ( SELECT approval_committee.id
    FROM institution.approval_committee
   WHERE (approval_committee.institution_id = ( SELECT ctx.institution_id
            FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))))));
@@ -12400,7 +12266,7 @@ ALTER TABLE institution.compliance_waiver ENABLE ROW LEVEL SECURITY;
 -- Name: doc_generation dg_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY dg_tenant ON institution.doc_generation USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY dg_tenant ON institution.doc_generation TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12413,7 +12279,7 @@ ALTER TABLE institution.doa_rule ENABLE ROW LEVEL SECURITY;
 -- Name: doa_rule doa_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY doa_tenant ON institution.doa_rule USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY doa_tenant ON institution.doa_rule TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12432,7 +12298,7 @@ ALTER TABLE institution.doc_generation ENABLE ROW LEVEL SECURITY;
 -- Name: doc doc_insert_own; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY doc_insert_own ON institution.doc FOR INSERT WITH CHECK ((institution_id = (((current_setting('request.jwt.claims'::text, true))::jsonb ->> 'institution_id'::text))::uuid));
+CREATE POLICY doc_insert_own ON institution.doc FOR INSERT TO authenticated WITH CHECK ((institution_id = (((( SELECT current_setting('request.jwt.claims'::text, true) AS current_setting))::jsonb ->> 'institution_id'::text))::uuid));
 
 --
 -- Name: doc_requirement; Type: ROW SECURITY; Schema: institution; Owner: -
@@ -12444,14 +12310,14 @@ ALTER TABLE institution.doc_requirement ENABLE ROW LEVEL SECURITY;
 -- Name: doc_requirement doc_requirement_tenant_read; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY doc_requirement_tenant_read ON institution.doc_requirement FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY doc_requirement_tenant_read ON institution.doc_requirement FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: doc doc_select_own; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY doc_select_own ON institution.doc FOR SELECT USING ((institution_id = (((current_setting('request.jwt.claims'::text, true))::jsonb ->> 'institution_id'::text))::uuid));
+CREATE POLICY doc_select_own ON institution.doc FOR SELECT TO authenticated USING ((institution_id = (((( SELECT current_setting('request.jwt.claims'::text, true) AS current_setting))::jsonb ->> 'institution_id'::text))::uuid));
 
 --
 -- Name: doc_template; Type: ROW SECURITY; Schema: institution; Owner: -
@@ -12481,28 +12347,28 @@ CREATE POLICY doc_type_select_all ON institution.doc_type FOR SELECT USING (true
 -- Name: doc_template dt_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY dt_tenant ON institution.doc_template USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY dt_tenant ON institution.doc_template TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: doc_template_version dtv_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY dtv_tenant ON institution.doc_template_version USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY dtv_tenant ON institution.doc_template_version TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: esign_envelope ee_env_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY ee_env_tenant ON institution.esign_envelope USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY ee_env_tenant ON institution.esign_envelope TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
 -- Name: esign_event ee_evt_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY ee_evt_tenant ON institution.esign_event USING ((envelope_id IN ( SELECT esign_envelope.id
+CREATE POLICY ee_evt_tenant ON institution.esign_event TO authenticated USING ((envelope_id IN ( SELECT esign_envelope.id
    FROM institution.esign_envelope
   WHERE (esign_envelope.institution_id = ( SELECT ctx.institution_id
            FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))))));
@@ -12511,7 +12377,7 @@ CREATE POLICY ee_evt_tenant ON institution.esign_event USING ((envelope_id IN ( 
 -- Name: esign_signer ee_sig_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY ee_sig_tenant ON institution.esign_signer USING ((envelope_id IN ( SELECT esign_envelope.id
+CREATE POLICY ee_sig_tenant ON institution.esign_signer TO authenticated USING ((envelope_id IN ( SELECT esign_envelope.id
    FROM institution.esign_envelope
   WHERE (esign_envelope.institution_id = ( SELECT ctx.institution_id
            FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))))));
@@ -12539,13 +12405,6 @@ ALTER TABLE institution.esign_signer ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE institution."group" ENABLE ROW LEVEL SECURITY;
-
---
--- Name: group group_select; Type: POLICY; Schema: institution; Owner: -
---
-
-CREATE POLICY group_select ON institution."group" FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
-   FROM institution.current_member_ctx() ctx(member_id, institution_id, is_admin, member_role, modules))));
 
 --
 -- Name: group inst_groups_delete; Type: POLICY; Schema: institution; Owner: -
@@ -12586,7 +12445,7 @@ ALTER TABLE institution.institution ENABLE ROW LEVEL SECURITY;
 -- Name: member institution_members_select_self; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY institution_members_select_self ON institution.member FOR SELECT TO authenticated USING ((auth_user_id = auth.uid()));
+CREATE POLICY institution_members_select_self ON institution.member FOR SELECT TO authenticated USING ((auth_user_id = ( SELECT auth.uid() AS uid)));
 
 --
 -- Name: institution_sla_config; Type: ROW SECURITY; Schema: institution; Owner: -
@@ -12598,9 +12457,9 @@ ALTER TABLE institution.institution_sla_config ENABLE ROW LEVEL SECURITY;
 -- Name: institution institutions_select_own; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY institutions_select_own ON institution.institution FOR SELECT TO authenticated USING ((((primary_contact_email)::text = (auth.jwt() ->> 'email'::text)) OR (EXISTS ( SELECT 1
+CREATE POLICY institutions_select_own ON institution.institution FOR SELECT TO authenticated USING ((((primary_contact_email)::text = (( SELECT auth.jwt() AS jwt) ->> 'email'::text)) OR (EXISTS ( SELECT 1
    FROM institution.member m
-  WHERE ((m.institution_id = institution.id) AND (m.auth_user_id = auth.uid()))))));
+  WHERE ((m.institution_id = institution.id) AND (m.auth_user_id = ( SELECT auth.uid() AS uid)))))));
 
 --
 -- Name: kyb_document; Type: ROW SECURITY; Schema: institution; Owner: -
@@ -12666,7 +12525,7 @@ ALTER TABLE institution.pipeline_stage_def ENABLE ROW LEVEL SECURITY;
 -- Name: pipeline_stage_def pipeline_stage_def_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY pipeline_stage_def_tenant ON institution.pipeline_stage_def USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY pipeline_stage_def_tenant ON institution.pipeline_stage_def TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)))) WITH CHECK ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
@@ -12680,7 +12539,7 @@ ALTER TABLE institution.pipeline_template ENABLE ROW LEVEL SECURITY;
 -- Name: pipeline_template pipeline_template_tenant; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY pipeline_template_tenant ON institution.pipeline_template USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY pipeline_template_tenant ON institution.pipeline_template TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)))) WITH CHECK ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
@@ -12694,31 +12553,31 @@ ALTER TABLE institution.product_config ENABLE ROW LEVEL SECURITY;
 -- Name: institution_sla_config tenant_isolation; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY tenant_isolation ON institution.institution_sla_config USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
+CREATE POLICY tenant_isolation ON institution.institution_sla_config TO authenticated USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
 
 --
 -- Name: member tenant_isolation; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY tenant_isolation ON institution.member USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
+CREATE POLICY tenant_isolation ON institution.member TO authenticated USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
 
 --
 -- Name: pending_actions tenant_isolation; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY tenant_isolation ON institution.pending_actions USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
+CREATE POLICY tenant_isolation ON institution.pending_actions TO authenticated USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
 
 --
 -- Name: product_config tenant_isolation; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY tenant_isolation ON institution.product_config USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
+CREATE POLICY tenant_isolation ON institution.product_config TO authenticated USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
 
 --
 -- Name: webhook tenant_isolation; Type: POLICY; Schema: institution; Owner: -
 --
 
-CREATE POLICY tenant_isolation ON institution.webhook USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
+CREATE POLICY tenant_isolation ON institution.webhook TO authenticated USING ((institution_id = institution.current_institution_id())) WITH CHECK ((institution_id = institution.current_institution_id()));
 
 --
 -- Name: webhook; Type: ROW SECURITY; Schema: institution; Owner: -
@@ -12744,6 +12603,12 @@ CREATE POLICY webhook_delivery_select ON institution.webhook_delivery FOR SELECT
 --
 
 ALTER TABLE integration.acceptance_log ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: admin_command_log; Type: ROW SECURITY; Schema: integration; Owner: -
+--
+
+ALTER TABLE integration.admin_command_log ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: aggregate_sequence; Type: ROW SECURITY; Schema: integration; Owner: -
@@ -12827,9 +12692,9 @@ ALTER TABLE marketplace.bid_acceptance ENABLE ROW LEVEL SECURITY;
 -- Name: bid_acceptance bid_acceptance_institution_read; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY bid_acceptance_institution_read ON marketplace.bid_acceptance FOR SELECT USING ((institution_id IN ( SELECT member.institution_id
+CREATE POLICY bid_acceptance_institution_read ON marketplace.bid_acceptance FOR SELECT TO authenticated USING ((institution_id IN ( SELECT member.institution_id
    FROM institution.member
-  WHERE (member.auth_user_id = auth.uid()))));
+  WHERE (member.auth_user_id = ( SELECT auth.uid() AS uid)))));
 
 --
 -- Name: bid_allocation; Type: ROW SECURITY; Schema: marketplace; Owner: -
@@ -12853,9 +12718,9 @@ CREATE POLICY bid_benefit_insert_trigger ON marketplace.bid_benefit FOR INSERT T
 -- Name: bid_benefit bid_benefit_select_own; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY bid_benefit_select_own ON marketplace.bid_benefit FOR SELECT USING ((EXISTS ( SELECT 1
+CREATE POLICY bid_benefit_select_own ON marketplace.bid_benefit FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
    FROM marketplace.bid b
-  WHERE ((b.id = bid_benefit.bid_id) AND (b.institution_id = (((current_setting('request.jwt.claims'::text, true))::jsonb ->> 'institution_id'::text))::uuid)))));
+  WHERE ((b.id = bid_benefit.bid_id) AND (b.institution_id = (((( SELECT current_setting('request.jwt.claims'::text, true) AS current_setting))::jsonb ->> 'institution_id'::text))::uuid)))));
 
 --
 -- Name: bid_event; Type: ROW SECURITY; Schema: marketplace; Owner: -
@@ -12892,7 +12757,7 @@ ALTER TABLE marketplace.deal_document_event ENABLE ROW LEVEL SECURITY;
 -- Name: deal_document_event deal_document_event_tenant_read; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY deal_document_event_tenant_read ON marketplace.deal_document_event FOR SELECT USING ((EXISTS ( SELECT 1
+CREATE POLICY deal_document_event_tenant_read ON marketplace.deal_document_event FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
    FROM marketplace.deal_document d
   WHERE ((d.id = deal_document_event.document_id) AND (d.institution_id = ( SELECT ctx.institution_id
            FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)))))));
@@ -12901,7 +12766,7 @@ CREATE POLICY deal_document_event_tenant_read ON marketplace.deal_document_event
 -- Name: deal_document deal_document_tenant_read; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY deal_document_tenant_read ON marketplace.deal_document FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY deal_document_tenant_read ON marketplace.deal_document FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12914,7 +12779,7 @@ ALTER TABLE marketplace.loan_booking ENABLE ROW LEVEL SECURITY;
 -- Name: loan_booking loan_booking_tenant_read; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY loan_booking_tenant_read ON marketplace.loan_booking FOR SELECT USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY loan_booking_tenant_read ON marketplace.loan_booking FOR SELECT TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
 --
@@ -12927,7 +12792,7 @@ ALTER TABLE marketplace.loan_pipeline ENABLE ROW LEVEL SECURITY;
 -- Name: loan_pipeline loan_pipeline_tenant; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY loan_pipeline_tenant ON marketplace.loan_pipeline USING ((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY loan_pipeline_tenant ON marketplace.loan_pipeline TO authenticated USING ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)))) WITH CHECK ((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))));
 
@@ -12944,7 +12809,7 @@ CREATE POLICY marketplace_acceptance_select ON marketplace.acceptance FOR SELECT
 -- Name: bid_allocation marketplace_bid_allocation_select; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY marketplace_bid_allocation_select ON marketplace.bid_allocation FOR SELECT USING ((EXISTS ( SELECT 1
+CREATE POLICY marketplace_bid_allocation_select ON marketplace.bid_allocation FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
    FROM marketplace.bid b
   WHERE (b.id = bid_allocation.bid_id))));
 
@@ -12961,7 +12826,7 @@ CREATE POLICY marketplace_bid_event_select ON marketplace.bid_event FOR SELECT T
 -- Name: bid marketplace_bid_select; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY marketplace_bid_select ON marketplace.bid FOR SELECT USING (((institution_id = ( SELECT ctx.institution_id
+CREATE POLICY marketplace_bid_select ON marketplace.bid FOR SELECT TO authenticated USING (((institution_id = ( SELECT ctx.institution_id
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products))) AND (( SELECT ((ctx.products IS NULL) OR (array_length(ctx.products, 1) IS NULL))
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)) OR (EXISTS ( SELECT 1
    FROM marketplace.request r,
@@ -12972,7 +12837,7 @@ CREATE POLICY marketplace_bid_select ON marketplace.bid FOR SELECT USING (((inst
 -- Name: request_allocation marketplace_request_allocation_select; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY marketplace_request_allocation_select ON marketplace.request_allocation FOR SELECT USING ((EXISTS ( SELECT 1
+CREATE POLICY marketplace_request_allocation_select ON marketplace.request_allocation FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
    FROM marketplace.request r
   WHERE (r.id = request_allocation.request_id))));
 
@@ -12980,7 +12845,7 @@ CREATE POLICY marketplace_request_allocation_select ON marketplace.request_alloc
 -- Name: request marketplace_request_select; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY marketplace_request_select ON marketplace.request FOR SELECT USING (((status = ANY (ARRAY['open'::text, 'bidding'::text])) AND (EXISTS ( SELECT 1
+CREATE POLICY marketplace_request_select ON marketplace.request FOR SELECT TO authenticated USING (((status = ANY (ARRAY['open'::text, 'bidding'::text])) AND (EXISTS ( SELECT 1
    FROM institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)
   WHERE ((ctx.institution_id IS NOT NULL) AND ((ctx.products IS NULL) OR (array_length(ctx.products, 1) IS NULL) OR (request.product_id = ANY (ctx.products))))))));
 
@@ -12988,7 +12853,7 @@ CREATE POLICY marketplace_request_select ON marketplace.request FOR SELECT USING
 -- Name: request marketplace_request_select_own_bids; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY marketplace_request_select_own_bids ON marketplace.request FOR SELECT USING ((EXISTS ( SELECT 1
+CREATE POLICY marketplace_request_select_own_bids ON marketplace.request FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
    FROM (institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)
      JOIN LATERAL institution.get_institution_bid_request_ids(ctx.institution_id) br(request_id) ON ((br.request_id = request.id))))));
 
@@ -13002,7 +12867,7 @@ ALTER TABLE marketplace.pipeline_stage_instance ENABLE ROW LEVEL SECURITY;
 -- Name: pipeline_stage_instance pipeline_stage_instance_tenant; Type: POLICY; Schema: marketplace; Owner: -
 --
 
-CREATE POLICY pipeline_stage_instance_tenant ON marketplace.pipeline_stage_instance USING ((EXISTS ( SELECT 1
+CREATE POLICY pipeline_stage_instance_tenant ON marketplace.pipeline_stage_instance TO authenticated USING ((EXISTS ( SELECT 1
    FROM marketplace.loan_pipeline lp,
     institution.current_member_ctx_v2() ctx(member_id, institution_id, is_admin, member_role, modules, products)
   WHERE ((lp.id = pipeline_stage_instance.pipeline_id) AND (lp.institution_id = ctx.institution_id))))) WITH CHECK ((EXISTS ( SELECT 1
@@ -13081,7 +12946,7 @@ CREATE POLICY admin_roles_select ON portal_admin.admin_roles FOR SELECT TO authe
 -- Name: admin_roles admin_roles_write; Type: POLICY; Schema: portal_admin; Owner: -
 --
 
-CREATE POLICY admin_roles_write ON portal_admin.admin_roles TO authenticated USING ((auth.role() = 'service_role'::text));
+CREATE POLICY admin_roles_write ON portal_admin.admin_roles TO authenticated USING ((( SELECT auth.role() AS role) = 'service_role'::text));
 
 --
 -- Name: admin_sessions; Type: ROW SECURITY; Schema: portal_admin; Owner: -
@@ -13099,7 +12964,7 @@ CREATE POLICY admin_sessions_select ON portal_admin.admin_sessions FOR SELECT TO
 -- Name: admin_sessions admin_sessions_write; Type: POLICY; Schema: portal_admin; Owner: -
 --
 
-CREATE POLICY admin_sessions_write ON portal_admin.admin_sessions TO authenticated USING ((portal_admin.is_admin() OR (auth.role() = 'service_role'::text)));
+CREATE POLICY admin_sessions_write ON portal_admin.admin_sessions TO authenticated USING ((portal_admin.is_admin() OR (( SELECT auth.role() AS role) = 'service_role'::text)));
 
 --
 -- Name: admin_users; Type: ROW SECURITY; Schema: portal_admin; Owner: -
@@ -13111,13 +12976,13 @@ ALTER TABLE portal_admin.admin_users ENABLE ROW LEVEL SECURITY;
 -- Name: admin_users admin_users_self_select; Type: POLICY; Schema: portal_admin; Owner: -
 --
 
-CREATE POLICY admin_users_self_select ON portal_admin.admin_users FOR SELECT TO authenticated USING ((auth_user_id = auth.uid()));
+CREATE POLICY admin_users_self_select ON portal_admin.admin_users FOR SELECT TO authenticated USING ((auth_user_id = ( SELECT auth.uid() AS uid)));
 
 --
 -- Name: admin_users admin_users_update; Type: POLICY; Schema: portal_admin; Owner: -
 --
 
-CREATE POLICY admin_users_update ON portal_admin.admin_users FOR UPDATE TO authenticated USING ((auth.role() = 'service_role'::text));
+CREATE POLICY admin_users_update ON portal_admin.admin_users FOR UPDATE TO authenticated USING ((( SELECT auth.role() AS role) = 'service_role'::text));
 
 --
 -- Name: admin_audit_log audit_select; Type: POLICY; Schema: portal_admin; Owner: -
@@ -13141,7 +13006,7 @@ CREATE POLICY dc_select ON portal_admin.admin_dual_control_actions FOR SELECT TO
 -- Name: admin_dual_control_actions dc_write; Type: POLICY; Schema: portal_admin; Owner: -
 --
 
-CREATE POLICY dc_write ON portal_admin.admin_dual_control_actions TO authenticated USING ((auth.role() = 'service_role'::text));
+CREATE POLICY dc_write ON portal_admin.admin_dual_control_actions TO authenticated USING ((( SELECT auth.role() AS role) = 'service_role'::text));
 
 --
 -- Name: user_groups groups_select; Type: POLICY; Schema: portal_admin; Owner: -
@@ -13153,7 +13018,7 @@ CREATE POLICY groups_select ON portal_admin.user_groups FOR SELECT TO authentica
 -- Name: user_groups groups_write; Type: POLICY; Schema: portal_admin; Owner: -
 --
 
-CREATE POLICY groups_write ON portal_admin.user_groups TO authenticated USING ((auth.role() = 'service_role'::text));
+CREATE POLICY groups_write ON portal_admin.user_groups TO authenticated USING ((( SELECT auth.role() AS role) = 'service_role'::text));
 
 --
 -- Name: user_groups; Type: ROW SECURITY; Schema: portal_admin; Owner: -
@@ -13173,17 +13038,17 @@ ALTER TABLE public._identity_migration_log ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY institution_members_mark_read ON public.portal_notifications FOR UPDATE TO authenticated USING ((institution_id IN ( SELECT m.institution_id
    FROM institution.member m
-  WHERE (m.auth_user_id = auth.uid())))) WITH CHECK ((institution_id IN ( SELECT m.institution_id
+  WHERE (m.auth_user_id = ( SELECT auth.uid() AS uid))))) WITH CHECK ((institution_id IN ( SELECT m.institution_id
    FROM institution.member m
-  WHERE (m.auth_user_id = auth.uid()))));
+  WHERE (m.auth_user_id = ( SELECT auth.uid() AS uid)))));
 
 --
 -- Name: portal_notifications institution_members_read_own_notifications; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY institution_members_read_own_notifications ON public.portal_notifications FOR SELECT USING ((institution_id IN ( SELECT member.institution_id
+CREATE POLICY institution_members_read_own_notifications ON public.portal_notifications FOR SELECT TO authenticated USING ((institution_id IN ( SELECT member.institution_id
    FROM institution.member
-  WHERE (member.auth_user_id = auth.uid()))));
+  WHERE (member.auth_user_id = ( SELECT auth.uid() AS uid)))));
 
 --
 -- Name: portal_notifications; Type: ROW SECURITY; Schema: public; Owner: -
@@ -13198,12 +13063,6 @@ ALTER TABLE public.portal_notifications ENABLE ROW LEVEL SECURITY;
 CREATE POLICY service_role_insert_notifications ON public.portal_notifications FOR INSERT TO service_role WITH CHECK (true);
 
 --
--- Name: SCHEMA admin; Type: ACL; Schema: -; Owner: -
---
-
-GRANT USAGE ON SCHEMA admin TO authenticated;
-
---
 -- Name: SCHEMA audit; Type: ACL; Schema: -; Owner: -
 --
 
@@ -13213,7 +13072,6 @@ GRANT USAGE ON SCHEMA audit TO authenticated;
 -- Name: SCHEMA auth_portal; Type: ACL; Schema: -; Owner: -
 --
 
-GRANT USAGE ON SCHEMA auth_portal TO authenticated;
 GRANT USAGE ON SCHEMA auth_portal TO service_role;
 
 --
@@ -13239,12 +13097,6 @@ GRANT USAGE ON SCHEMA entitlements TO authenticated;
 --
 
 GRANT USAGE ON SCHEMA governance TO authenticated;
-
---
--- Name: SCHEMA identity; Type: ACL; Schema: -; Owner: -
---
-
-GRANT USAGE ON SCHEMA identity TO authenticated;
 
 --
 -- Name: SCHEMA institution; Type: ACL; Schema: -; Owner: -
@@ -13275,35 +13127,6 @@ GRANT USAGE ON SCHEMA public TO authenticated;
 GRANT USAGE ON SCHEMA public TO service_role;
 
 --
--- Name: FUNCTION current_user_id(); Type: ACL; Schema: admin; Owner: -
---
-
-REVOKE ALL ON FUNCTION admin.current_user_id() FROM PUBLIC;
-GRANT ALL ON FUNCTION admin.current_user_id() TO authenticated;
-
---
--- Name: FUNCTION get_user_display_name(p_auth_user_id uuid); Type: ACL; Schema: admin; Owner: -
---
-
-REVOKE ALL ON FUNCTION admin.get_user_display_name(p_auth_user_id uuid) FROM PUBLIC;
-GRANT ALL ON FUNCTION admin.get_user_display_name(p_auth_user_id uuid) TO authenticated;
-GRANT ALL ON FUNCTION admin.get_user_display_name(p_auth_user_id uuid) TO service_role;
-
---
--- Name: FUNCTION has_permission(p_key text); Type: ACL; Schema: admin; Owner: -
---
-
-REVOKE ALL ON FUNCTION admin.has_permission(p_key text) FROM PUBLIC;
-GRANT ALL ON FUNCTION admin.has_permission(p_key text) TO authenticated;
-
---
--- Name: FUNCTION is_admin(); Type: ACL; Schema: admin; Owner: -
---
-
-REVOKE ALL ON FUNCTION admin.is_admin() FROM PUBLIC;
-GRANT ALL ON FUNCTION admin.is_admin() TO authenticated;
-
---
 -- Name: FUNCTION log(p_action text, p_actor_id uuid, p_actor_type text, p_institution_id uuid, p_resource_type text, p_resource_id uuid, p_outcome text, p_metadata jsonb); Type: ACL; Schema: audit; Owner: -
 --
 
@@ -13329,7 +13152,6 @@ GRANT ALL ON FUNCTION auth_portal.set_updated_at() TO service_role;
 --
 
 REVOKE ALL ON FUNCTION autobid.ensure_execution_partition(p_month date) FROM PUBLIC;
-GRANT ALL ON FUNCTION autobid.ensure_execution_partition(p_month date) TO authenticated;
 GRANT ALL ON FUNCTION autobid.ensure_execution_partition(p_month date) TO service_role;
 
 --
@@ -13337,14 +13159,25 @@ GRANT ALL ON FUNCTION autobid.ensure_execution_partition(p_month date) TO servic
 --
 
 REVOKE ALL ON FUNCTION autobid.ensure_execution_partitions() FROM PUBLIC;
-GRANT ALL ON FUNCTION autobid.ensure_execution_partitions() TO authenticated;
 GRANT ALL ON FUNCTION autobid.ensure_execution_partitions() TO service_role;
 
 --
--- Name: FUNCTION commission_for(p_institution_id uuid, p_product_code text, p_on date); Type: ACL; Schema: billing; Owner: -
+-- Name: FUNCTION adjustment_is_append_only(); Type: ACL; Schema: billing; Owner: -
 --
 
-REVOKE ALL ON FUNCTION billing.commission_for(p_institution_id uuid, p_product_code text, p_on date) FROM PUBLIC;
+REVOKE ALL ON FUNCTION billing.adjustment_is_append_only() FROM PUBLIC;
+
+--
+-- Name: FUNCTION compute_fee(p_basis text, p_rate numeric, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_in jsonb); Type: ACL; Schema: billing; Owner: -
+--
+
+REVOKE ALL ON FUNCTION billing.compute_fee(p_basis text, p_rate numeric, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_in jsonb) FROM PUBLIC;
+
+--
+-- Name: FUNCTION rule_shape_error(p_basis text, p_rate numeric, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_clawback_months integer, p_clawback_mode text); Type: ACL; Schema: billing; Owner: -
+--
+
+REVOKE ALL ON FUNCTION billing.rule_shape_error(p_basis text, p_rate numeric, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_clawback_months integer, p_clawback_mode text) FROM PUBLIC;
 
 --
 -- Name: FUNCTION end_commission_rule(p_rule_id uuid, p_ended_on date, p_command_id uuid, p_maker uuid, p_checker uuid); Type: ACL; Schema: billing; Owner: -
@@ -13353,17 +13186,28 @@ REVOKE ALL ON FUNCTION billing.commission_for(p_institution_id uuid, p_product_c
 REVOKE ALL ON FUNCTION billing.end_commission_rule(p_rule_id uuid, p_ended_on date, p_command_id uuid, p_maker uuid, p_checker uuid) FROM PUBLIC;
 
 --
--- Name: FUNCTION set_commission_rule(p_institution_id uuid, p_product_code text, p_rate numeric, p_effective_from date, p_reason text, p_command_id uuid, p_maker uuid, p_checker uuid); Type: ACL; Schema: billing; Owner: -
+-- Name: FUNCTION json_num(p jsonb); Type: ACL; Schema: billing; Owner: -
 --
 
-REVOKE ALL ON FUNCTION billing.set_commission_rule(p_institution_id uuid, p_product_code text, p_rate numeric, p_effective_from date, p_reason text, p_command_id uuid, p_maker uuid, p_checker uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION billing.json_num(p jsonb) FROM PUBLIC;
+
+--
+-- Name: FUNCTION rule_for(p_institution_id uuid, p_product_code text, p_on date); Type: ACL; Schema: billing; Owner: -
+--
+
+REVOKE ALL ON FUNCTION billing.rule_for(p_institution_id uuid, p_product_code text, p_on date) FROM PUBLIC;
+
+--
+-- Name: FUNCTION set_commission_rule(p_institution_id uuid, p_product_code text, p_rate numeric, p_effective_from date, p_reason text, p_command_id uuid, p_maker uuid, p_checker uuid, p_basis text, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_clawback_months integer, p_clawback_mode text); Type: ACL; Schema: billing; Owner: -
+--
+
+REVOKE ALL ON FUNCTION billing.set_commission_rule(p_institution_id uuid, p_product_code text, p_rate numeric, p_effective_from date, p_reason text, p_command_id uuid, p_maker uuid, p_checker uuid, p_basis text, p_params jsonb, p_min_fee numeric, p_max_fee numeric, p_clawback_months integer, p_clawback_mode text) FROM PUBLIC;
 
 --
 -- Name: FUNCTION ensure_usage_partition(p_month date); Type: ACL; Schema: entitlements; Owner: -
 --
 
 REVOKE ALL ON FUNCTION entitlements.ensure_usage_partition(p_month date) FROM PUBLIC;
-GRANT ALL ON FUNCTION entitlements.ensure_usage_partition(p_month date) TO authenticated;
 GRANT ALL ON FUNCTION entitlements.ensure_usage_partition(p_month date) TO service_role;
 
 --
@@ -13371,7 +13215,6 @@ GRANT ALL ON FUNCTION entitlements.ensure_usage_partition(p_month date) TO servi
 --
 
 REVOKE ALL ON FUNCTION entitlements.ensure_usage_partitions() FROM PUBLIC;
-GRANT ALL ON FUNCTION entitlements.ensure_usage_partitions() TO authenticated;
 GRANT ALL ON FUNCTION entitlements.ensure_usage_partitions() TO service_role;
 
 --
@@ -13456,14 +13299,6 @@ GRANT ALL ON FUNCTION governance.guard_member_action() TO service_role;
 
 REVOKE ALL ON FUNCTION governance.submit(p_category text, p_resource_type text, p_resource_id uuid, p_payload jsonb, p_label text, p_risk text) FROM PUBLIC;
 GRANT ALL ON FUNCTION governance.submit(p_category text, p_resource_type text, p_resource_id uuid, p_payload jsonb, p_label text, p_risk text) TO authenticated;
-
---
--- Name: FUNCTION handle_new_user(); Type: ACL; Schema: identity; Owner: -
---
-
-REVOKE ALL ON FUNCTION identity.handle_new_user() FROM PUBLIC;
-GRANT ALL ON FUNCTION identity.handle_new_user() TO authenticated;
-GRANT ALL ON FUNCTION identity.handle_new_user() TO service_role;
 
 --
 -- Name: TABLE pending_actions; Type: ACL; Schema: institution; Owner: -
@@ -13920,6 +13755,12 @@ GRANT ALL ON FUNCTION marketplace.advance_pipeline_stage(p_pipeline_id uuid, p_s
 GRANT ALL ON FUNCTION marketplace.advance_pipeline_stage(p_pipeline_id uuid, p_stage_inst_id uuid, p_actor_id uuid, p_notes text, p_is_approval boolean) TO authenticated;
 
 --
+-- Name: FUNCTION booking_fee_inputs(p_pipeline_id uuid, p_institution_id uuid); Type: ACL; Schema: marketplace; Owner: -
+--
+
+REVOKE ALL ON FUNCTION marketplace.booking_fee_inputs(p_pipeline_id uuid, p_institution_id uuid) FROM PUBLIC;
+
+--
 -- Name: FUNCTION chat_thread_state(p_request_id uuid, p_institution_id uuid); Type: ACL; Schema: marketplace; Owner: -
 --
 
@@ -14024,16 +13865,22 @@ REVOKE ALL ON FUNCTION marketplace.on_facility_approval_record_decision() FROM P
 REVOKE ALL ON FUNCTION marketplace.on_facility_approval_resolved() FROM PUBLIC;
 
 --
+-- Name: FUNCTION record_booking_closure(p_pipeline_id uuid, p_institution_id uuid, p_closed_on date, p_reason text, p_source text, p_actor_id uuid, p_api_key_id uuid); Type: ACL; Schema: marketplace; Owner: -
+--
+
+REVOKE ALL ON FUNCTION marketplace.record_booking_closure(p_pipeline_id uuid, p_institution_id uuid, p_closed_on date, p_reason text, p_source text, p_actor_id uuid, p_api_key_id uuid) FROM PUBLIC;
+
+--
 -- Name: FUNCTION record_credit_decision(p_pipeline_id uuid, p_institution_id uuid, p_outcome text, p_conditions jsonb, p_reason text, p_reference text, p_decided_at timestamp with time zone, p_source text, p_actor uuid, p_api_key uuid); Type: ACL; Schema: marketplace; Owner: -
 --
 
 REVOKE ALL ON FUNCTION marketplace.record_credit_decision(p_pipeline_id uuid, p_institution_id uuid, p_outcome text, p_conditions jsonb, p_reason text, p_reference text, p_decided_at timestamp with time zone, p_source text, p_actor uuid, p_api_key uuid) FROM PUBLIC;
 
 --
--- Name: FUNCTION record_loan_booking(p_pipeline_id uuid, p_institution_id uuid, p_core_reference text, p_booked_on date, p_disbursed_amount numeric, p_disbursed_on date, p_notes text, p_source text, p_actor_id uuid, p_api_key_id uuid, p_correction boolean); Type: ACL; Schema: marketplace; Owner: -
+-- Name: FUNCTION record_loan_booking(p_pipeline_id uuid, p_institution_id uuid, p_core_reference text, p_booked_on date, p_disbursed_amount numeric, p_disbursed_on date, p_notes text, p_source text, p_actor_id uuid, p_api_key_id uuid, p_correction boolean, p_monthly_amount numeric, p_term_months integer); Type: ACL; Schema: marketplace; Owner: -
 --
 
-REVOKE ALL ON FUNCTION marketplace.record_loan_booking(p_pipeline_id uuid, p_institution_id uuid, p_core_reference text, p_booked_on date, p_disbursed_amount numeric, p_disbursed_on date, p_notes text, p_source text, p_actor_id uuid, p_api_key_id uuid, p_correction boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION marketplace.record_loan_booking(p_pipeline_id uuid, p_institution_id uuid, p_core_reference text, p_booked_on date, p_disbursed_amount numeric, p_disbursed_on date, p_notes text, p_source text, p_actor_id uuid, p_api_key_id uuid, p_correction boolean, p_monthly_amount numeric, p_term_months integer) FROM PUBLIC;
 
 --
 -- Name: FUNCTION relist_request(p_request_id uuid, p_consumer_id uuid, p_extend_hours integer); Type: ACL; Schema: marketplace; Owner: -
@@ -14257,36 +14104,6 @@ GRANT ALL ON FUNCTION public.set_updated_at() TO authenticated;
 GRANT ALL ON FUNCTION public.set_updated_at() TO service_role;
 
 --
--- Name: TABLE notification_log; Type: ACL; Schema: admin; Owner: -
---
-
-GRANT SELECT,INSERT ON TABLE admin.notification_log TO service_role;
-
---
--- Name: TABLE role; Type: ACL; Schema: admin; Owner: -
---
-
-GRANT SELECT ON TABLE admin.role TO authenticated;
-
---
--- Name: TABLE session; Type: ACL; Schema: admin; Owner: -
---
-
-GRANT SELECT ON TABLE admin.session TO authenticated;
-
---
--- Name: TABLE system_group; Type: ACL; Schema: admin; Owner: -
---
-
-GRANT SELECT ON TABLE admin.system_group TO authenticated;
-
---
--- Name: TABLE "user"; Type: ACL; Schema: admin; Owner: -
---
-
-GRANT SELECT ON TABLE admin."user" TO authenticated;
-
---
 -- Name: TABLE event; Type: ACL; Schema: audit; Owner: -
 --
 
@@ -14491,42 +14308,6 @@ GRANT SELECT ON TABLE governance.four_eyes_catalog TO authenticated;
 GRANT SELECT ON TABLE governance.four_eyes_policy TO authenticated;
 
 --
--- Name: TABLE email_verification_token; Type: ACL; Schema: identity; Owner: -
---
-
-GRANT SELECT ON TABLE identity.email_verification_token TO authenticated;
-
---
--- Name: TABLE ip_allowlist; Type: ACL; Schema: identity; Owner: -
---
-
-GRANT SELECT ON TABLE identity.ip_allowlist TO authenticated;
-
---
--- Name: TABLE login_event; Type: ACL; Schema: identity; Owner: -
---
-
-GRANT SELECT ON TABLE identity.login_event TO authenticated;
-
---
--- Name: TABLE mfa_backup_code; Type: ACL; Schema: identity; Owner: -
---
-
-GRANT SELECT ON TABLE identity.mfa_backup_code TO authenticated;
-
---
--- Name: TABLE password_reset_token; Type: ACL; Schema: identity; Owner: -
---
-
-GRANT SELECT ON TABLE identity.password_reset_token TO authenticated;
-
---
--- Name: TABLE profile; Type: ACL; Schema: identity; Owner: -
---
-
-GRANT SELECT ON TABLE identity.profile TO authenticated;
-
---
 -- Name: TABLE api_key; Type: ACL; Schema: institution; Owner: -
 --
 
@@ -14621,7 +14402,7 @@ GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE institution.institution TO service_ro
 -- Name: TABLE compliance; Type: ACL; Schema: institution; Owner: -
 --
 
-GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE institution.compliance TO authenticated;
+GRANT SELECT ON TABLE institution.compliance TO authenticated;
 
 --
 -- Name: TABLE doa_rule; Type: ACL; Schema: institution; Owner: -
@@ -14899,12 +14680,6 @@ GRANT ALL ON SEQUENCE public._identity_migration_log_id_seq TO service_role;
 
 GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.portal_notifications TO authenticated;
 GRANT ALL ON TABLE public.portal_notifications TO service_role;
-
---
--- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: admin; Owner: -
---
-
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA admin GRANT SELECT ON TABLES TO authenticated;
 
 --
 -- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: catalog; Owner: -
