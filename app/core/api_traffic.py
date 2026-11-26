@@ -58,6 +58,7 @@ CHANNELS: dict[str, Channel] = {
     "integration.events_out": Channel("outbound", True),  # outbox -> borrower app
     "webhooks.out": Channel("outbound", True),  # bank webhooks
     "mail.out": Channel("outbound", True),  # email provider
+    "autobid.decision_out": Channel("outbound", True),  # banks' own decision engines
 }
 
 # Calls that are not business traffic: probes, metrics, docs, CORS preflight.

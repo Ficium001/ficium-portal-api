@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     maintenance_close_expired_enabled: bool = False
     maintenance_interval_s: float = 300.0
 
+    # ── Autobid engine (app/core/autobid_engine.py). Global kill switch; each bank still has
+    #    to be licensed (AUTOBID) and switch autobid on with four eyes before anything happens.
+    autobid_engine_enabled: bool = True
+
     @property
     def integration_inbound_keys(self) -> list[bytes]:
         raw = self.integration_b2i_verify_keys.split(",")
