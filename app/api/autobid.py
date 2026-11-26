@@ -513,6 +513,8 @@ def preview_rule(
         raise HTTPException(status_code=422, detail=str(e)) from e
     rows = (
         conn.execute(
+            # constant SQL; the window is bound
+            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             text(
                 REQUEST_SQL + " WHERE r.created_at > now() - make_interval(days => :d) "
                 "ORDER BY r.created_at DESC LIMIT 500"

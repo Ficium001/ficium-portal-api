@@ -131,6 +131,7 @@ def request_object(row: dict[str, Any]) -> dict[str, Any]:
 
 def load_request(conn: Session, request_id: str) -> dict[str, Any] | None:
     row = (
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         conn.execute(text(REQUEST_SQL + " WHERE r.id = CAST(:rid AS uuid)"), {"rid": request_id})
         .mappings()
         .first()

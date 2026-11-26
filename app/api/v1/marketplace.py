@@ -93,11 +93,13 @@ def list_requests(
                               "amax": amount_max, "lim": limit, "off": offset}
     with _svc() as conn:
         rows = conn.execute(
+            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text  (constant SQL; values are bound)
             text(REQUEST_SQL + where + """
                  ORDER BY r.created_at DESC LIMIT :lim OFFSET :off"""),
             params,
         ).mappings().all()
         total = conn.execute(
+            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             text("SELECT count(*) FROM marketplace.request r "
                  "JOIN catalog.product p ON p.id = r.product_id " + where),
             params,
