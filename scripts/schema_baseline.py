@@ -76,6 +76,12 @@ DUMP_FLAGS = (
     "--no-subscriptions",
     "--no-security-labels",
     "--no-tablespaces",
+    # Monthly partitions (usage_event_2026_11, execution_2027_01, ...) are created by
+    # ensure_*_partitions() on a daily schedule: data layout, not schema. Left out of
+    # both dumps so the rebuild-and-compare does not drift every month. The parents
+    # and their DEFAULT partitions stay in (migration 075).
+    "--exclude-table=entitlements.usage_event_[0-9]*",
+    "--exclude-table=autobid.execution_[0-9]*",
 )
 
 _DROP_LINE = re.compile(
