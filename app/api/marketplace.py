@@ -74,6 +74,52 @@ async def list_requests(
     # is exactly one authorization path to maintain, not two that can drift.
     return [_row(r) for r in rows]
 
+# ── GET /marketplace/intelligence ─────────────────────────────────────────────
+_DEMAND_SQL = """
+    SELECT integration.app_type_for_product(p.code)                       AS product_type,
+           count(*)                                                       AS total_requests,
+           count(*) FILTER (WHERE r.status IN ('open', 'bidding'))        AS open_requests,
+           avg(r.amount)                                                  AS avg_amount,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY r.amount)          AS median_amount,
+           avg(r.term_months)                                             AS avg_term_months,
+           100.0 * count(*) FILTER (WHERE r.accepted_at IS NOT NULL)
+                 / nullif(count(*), 0)                                    AS close_rate_pct
+      FROM marketplace.request r
+      JOIN catalog.product p ON p.id = r.product_id
+     WHERE r.created_at > now() - interval '90 days'
+     GROUP BY 1
+"""
+
+
+def _load_intelligence() -> dict:
+    from ..core.market_intelligence import shape
+    with service_session() as svc:
+        built = svc.execute(text("SELECT integration.build_market_intelligence()")).scalar() or {}
+        demand = [_row(r) for r in svc.execute(text(_DEMAND_SQL)).fetchall()]
+    return shape(built, demand)
+
+
+@router.get("/intelligence")
+async def market_intelligence(
+    claims: dict = Depends(current_claims),
+    conn: Session = Depends(tenant_conn),
+) -> dict:
+    """
+    Anonymous market aggregates for the Marketplace strip and Analytics.
+
+    The portal used to fetch /api/intelligence from its own origin, which has no API, so the
+    strip never rendered. Same numbers the borrower side receives (build_market_intelligence),
+    with competitor figures suppressed below MIN_INSTITUTIONS per product. Caller must be a
+    member of an institution; the aggregates are computed outside tenant RLS on purpose
+    (they span institutions) and carry no institution, request or borrower identifiers.
+    """
+    if not claims.get("institution_id"):
+        raise HTTPException(status_code=403, detail="No institution context.")
+    if conn.execute(text("SELECT 1 FROM institution.current_member_ctx_v2()")).fetchone() is None:
+        raise HTTPException(status_code=403, detail="Not a member of an institution.")
+    return await asyncio.to_thread(_load_intelligence)
+
+
 # ── GET /marketplace/my-bids ──────────────────────────────────────────────────
 @router.get("/my-bids")
 async def list_my_bids(
