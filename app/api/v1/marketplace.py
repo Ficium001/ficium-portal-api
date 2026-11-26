@@ -26,6 +26,7 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Qu
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from ...core.autobid_facts import REQUEST_SQL, request_object
 from ...core.bidding import BidInput, BidPlacementError, place_bid
 from ...core.booking import (
     BookingInput,
@@ -59,83 +60,61 @@ def _institution_id_from_claims(claims: dict[str, Any]) -> str:
 @router.get("/requests", dependencies=[Depends(require_scope("marketplace:read"))])
 def list_requests(
     claims: dict[str, Any] = Depends(api_or_jwt_claims),
-    product_type: str | None = Query(default=None),
+    product_type: str | None = Query(default=None, max_length=40),
     amount_min: float | None = Query(default=None),
     amount_max: float | None = Query(default=None),
     limit: int = Query(default=20, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     """
-    Browse open borrower requests in the marketplace.
-    Filtered to products the institution is configured and permitted to bid on.
+    Open borrower requests this institution may bid on (products it has enabled,
+    not declined by it), as the anonymous request object: the same shape the
+    autobid decision engine receives (app/core/autobid_facts.py).
+
+    Rewritten 2026-11-26: the old query read columns that do not exist
+    (request.product_type, amount_requested, purpose; product_config.product_type,
+    is_active) and status 'open', which ingested requests never take, so this
+    endpoint could never have answered.
     """
     iid = _institution_id_from_claims(claims)
-
+    where = """
+        WHERE r.status = 'bidding' AND r.bid_window_closes_at > now()
+          AND EXISTS (SELECT 1 FROM institution.product_config pc
+                       WHERE pc.institution_id = CAST(:iid AS uuid)
+                         AND pc.product_id = r.product_id AND pc.enabled = true)
+          AND NOT EXISTS (SELECT 1 FROM marketplace.request_decline d
+                           WHERE d.request_id = r.id AND d.institution_id = CAST(:iid AS uuid))
+          AND (CAST(:pt AS text) IS NULL OR coalesce(r.params ->> 'app_product_type',
+               integration.app_type_for_product(p.code)) = CAST(:pt AS text))
+          AND (CAST(:amin AS numeric) IS NULL OR r.amount >= CAST(:amin AS numeric))
+          AND (CAST(:amax AS numeric) IS NULL OR r.amount <= CAST(:amax AS numeric))
+    """
+    params: dict[str, Any] = {"iid": iid, "pt": product_type, "amin": amount_min,
+                              "amax": amount_max, "lim": limit, "off": offset}
     with _svc() as conn:
-        params: dict[str, Any] = {"iid": iid, "lim": limit, "off": offset}
-        filters = [
-            "r.status = 'open'",
-            "r.bid_window_closes_at > now()",
-            # Only return requests for product types this institution has active config for
-            """EXISTS (
-                SELECT 1 FROM institution.product_config pc
-                WHERE pc.institution_id = CAST(:iid AS uuid)
-                  AND pc.product_type   = r.product_type
-                  AND pc.is_active      = true
-            )""",
-        ]
-
-        if product_type:
-            filters.append("r.product_type = :product_type")
-            params["product_type"] = product_type
-        if amount_min is not None:
-            filters.append("r.amount_requested >= :amount_min")
-            params["amount_min"] = amount_min
-        if amount_max is not None:
-            filters.append("r.amount_requested <= :amount_max")
-            params["amount_max"] = amount_max
-
-        where = " AND ".join(filters)
-
         rows = conn.execute(
-            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
-            text(f"""
-                SELECT
-                    r.id,
-                    r.product_type,
-                    r.amount_requested,
-                    r.term_months,
-                    r.purpose,
-                    r.ficium_risk_tier,
-                    r.ficium_score,
-                    r.bid_window_closes_at,
-                    r.created_at,
-                    -- Has this institution already bid?
-                    EXISTS (
-                        SELECT 1 FROM marketplace.bid b
-                        WHERE b.request_id    = r.id
-                          AND b.institution_id = CAST(:iid AS uuid)
-                          AND b.status NOT IN ('withdrawn')
-                    ) AS already_bid
-                FROM marketplace.request r
-                WHERE {where}
-                ORDER BY r.created_at DESC
-                LIMIT :lim OFFSET :off
-            """),
+            # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text  (constant SQL; values are bound)
+            text(REQUEST_SQL + where + """
+                 ORDER BY r.created_at DESC LIMIT :lim OFFSET :off"""),
             params,
-        ).fetchall()
-
+        ).mappings().all()
         total = conn.execute(
             # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
-            text(f"SELECT COUNT(*) FROM marketplace.request r WHERE {where}"),
+            text("SELECT count(*) FROM marketplace.request r "
+                 "JOIN catalog.product p ON p.id = r.product_id " + where),
             params,
         ).scalar()
+        mine = {str(x[0]) for x in conn.execute(text("""
+            SELECT request_id FROM marketplace.bid
+             WHERE institution_id = CAST(:iid AS uuid) AND status <> 'withdrawn'
+               AND request_id = ANY (CAST(:ids AS uuid[]))
+        """), {"iid": iid, "ids": [str(r["id"]) for r in rows]}).fetchall()} if rows else set()
 
     return {
         "total": total,
         "limit": limit,
         "offset": offset,
-        "requests": [dict(r._mapping) for r in rows],
+        "requests": [{**request_object(dict(r)), "already_bid": str(r["id"]) in mine} for r in rows],
     }
 
 
@@ -168,9 +147,12 @@ def list_bids(
                     b.id, b.request_id, b.status,
                     b.rate, b.rate_type, b.amount_offered, b.term_months,
                     b.rate_valid_days, b.conditions, b.submitted_at, b.expires_at,
-                    r.product_type, r.amount_requested, r.ficium_risk_tier
+                    coalesce(r.params ->> 'app_product_type',
+                             integration.app_type_for_product(p.code)) AS product_type,
+                    r.amount AS amount_requested, r.ficium_risk_tier
                 FROM marketplace.bid b
                 JOIN marketplace.request r ON r.id = b.request_id
+                JOIN catalog.product p ON p.id = r.product_id
                 WHERE {where}
                 ORDER BY b.submitted_at DESC
                 LIMIT :lim OFFSET :off

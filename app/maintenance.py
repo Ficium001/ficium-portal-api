@@ -17,6 +17,7 @@ import structlog
 from sqlalchemy import text
 
 from .api.marketplace import close_expired_once
+from .core import autobid_engine
 from .core.config import settings
 from .core.db import service_session
 
@@ -61,11 +62,21 @@ async def publish_market_if_due(now: float | None = None) -> bool | None:
     return published
 
 
+async def autobid_sweep() -> int | None:
+    """Requests the autobid trigger missed (deploy, restart, a bank switched on later)."""
+    try:
+        return await asyncio.to_thread(autobid_engine.sweep)
+    except Exception:  # noqa: BLE001 - a DB blip must not kill the loop
+        log.exception("maintenance_autobid_sweep_error")
+        return None
+
+
 async def run_forever(stop: asyncio.Event) -> None:
     log.info("maintenance_started", interval_s=settings.maintenance_interval_s)
     while not stop.is_set():
         await run_once()
         await publish_market_if_due()
+        await autobid_sweep()
         try:
             await asyncio.wait_for(stop.wait(), timeout=settings.maintenance_interval_s)
         except TimeoutError:

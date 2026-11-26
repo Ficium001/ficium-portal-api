@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..core import autobid_engine
 from ..core.config import settings
 from ..core.db import service_session
 
@@ -165,4 +166,6 @@ async def receive_event(request: Request) -> JSONResponse:
     if is_new:
         # After commit: tell institutions licensed for the product.
         await asyncio.to_thread(_notify_new_request, envelope["aggregate_id"])
+        # Banks that switched autobid on decide now (in the background; the sweep catches misses).
+        autobid_engine.schedule(envelope["aggregate_id"])
     return JSONResponse(status_code=200, content={"status": outcome, "id": envelope["id"]})
