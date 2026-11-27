@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     db_pool_min:         int = 5
     db_pool_max:         int = 10
     db_command_timeout:  float = 30.0
+    # TLS to the Portal DB. Without a CA the connection is encrypted but the server is not
+    # authenticated (sslmode=require). Set DB_SSL_ROOT_CERT to Supabase's CA (Dashboard >
+    # Database > SSL configuration > Download certificate): either the PEM text itself or a
+    # file path. The connection then uses verify-full. DB_SSLMODE overrides the mode
+    # (verify-full | verify-ca | require); leave it empty unless verify-full is refused.
+    db_ssl_root_cert:    str = Field(default="", description="Supabase CA: PEM text or path")
+    db_sslmode:          str = Field(default="", description="TLS mode override")
 
     # ── Cross-project: Ficium App database (marketplace pool) ──
     @field_validator("database_url", mode="before")

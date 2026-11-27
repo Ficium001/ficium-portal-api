@@ -30,7 +30,7 @@ Fill in `.env`:
 
 ```
 DATABASE_URL=postgresql://postgres.<institution-ref>:<pw>@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres
-APP_DATABASE_URL=postgresql://postgres.<app-ref>:<pw>@aws-0-ap-south-1.pooler.supabase.com:6543/postgres
+DB_SSL_ROOT_CERT=<Supabase CA: PEM text or a path>   # production: TLS verify-full
 APP_SERVICE_SECRET=<shared secret — same value set in Vercel + Supabase Vault>
 AUTH_JWKS_URL=https://ficium-auth-production.up.railway.app/.well-known/jwks.json
 AUTH_ISSUER=ficium-auth
