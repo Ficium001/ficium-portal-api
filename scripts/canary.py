@@ -153,20 +153,31 @@ def outbox_backlog() -> tuple[str, str]:
     return "PASS", "nothing waiting"
 
 
-TRAFFIC_SQL = """
+# One literal query per table: no SQL is ever built from strings.
+TRAFFIC_SQL = {
+    "admin.api_traffic_hour": """
     SELECT channel, sum(total)::int, sum(server_errors + network_errors)::int
-      FROM {table}
+      FROM admin.api_traffic_hour
      WHERE hour > now() - interval '24 hours'
      GROUP BY channel
     HAVING sum(total) >= 3 AND sum(server_errors + network_errors) * 2 >= sum(total)
      ORDER BY 1
-"""
+""",
+    "integration.api_traffic_hour": """
+    SELECT channel, sum(total)::int, sum(server_errors + network_errors)::int
+      FROM integration.api_traffic_hour
+     WHERE hour > now() - interval '24 hours'
+     GROUP BY channel
+    HAVING sum(total) >= 3 AND sum(server_errors + network_errors) * 2 >= sum(total)
+     ORDER BY 1
+""",
+}
 
 
 def traffic(env: str, table: str) -> Callable[[], tuple[str, str]]:
     def run() -> tuple[str, str]:
         with _connect(env) as conn, conn.cursor() as cur:
-            cur.execute(TRAFFIC_SQL.format(table=table))
+            cur.execute(TRAFFIC_SQL[table])
             bad = cur.fetchall()
         if bad:
             return "FAIL", "; ".join(f"{ch}: {err}/{tot} calls failed" for ch, tot, err in bad)
