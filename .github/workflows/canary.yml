@@ -1,0 +1,74 @@
+name: production-canary
+
+# Can the live marketplace work right now? Outside-in HTTP probes plus read-only
+# checks on what both live databases recorded (scripts/canary.py). Every 3 hours
+# and on demand. On failure it opens (or updates) one GitHub issue labelled
+# "canary", so the alert reaches a phone; when everything passes again it
+# comments and closes that issue.
+#
+# Repo variables (optional, Settings > Secrets and variables > Actions > Variables):
+#   CANARY_PORTAL_API_URL, CANARY_APP_URL, CANARY_PORTAL_URL
+# Secrets (already used by integration-tests): PORTAL_DB_DSN, APP_DB_DSN
+
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: production-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+      - run: pip install httpx==0.28.1 psycopg2-binary==2.9.13
+
+      - name: Probe production
+        id: probe
+        env:
+          PORTAL_DB_DSN: ${{ secrets.PORTAL_DB_DSN }}
+          APP_DB_DSN: ${{ secrets.APP_DB_DSN }}
+          CANARY_PORTAL_API_URL: ${{ vars.CANARY_PORTAL_API_URL }}
+          CANARY_APP_URL: ${{ vars.CANARY_APP_URL }}
+          CANARY_PORTAL_URL: ${{ vars.CANARY_PORTAL_URL }}
+        run: |
+          # Empty repo variables must fall back to the script's defaults.
+          for v in CANARY_PORTAL_API_URL CANARY_APP_URL CANARY_PORTAL_URL; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          python scripts/canary.py
+
+      - name: Open or update the alert issue
+        if: ${{ failure() && steps.probe.conclusion == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create canary --color B60205 --description "Production canary" 2>/dev/null || true
+          body="$(printf 'Production canary failed at %s UTC.\n\n%s\n\n[Run](%s)\n' "$(date -u '+%Y-%m-%d %H:%M')" "$(cat canary-report.md)" "$RUN_URL")"
+          n=$(gh issue list --label canary --state open --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --title "Production canary failing" --label canary --body "$body"
+          fi
+
+      - name: Close the alert issue when healthy again
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label canary --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Healthy again at $(date -u '+%Y-%m-%d %H:%M') UTC."$'\n\n'"$(cat canary-report.md)"
+          done
