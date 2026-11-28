@@ -67,17 +67,17 @@ docs/
                │  tenant_session() — SET jwt.claims + ROLE        │
                └──────────┬──────────────────────┬───────────────┘
                           │                      │
-           psycopg2       │  :6543               │  APP_DATABASE_URL
-           tx pooler      ▼                      ▼
+           psycopg2       │  :6543, TLS          │  HTTPS, HMAC-signed
+           tx pooler      ▼                      ▼  (integration contract)
           ┌───────────────────────────┐ ┌────────────────────────────┐
-          │  Portal DB (Institution)  │ │  App DB (Consumer)         │
-          │  egwobcajdlragubtkpqp    │ │  wixfhjlsjkiwfvqewvmt      │
-          │  ap-southeast-1          │ │  ap-south-1                │
+          │  Portal DB (Institution)  │ │  ficium.net (borrower app) │
+          │  egwobcajdlragubtkpqp    │ │  /api/internal?op=events   │
+          │  ap-southeast-1          │ │  (I2B key)                 │
           │                          │ │                            │
-          │  institution.*           │ │  public.clients            │
-          │   └── api_key            │ │  public.requests           │
-          │   └── webhook            │ │  public.kyc_submissions    │
-          │   └── webhook_delivery   │ │  (Phase 2 PII fetch only)  │
+          │  institution.*           │ │  inbound from it:          │
+          │   └── api_key            │ │  /integration/v1/events    │
+          │   └── webhook            │ │  /integration/v1/acceptances│
+          │   └── webhook_delivery   │ │  (B2I / acceptance keys)   │
           │  marketplace.*           │ └────────────────────────────┘
           │  governance.*            │
           │  catalog.*               │
@@ -87,12 +87,12 @@ docs/
                           JWKS (5 min cache)◄──┤  /.well-known/     │
                                                │  jwks.json         │
                                                └────────────────────┘
-
-ficium (Vercel SPA — consumer app)
-  │  X-Service-Secret
-  ▼
-/public/*  routes (no JWT)
 ```
+
+There is **no connection to the App DB**. Since October 2026 everything exchanged with the
+borrower app goes through the signed integration contract (`ficium-integration`); the old
+`APP_DATABASE_URL` pool and the `X-Service-Secret` routes (`/public/requests/*`) are gone.
+(`/esign/public/*` is unrelated: the signer ceremony, authorised by an unguessable token.)
 
 ---
 
@@ -128,7 +128,6 @@ Keys require maker-checker approval before activation. Raw key never stored — 
 |---------|-------------|------|-----|-----------|
 | `tenant_session(claims)` | `DATABASE_URL` | `authenticated` | Enforced | All institution data routes (JWT path) |
 | `service_session()` | `DATABASE_URL` | `postgres` | Bypassed | API key routes, webhooks, admin, s2s |
-| `app_service_session()` | `APP_DATABASE_URL` | `postgres` | Bypassed | Phase 2 PII fetch, marketplace sync |
 
 API key routes use `service_session()` with explicit `WHERE institution_id = :iid` filtering from claims — the equivalent of RLS but at the SQL layer, since API keys don't carry JWT claims for `auth.uid()`.
 
@@ -154,7 +153,7 @@ dispatch_event("f192050a-...", "bid.accepted", {...})
 Called with `asyncio.create_task()` so delivery is fire-and-forget from the API response. Current event emission points:
 - `POST /v1/bids` → `bid.accepted` (confirmation to LOS after successful submission)
 - `PUT /v1/pipeline/.../advance` → `pipeline.stage_changed`
-- `POST /public/requests/:id/accept-bid` → `bid.accepted` (winning institution notified)
+- `POST /integration/v1/acceptances` → `bid.accepted` (winning institution notified)
 
 ---
 
@@ -174,10 +173,9 @@ All routes under `/v1/` form a stable, versioned contract for institution integr
 ## 8. Marketplace lifecycle
 
 ```
-Sync (App DB → Portal DB):
-  pg_net trigger on public.requests INSERT
-  → POST /marketplace/sync-requests
-  → marketplace.ingest_app_request()
+New request (borrower app → portal-api):
+  borrower app outbox → POST /integration/v1/events  (HMAC, B2I key)
+  → request stored in the Portal DB, banks notified, autobid scheduled
 
 Bid submission (API key path — LOS):
   POST /v1/bids
@@ -192,8 +190,8 @@ Bid submission (JWT path — portal human):
   → INSERT marketplace.bid
   → pg_net → bid-notify → Resend email
 
-Bid acceptance (consumer):
-  POST /public/requests/{id}/accept-bid  (s2s, Vercel)
+Bid acceptance (borrower):
+  POST /integration/v1/acceptances  (HMAC, acceptance key; synchronous)
   → marketplace.accept_bid() atomic:
       bid → accepted, others → rejected
       request → accepted, bid_acceptance PII row
@@ -222,6 +220,7 @@ For client-cloud or on-prem Postgres, run `db/000_auth_shim.sql` before Portal m
 ## 10. Connection constraints
 
 - **Transaction pooler only (port 6543):** psycopg2 (sync). Supabase blocks direct port 5432 on pooled plans.
+- **TLS:** `verify-full` when `DB_SSL_ROOT_CERT` holds Supabase's CA (PEM text or a path); otherwise `require` (encrypted, server not authenticated) and `db_tls_unverified` is logged at start-up. Production must set the CA.
 - **Username:** `postgres.<project-ref>` (pooler tenant prefix, not plain `postgres`).
 - **`SET LOCAL ROLE authenticated`:** emitted inside `tenant_session()` — required because the pooler connects as `postgres` which carries `BYPASSRLS`. Without this, all RLS policies are silently inert. (This was a critical incident on 30 June 2026 — see `db.py` incident notes.)
 - **Sync driver only:** asyncpg requires a direct persistent connection for session setup, which pgbouncer transaction mode doesn't support.

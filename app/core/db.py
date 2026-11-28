@@ -35,6 +35,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
@@ -54,9 +56,43 @@ _SessionLocal = None
 # with the borrower app goes through the integration contract (Oct 2026).
 
 
+_SSLMODES = ("verify-full", "verify-ca", "require")
+
+
+def ssl_connect_args(root_cert: str, mode_override: str = "") -> dict[str, str]:
+    """libpq TLS arguments for the Portal DB.
+
+    With Supabase's CA the server is authenticated (verify-full); without it the link is
+    only encrypted (require), which a man in the middle can still answer. The CA may be
+    given as PEM text (convenient as a Railway variable) or as a file path.
+    """
+    cert = (root_cert or "").strip()
+    mode = (mode_override or "").strip().lower()
+    if mode and mode not in _SSLMODES:
+        raise ValueError(f"DB_SSLMODE must be one of {', '.join(_SSLMODES)}")
+    if not cert:
+        if mode and mode != "require":
+            raise ValueError(f"DB_SSLMODE={mode} needs DB_SSL_ROOT_CERT")
+        return {"sslmode": "require"}
+    if "BEGIN CERTIFICATE" in cert:
+        fd, path = tempfile.mkstemp(prefix="portal-db-ca-", suffix=".crt")
+        with os.fdopen(fd, "w") as f:
+            f.write(cert if cert.endswith("\n") else cert + "\n")
+        os.chmod(path, 0o600)
+    else:
+        if not os.path.isfile(cert):
+            raise ValueError("DB_SSL_ROOT_CERT is neither PEM text nor an existing file")
+        path = cert
+    return {"sslmode": mode or "verify-full", "sslrootcert": path}
+
+
 def init_pool() -> None:
     global _engine, _SessionLocal
     if _engine is None:
+        tls = ssl_connect_args(settings.db_ssl_root_cert, settings.db_sslmode)
+        if tls["sslmode"] == "require":
+            log.warning("db_tls_unverified",
+                        detail="Portal DB server certificate is not checked: set DB_SSL_ROOT_CERT")
         _engine = create_engine(
             settings.database_url,
             pool_size=settings.db_pool_min,
@@ -69,7 +105,7 @@ def init_pool() -> None:
             # replaces it. 5 min stays safely under the server timeout.
             pool_recycle=300,
             connect_args={
-                "sslmode": "require",
+                **tls,
                 # TCP keepalives keep long-lived pooled connections from being
                 # silently reaped by intermediate NAT/load balancers.
                 "keepalives": 1,
@@ -79,7 +115,8 @@ def init_pool() -> None:
             },
         )
         _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
-        log.info("db_pool_ready", min=settings.db_pool_min, max=settings.db_pool_max)
+        log.info("db_pool_ready", min=settings.db_pool_min, max=settings.db_pool_max,
+                 sslmode=tls["sslmode"])
 
 
 def close_pool() -> None:
